@@ -18,7 +18,9 @@ make dev-release-artifact
 ```
 
 For a local-only release-mode installation signed by the user's own dedicated
-self-signed identity, use:
+self-signed identity, double-click
+[`Install RepoPrompt CE Local Production.command`](../../../Install%20RepoPrompt%20CE%20Local%20Production.command)
+in Finder or use:
 
 ```bash
 CONFIRM_LOCAL_PRODUCTION_INSTALL=1 make dev-install-local-production

@@ -2421,6 +2421,26 @@ actor WorkspaceFileContextStore {
         return nil
     }
 
+    func lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(
+        _ userPath: String,
+        rootScope: WorkspaceLookupRootScope
+    ) -> WorkspacePathLookupResult? {
+        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !StandardizedPath.containsNUL(trimmed) else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        let standardizedPath = StandardizedPath.absolute(expanded)
+        guard let root = rootsForPathLookup(scope: rootScope)
+            .filter({ StandardizedPath.isDescendant(standardizedPath, of: $0.standardizedFullPath) })
+            .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count })
+        else { return nil }
+        let relativePath = relativePath(for: standardizedPath, rootPath: root.standardizedFullPath)
+        guard let result = lookupPath(rootID: root.id, relativePath: relativePath),
+              isDiscoverableLookupResult(result)
+        else { return nil }
+        return result
+    }
+
     func rootRefs(scope: WorkspaceLookupRootScope = .allLoaded) -> [WorkspaceRootRef] {
         rootsForPathLookup(scope: scope).map {
             WorkspaceRootRef(id: $0.id, name: $0.name, fullPath: $0.standardizedFullPath)

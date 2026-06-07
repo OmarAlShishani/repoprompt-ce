@@ -8,8 +8,9 @@ final class MentionOverlayControllerTests: XCTestCase {
 
         XCTAssertEqual(overlay.visibleRowLimit, 5)
 
-        overlay.visibleRowLimit = FileMentionPickerStyle.expanded.configuration.visibleRows
-        XCTAssertEqual(overlay.visibleRowLimit, 15)
+        let expandedVisibleRows = FileMentionPickerStyle.expanded.configuration.visibleRows
+        overlay.visibleRowLimit = expandedVisibleRows
+        XCTAssertEqual(overlay.visibleRowLimit, expandedVisibleRows)
 
         overlay.visibleRowLimit = 0
         XCTAssertEqual(overlay.visibleRowLimit, 1)

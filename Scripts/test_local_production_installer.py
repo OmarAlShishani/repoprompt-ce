@@ -268,7 +268,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
         info_template = (ROOT_DIR / "AppBundle" / "Info.plist.template").read_text(encoding="utf-8")
         self.assertIn("RepoPromptLocalSigningCertificateSHA256", info_template)
         self.assertIn("RepoPromptLocalSecureStorageGeneration", info_template)
-        self.assertIn("--extract-certificates", package_script)
+        self.assertIn("--extract-certificates=\"$certificate_prefix\"", package_script)
         self.assertIn("Extracted designated requirement", package_script)
 
     def test_first_use_adopts_sole_identity_and_writes_registry(self) -> None:

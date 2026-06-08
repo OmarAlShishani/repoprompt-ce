@@ -29,6 +29,30 @@ run(){
     "$@"
 }
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+remove_stale_artifact_manifests(){
+    local manifests=()
+    shopt -s nullglob
+    manifests=("$ROOT_DIR"/.build/release/*-artifact-manifest.json)
+    shopt -u nullglob
+    if (( ${#manifests[@]} )); then
+        run rm -f -- "${manifests[@]}"
+    fi
+}
+paths_same(){
+    python3 - "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+
+left = Path(sys.argv[1])
+right = Path(sys.argv[2])
+try:
+    print("1" if left.samefile(right) else "0")
+except OSError:
+    left_resolved = left.resolve(strict=False)
+    right_resolved = right.resolve(strict=False)
+    print("1" if left_resolved == right_resolved else "0")
+PY
+}
 finish(){
     local status="$1" now total
     [[ -z "${APP_ENTITLEMENTS:-}" ]] || rm -f "$APP_ENTITLEMENTS"
@@ -44,9 +68,13 @@ finish(){
 trap 'finish $?' EXIT
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
+# Invalidate public-release manifests before metadata parsing, checks, or builds
+# so failed non-public packaging cannot leave stale release metadata behind.
+remove_stale_artifact_manifests
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
 load_release_metadata "$ROOT_DIR"
 APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"
+ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 
 IS_RELEASE=0
 [[ "$CONF" == "release" ]] && IS_RELEASE=1
@@ -200,20 +228,11 @@ else
 fi
 COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
 CLI_PATH="$BUILD_DIR/repoprompt-mcp"
-ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
 
 phase "Creating app bundle layout"
 run rm -rf "$APP_BUNDLE"
-if (( PUBLIC_UNIVERSAL_RELEASE )); then
-    run rm -f "$ARTIFACT_MANIFEST"
-fi
-if [[ "$(python3 - <<PY
-from pathlib import Path
-import os
-print(Path('$APP_BUNDLE').resolve(strict=False) == Path('$COMPAT_APP_BUNDLE').resolve(strict=False))
-PY
-)" != "True" ]]; then
+if [[ "$(paths_same "$APP_BUNDLE" "$COMPAT_APP_BUNDLE")" != "1" ]]; then
     run rm -rf "$COMPAT_APP_BUNDLE"
 fi
 run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
@@ -327,7 +346,7 @@ verify_signed_app_identity(){
         run codesign --verify --deep --strict --verbose=2 -R="$LOCAL_SELF_SIGNED_REQUIREMENT" "$APP_BUNDLE"
         certificate_dir="$(mktemp -d)"
         certificate_prefix="$certificate_dir/leaf"
-        codesign -d --extract-certificates "$certificate_prefix" "$APP_BUNDLE" >/dev/null 2>&1 || {
+        codesign -d --extract-certificates="$certificate_prefix" "$APP_BUNDLE" >/dev/null 2>&1 || {
             rm -rf "$certificate_dir"
             fail "Could not extract the local signing certificate from the packaged app."
         }
@@ -358,7 +377,7 @@ if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     APP_SIGN_ARGS+=(--entitlements "$APP_ENTITLEMENTS")
 fi
 if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
-    APP_SIGN_ARGS+=(--requirements "designated => $LOCAL_SELF_SIGNED_REQUIREMENT")
+    APP_SIGN_ARGS+=(--requirements "=designated => $LOCAL_SELF_SIGNED_REQUIREMENT")
 fi
 if (( ${#APP_SIGN_ARGS[@]} )); then
     sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"
@@ -376,11 +395,7 @@ if (( PUBLIC_UNIVERSAL_RELEASE )); then
 fi
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Packaged app MCP helper layout"
 run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
-if [[ "$(python3 - <<PY
-from pathlib import Path
-print(Path('$APP_BUNDLE').resolve(strict=False) == Path('$COMPAT_APP_BUNDLE').resolve(strict=False))
-PY
-)" != "True" ]]; then
+if [[ "$(paths_same "$APP_BUNDLE" "$COMPAT_APP_BUNDLE")" != "1" ]]; then
     phase "Updating compatibility app bundle link"
     run mkdir -p "$(dirname "$COMPAT_APP_BUNDLE")"
     if (( USE_ADHOC_SIGNING )); then

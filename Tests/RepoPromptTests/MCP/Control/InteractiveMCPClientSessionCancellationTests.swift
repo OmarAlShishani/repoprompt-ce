@@ -5,13 +5,10 @@ import XCTest
 
 #if DEBUG
     final class InteractiveMCPClientSessionCancellationTests: XCTestCase {
-        func testTimeoutSendsMCPRequestCancellationAndReturnsTimeout() async throws {
-            let timeoutTrigger = CLIAsyncSignal()
+        func testImmediateTimeoutRegistersAndSendsBeforeCancellationWithoutWaitingForHandlerStartup() async throws {
             let fixture = try await makeFixture(
                 cancellationBehavior: .ignoreUntilReleased,
-                timeoutSleep: { _ in
-                    await timeoutTrigger.wait()
-                }
+                timeoutSleep: { _ in }
             )
             do {
                 let call = Task {
@@ -21,9 +18,6 @@ import XCTest
                         timeout: .seconds(42)
                     )
                 }
-                await fixture.handlerStarted.wait()
-                await timeoutTrigger.signal()
-
                 do {
                     _ = try await call.value
                     XCTFail("Expected tool timeout")
@@ -46,8 +40,13 @@ import XCTest
             }
         }
 
-        func testCallerCancellationSendsMCPRequestCancellationAndReturnsCancellation() async throws {
-            let fixture = try await makeFixture()
+        func testCallerCancellationBeforeRequestTaskStartupStillSendsThenCancels() async throws {
+            let requestStartGate = CLIAsyncGate()
+            let fixture = try await makeFixture(
+                requestSendWillStart: {
+                    await requestStartGate.arriveAndWait()
+                }
+            )
             do {
                 let call = Task {
                     try await fixture.session.callTool(
@@ -56,8 +55,9 @@ import XCTest
                         timeout: .none
                     )
                 }
-                await fixture.handlerStarted.wait()
+                await requestStartGate.waitUntilArrived()
                 call.cancel()
+                await requestStartGate.release()
 
                 do {
                     _ = try await call.value
@@ -76,12 +76,12 @@ import XCTest
 
         private func makeFixture(
             cancellationBehavior: CLICancellationBehavior = .cooperative,
+            requestSendWillStart: (@Sendable () async -> Void)? = nil,
             timeoutSleep: @escaping @Sendable (UInt64) async throws -> Void = { nanoseconds in
                 try await Task.sleep(nanoseconds: nanoseconds)
             }
         ) async throws -> CLISessionCancellationFixture {
             let transports = await InMemoryTransport.createConnectedPair()
-            let handlerStarted = CLIAsyncSignal()
             let handlerCancelled = CLIAsyncSignal()
             let ignoredCancellationRelease = CLIAsyncSignal()
             let cancellationSuspension = CLICancellationSuspension()
@@ -91,7 +91,6 @@ import XCTest
                 capabilities: .init(tools: .init())
             )
             await server.withMethodHandler(CallTool.self) { _ in
-                await handlerStarted.signal()
                 do {
                     try await cancellationSuspension.wait()
                     return .init(
@@ -114,17 +113,24 @@ import XCTest
             }
             try await server.start(transport: transports.server)
 
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
             let client = Client(name: "CLI cancellation test client", version: "1.0")
-            _ = try await client.connect(transport: transports.client)
+            _ = try await client.connect(transport: clientTransport)
             let session = InteractiveMCPClientSession(
                 connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier,
+                requestSendWillStart: requestSendWillStart,
                 timeoutSleep: timeoutSleep
             )
             return CLISessionCancellationFixture(
                 client: client,
                 server: server,
                 session: session,
-                handlerStarted: handlerStarted,
                 handlerCancelled: handlerCancelled,
                 ignoredCancellationRelease: ignoredCancellationRelease
             )
@@ -140,7 +146,6 @@ import XCTest
         let client: Client
         let server: Server
         let session: InteractiveMCPClientSession
-        let handlerStarted: CLIAsyncSignal
         let handlerCancelled: CLIAsyncSignal
         let ignoredCancellationRelease: CLIAsyncSignal
 
@@ -148,6 +153,43 @@ import XCTest
             await ignoredCancellationRelease.signal()
             await client.disconnect()
             await server.stop()
+        }
+    }
+
+    private actor CLIAsyncGate {
+        private var arrived = false
+        private var released = false
+        private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func arriveAndWait() async {
+            arrived = true
+            let arrivalWaiters = arrivalWaiters
+            self.arrivalWaiters.removeAll()
+            for waiter in arrivalWaiters {
+                waiter.resume()
+            }
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+
+        func waitUntilArrived() async {
+            guard !arrived else { return }
+            await withCheckedContinuation { continuation in
+                arrivalWaiters.append(continuation)
+            }
+        }
+
+        func release() {
+            guard !released else { return }
+            released = true
+            let releaseWaiters = releaseWaiters
+            self.releaseWaiters.removeAll()
+            for waiter in releaseWaiters {
+                waiter.resume()
+            }
         }
     }
 
@@ -180,12 +222,17 @@ import XCTest
         }
 
         private var waiter: Waiter?
+        private var cancelledWaiterIDs: Set<UUID> = []
 
         func wait() async throws {
             let waiterID = UUID()
             try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    waiter = Waiter(id: waiterID, continuation: continuation)
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    if Task.isCancelled || cancelledWaiterIDs.remove(waiterID) != nil {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        waiter = Waiter(id: waiterID, continuation: continuation)
+                    }
                 }
             } onCancel: {
                 Task { await self.cancel(waiterID) }
@@ -193,7 +240,10 @@ import XCTest
         }
 
         private func cancel(_ waiterID: UUID) {
-            guard let waiter, waiter.id == waiterID else { return }
+            guard let waiter, waiter.id == waiterID else {
+                cancelledWaiterIDs.insert(waiterID)
+                return
+            }
             self.waiter = nil
             waiter.continuation.resume(throwing: CancellationError())
         }

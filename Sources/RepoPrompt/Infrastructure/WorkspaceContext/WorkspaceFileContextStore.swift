@@ -154,6 +154,7 @@ actor WorkspaceFileContextStore {
 
     private final class ScopedIngressBarrierJoin: @unchecked Sendable {
         private let lock = NSLock()
+        private var isCompleted = false
         private var completedOutput: ScopedIngressBarrierTaskOutput?
         private var waiters: [UUID: CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>] = [:]
 
@@ -165,9 +166,10 @@ actor WorkspaceFileContextStore {
                     if Task.isCancelled {
                         lock.unlock()
                         continuation.resume(returning: nil)
-                    } else if let completedOutput {
+                    } else if isCompleted {
+                        let output = completedOutput
                         lock.unlock()
-                        continuation.resume(returning: completedOutput)
+                        continuation.resume(returning: output)
                     } else {
                         waiters[waiterID] = continuation
                         lock.unlock()
@@ -178,13 +180,14 @@ actor WorkspaceFileContextStore {
             }
         }
 
-        func complete(with output: ScopedIngressBarrierTaskOutput) {
+        func complete(with output: ScopedIngressBarrierTaskOutput?) {
             let continuations: [CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>]
             lock.lock()
-            guard completedOutput == nil else {
+            guard !isCompleted else {
                 lock.unlock()
                 return
             }
+            isCompleted = true
             completedOutput = output
             continuations = Array(waiters.values)
             waiters.removeAll(keepingCapacity: false)
@@ -201,13 +204,28 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    private struct ScopedIngressBarrierFlight {
+    private final class ScopedIngressBarrierFlight {
         let token: UInt64
         let target: ScopedIngressBarrierTarget
         let join: ScopedIngressBarrierJoin
+        var task: Task<Void, Never>?
         #if DEBUG
             let startedAtNanoseconds: UInt64
         #endif
+
+        init(
+            token: UInt64,
+            target: ScopedIngressBarrierTarget,
+            join: ScopedIngressBarrierJoin,
+            startedAtNanoseconds: UInt64 = 0
+        ) {
+            self.token = token
+            self.target = target
+            self.join = join
+            #if DEBUG
+                self.startedAtNanoseconds = startedAtNanoseconds
+            #endif
+        }
     }
 
     #if DEBUG
@@ -360,6 +378,14 @@ actor WorkspaceFileContextStore {
             )
         }
 
+        func scopedIngressBarrierFlightCountForTesting() -> Int {
+            scopedIngressBarrierFlightsByRootID.values.reduce(0) { $0 + $1.count }
+        }
+
+        func fileSystemServiceForTesting(rootID: UUID) -> FileSystemService? {
+            rootStatesByID[rootID]?.service
+        }
+
         func readSearchRootDiagnosticsSnapshot(
             recentPublicationLimit: Int = 8
         ) -> [ReadSearchRootDiagnosticsSnapshot] {
@@ -384,7 +410,7 @@ actor WorkspaceFileContextStore {
         }
 
         private func scopedIngressBarrierDebugSnapshot(rootID: UUID) -> ScopedIngressBarrierDebugSnapshot {
-            let active = scopedIngressBarrierFlightsByRootID[rootID].map { flight in
+            let active = scopedIngressBarrierFlightsByRootID[rootID]?.last.map { flight in
                 ScopedIngressBarrierDebugSnapshot.Active(
                     targetWatcherWatermark: flight.target.watcherAcceptedWatermark.rawValue,
                     targetServicePublicationSequence: flight.target.acceptedServicePublicationSequence,
@@ -579,7 +605,7 @@ actor WorkspaceFileContextStore {
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
     private var watcherCancellablesByRootID: [UUID: AnyCancellable] = [:]
     private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
-    private var scopedIngressBarrierFlightsByRootID: [UUID: ScopedIngressBarrierFlight] = [:]
+    private var scopedIngressBarrierFlightsByRootID: [UUID: [ScopedIngressBarrierFlight]] = [:]
     private var nextScopedIngressBarrierToken: UInt64 = 0
     private static let maxConcurrentScopedIngressBarriers = 8
     private var codeScanResultTask: Task<Void, Never>?
@@ -1262,7 +1288,7 @@ actor WorkspaceFileContextStore {
         target: ScopedIngressBarrierTarget
     ) async -> WorkspaceIngressBarrierSample? {
         guard !Task.isCancelled, let state = rootStatesByID[rootID] else { return nil }
-        if let flight = scopedIngressBarrierFlightsByRootID[rootID], flight.target.covers(target) {
+        if let flight = scopedIngressBarrierFlightsByRootID[rootID]?.first(where: { $0.target.covers(target) }) {
             #if DEBUG
                 scopedIngressBarrierJoinCountsByRootID[rootID, default: 0] += 1
             #endif
@@ -1270,7 +1296,7 @@ actor WorkspaceFileContextStore {
             return scopedIngressBarrierSample(from: output)
         }
 
-        let isSuccessor = scopedIngressBarrierFlightsByRootID[rootID] != nil
+        let isSuccessor = scopedIngressBarrierFlightsByRootID[rootID]?.isEmpty == false
         nextScopedIngressBarrierToken &+= 1
         let token = nextScopedIngressBarrierToken
         let publisherIngressCoordinator = publisherIngressCoordinator
@@ -1293,11 +1319,36 @@ actor WorkspaceFileContextStore {
         #else
             let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil
         #endif
-        let task = Task {
+        let join = ScopedIngressBarrierJoin()
+        let flight = ScopedIngressBarrierFlight(
+            token: token,
+            target: target,
+            join: join,
+            startedAtNanoseconds: barrierStartedAtNanoseconds
+        )
+        scopedIngressBarrierFlightsByRootID[rootID, default: []].append(flight)
+        flight.task = Task { [weak self] in
             #if DEBUG
                 if let scopedIngressBarrierWillFlushHandler {
                     await scopedIngressBarrierWillFlushHandler(rootID)
                 }
+            #endif
+            guard !Task.isCancelled else {
+                if let self {
+                    await finishScopedIngressBarrier(
+                        rootID: rootID,
+                        token: token,
+                        target: target,
+                        output: nil,
+                        startedAtNanoseconds: barrierStartedAtNanoseconds,
+                        join: join
+                    )
+                } else {
+                    join.complete(with: nil)
+                }
+                return
+            }
+            #if DEBUG
                 let pendingCount = await service.pendingRawEventCountForDiagnostics()
             #else
                 let pendingCount = 0
@@ -1318,19 +1369,79 @@ actor WorkspaceFileContextStore {
                     await publisherIngressWillWaitHandler([rootID])
                 }
             #endif
+            guard !Task.isCancelled else {
+                if let self {
+                    await finishScopedIngressBarrier(
+                        rootID: rootID,
+                        token: token,
+                        target: target,
+                        output: nil,
+                        startedAtNanoseconds: barrierStartedAtNanoseconds,
+                        join: join
+                    )
+                } else {
+                    join.complete(with: nil)
+                }
+                return
+            }
             await publisherIngressCoordinator.waitUntilApplied(
                 rootID: rootID,
                 servicePublicationSequence: target.acceptedServicePublicationSequence
             )
+            guard !Task.isCancelled else {
+                if let self {
+                    await finishScopedIngressBarrier(
+                        rootID: rootID,
+                        token: token,
+                        target: target,
+                        output: nil,
+                        startedAtNanoseconds: barrierStartedAtNanoseconds,
+                        join: join
+                    )
+                } else {
+                    join.complete(with: nil)
+                }
+                return
+            }
             let publishedSequence = await service.flushPendingEventsNow(
                 throughAcceptedWatcherWatermark: target.watcherAcceptedWatermark
             )
+            guard !Task.isCancelled else {
+                if let self {
+                    await finishScopedIngressBarrier(
+                        rootID: rootID,
+                        token: token,
+                        target: target,
+                        output: nil,
+                        startedAtNanoseconds: barrierStartedAtNanoseconds,
+                        join: join
+                    )
+                } else {
+                    join.complete(with: nil)
+                }
+                return
+            }
             let acceptedDownstreamCut = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
                 .acceptedServicePublicationSequence
             await publisherIngressCoordinator.waitUntilApplied(
                 rootID: rootID,
                 servicePublicationSequence: max(target.acceptedServicePublicationSequence, acceptedDownstreamCut)
             )
+            guard !Task.isCancelled else {
+                if let self {
+                    await finishScopedIngressBarrier(
+                        rootID: rootID,
+                        token: token,
+                        target: target,
+                        output: nil,
+                        startedAtNanoseconds: barrierStartedAtNanoseconds,
+                        join: join
+                    )
+                } else {
+                    join.complete(with: nil)
+                }
+                return
+            }
             let applied = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.WorkspaceIngress.rootFlushEnded,
@@ -1352,43 +1463,25 @@ actor WorkspaceFileContextStore {
                 appliedWatcherWatermark: applied.appliedWatcherWatermark.rawValue
             )
             #if DEBUG
-                return ScopedIngressBarrierTaskOutput(
+                let output = ScopedIngressBarrierTaskOutput(
                     sample: sample,
                     completedAtNanoseconds: barrierCompletionNowNanoseconds()
                 )
             #else
-                return sample
+                let output = sample
             #endif
-        }
-        let join = ScopedIngressBarrierJoin()
-        #if DEBUG
-            scopedIngressBarrierFlightsByRootID[rootID] = ScopedIngressBarrierFlight(
-                token: token,
-                target: target,
-                join: join,
-                startedAtNanoseconds: barrierStartedAtNanoseconds
-            )
-        #else
-            scopedIngressBarrierFlightsByRootID[rootID] = ScopedIngressBarrierFlight(
-                token: token,
-                target: target,
-                join: join
-            )
-        #endif
-        Task { [weak self, join] in
-            let output = await task.value
-            guard let self else {
+            if let self {
+                await finishScopedIngressBarrier(
+                    rootID: rootID,
+                    token: token,
+                    target: target,
+                    output: output,
+                    startedAtNanoseconds: barrierStartedAtNanoseconds,
+                    join: join
+                )
+            } else {
                 join.complete(with: output)
-                return
             }
-            await finishScopedIngressBarrier(
-                rootID: rootID,
-                token: token,
-                target: target,
-                output: output,
-                startedAtNanoseconds: barrierStartedAtNanoseconds,
-                join: join
-            )
         }
         guard let output = await join.value() else { return nil }
         return scopedIngressBarrierSample(from: output)
@@ -1398,23 +1491,34 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         token: UInt64,
         target: ScopedIngressBarrierTarget,
-        output: ScopedIngressBarrierTaskOutput,
+        output: ScopedIngressBarrierTaskOutput?,
         startedAtNanoseconds: UInt64,
         join: ScopedIngressBarrierJoin
     ) {
-        #if DEBUG
-            recordScopedIngressBarrierCompletion(
-                rootID: rootID,
-                token: token,
-                target: target,
-                sample: output.sample,
-                startedAtNanoseconds: startedAtNanoseconds,
-                completedAtNanoseconds: output.completedAtNanoseconds
-            )
-        #endif
-        if scopedIngressBarrierFlightsByRootID[rootID]?.token == token {
-            scopedIngressBarrierFlightsByRootID.removeValue(forKey: rootID)
+        guard var flights = scopedIngressBarrierFlightsByRootID[rootID],
+              flights.contains(where: { $0.token == token })
+        else {
+            join.complete(with: output)
+            return
         }
+        flights.removeAll { $0.token == token }
+        if flights.isEmpty {
+            scopedIngressBarrierFlightsByRootID.removeValue(forKey: rootID)
+        } else {
+            scopedIngressBarrierFlightsByRootID[rootID] = flights
+        }
+        #if DEBUG
+            if let output {
+                recordScopedIngressBarrierCompletion(
+                    rootID: rootID,
+                    token: token,
+                    target: target,
+                    sample: output.sample,
+                    startedAtNanoseconds: startedAtNanoseconds,
+                    completedAtNanoseconds: output.completedAtNanoseconds
+                )
+            }
+        #endif
         join.complete(with: output)
     }
 
@@ -1677,7 +1781,7 @@ actor WorkspaceFileContextStore {
 
         let deltas: [FileSystemDelta]
         do {
-            deltas = try await state.service.scanFoldersInParallel(folderPaths).deltas
+            deltas = try await state.service.scanFoldersInParallel(folderPaths.sorted()).deltas
         } catch {
             return []
         }
@@ -2323,6 +2427,12 @@ actor WorkspaceFileContextStore {
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
         for rootID in orderedRootIDs {
+            if let flights = scopedIngressBarrierFlightsByRootID.removeValue(forKey: rootID) {
+                for flight in flights {
+                    flight.task?.cancel()
+                    flight.join.complete(with: nil)
+                }
+            }
             watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
             publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }

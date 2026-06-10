@@ -105,6 +105,7 @@ actor FileSystemService {
 
         /// Test-only tracking of processed events
         var processedFolders: Set<String> = []
+        var processedFolderBatches: [[String]] = []
 
         /// Test-only method to mock directory contents
         var mockDirectoryContents: ((String) -> [String])?

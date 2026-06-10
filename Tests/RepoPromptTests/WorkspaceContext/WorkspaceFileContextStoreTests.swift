@@ -1236,28 +1236,40 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await store.setScopedIngressBarrierWillFlushHandler(nil)
         }
 
-        func testScopedIngressBarrierDiagnosticsDoNotReappearAfterRootUnload() async throws {
-            let root = try makeTemporaryRoot(name: "ScopedIngressDiagnosticsUnload")
+        func testRootUnloadCancelsOwnedScopedIngressFlightAndReleasesDetachedService() async throws {
+            let root = try makeTemporaryRoot(name: "ScopedIngressUnloadRelease")
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
-            let flushGate = AsyncGate()
+            var service: FileSystemService? = await store.fileSystemServiceForTesting(rootID: record.id)
+            let weakService = WeakObjectBox(service)
+            let cancellationGate = CancellationAwareGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == record.id else { return }
-                await flushGate.markStartedAndWaitForRelease()
+                await cancellationGate.markStartedAndWaitForCancellation()
             }
 
             let barrierTask = Task {
                 await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
             }
-            await flushGate.waitUntilStarted()
-            await store.unloadRoot(id: record.id)
-            var retainedRootIDs = await store.retainedReadSearchDiagnosticRootIDsForTesting()
-            XCTAssertFalse(retainedRootIDs.contains(record.id))
+            await cancellationGate.waitUntilStarted()
+            let activeFlightCount = await store.scopedIngressBarrierFlightCountForTesting()
+            XCTAssertEqual(activeFlightCount, 1)
 
-            await flushGate.release()
-            _ = await barrierTask.value
-            retainedRootIDs = await store.retainedReadSearchDiagnosticRootIDsForTesting()
+            await store.unloadRoot(id: record.id)
+            service = nil
+            let samples = await barrierTask.value
+            let roots = await store.roots()
+            let retainedRootIDs = await store.retainedReadSearchDiagnosticRootIDsForTesting()
+            let remainingFlightCount = await store.scopedIngressBarrierFlightCountForTesting()
+            let serviceReleased = await waitForAsyncCondition(maxYields: 10000) {
+                weakService.value == nil
+            }
+
+            XCTAssertTrue(samples.isEmpty)
+            XCTAssertTrue(roots.isEmpty)
+            XCTAssertEqual(remainingFlightCount, 0)
             XCTAssertFalse(retainedRootIDs.contains(record.id))
+            XCTAssertTrue(serviceReleased)
             await store.setScopedIngressBarrierWillFlushHandler(nil)
         }
 
@@ -4293,6 +4305,62 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             func startCount() -> Int {
                 startedCount
+            }
+        }
+
+        private actor CancellationAwareGate {
+            private struct Waiter {
+                let id: UUID
+                let continuation: CheckedContinuation<Void, Never>
+            }
+
+            private var started = false
+            private var startWaiters: [CheckedContinuation<Void, Never>] = []
+            private var cancellationWaiter: Waiter?
+            private var cancelledWaiterIDs: Set<UUID> = []
+
+            func markStartedAndWaitForCancellation() async {
+                started = true
+                let waiters = startWaiters
+                startWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+
+                let waiterID = UUID()
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        if Task.isCancelled || cancelledWaiterIDs.remove(waiterID) != nil {
+                            continuation.resume()
+                        } else {
+                            cancellationWaiter = Waiter(id: waiterID, continuation: continuation)
+                        }
+                    }
+                } onCancel: {
+                    Task { await self.cancel(waiterID) }
+                }
+            }
+
+            func waitUntilStarted() async {
+                guard !started else { return }
+                await withCheckedContinuation { continuation in
+                    startWaiters.append(continuation)
+                }
+            }
+
+            private func cancel(_ waiterID: UUID) {
+                guard let cancellationWaiter, cancellationWaiter.id == waiterID else {
+                    cancelledWaiterIDs.insert(waiterID)
+                    return
+                }
+                self.cancellationWaiter = nil
+                cancellationWaiter.continuation.resume()
+            }
+        }
+
+        private final class WeakObjectBox<T: AnyObject>: @unchecked Sendable {
+            weak var value: T?
+
+            init(_ value: T?) {
+                self.value = value
             }
         }
 

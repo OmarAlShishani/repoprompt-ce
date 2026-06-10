@@ -79,18 +79,20 @@ extension FileSystemService {
 
     /// Scan multiple folders in parallel for better I/O performance.
     /// Uses configurable caps to prevent CPU saturation.
-    func scanFoldersInParallel(_ folders: Set<String>) async throws -> FolderScanBatchResult {
+    func scanFoldersInParallel(_ folders: [String]) async throws -> FolderScanBatchResult {
         guard !folders.isEmpty else {
             return FolderScanBatchResult(deltas: [], scannedFolders: [])
         }
 
-        // Apply batch cap to limit per-tick work in high-churn scenarios.
-        let cappedFolders: Set<String> = if folders.count > maxFoldersPerBatch {
-            // Take a subset; remaining folders stay pending for a subsequent batch.
-            Set(folders.prefix(maxFoldersPerBatch))
-        } else {
-            folders
-        }
+        // Apply the cap without discarding caller-provided scheduling priority.
+        let cappedFolders = Array(folders.prefix(maxFoldersPerBatch))
+        let scannedFolders = Set(cappedFolders)
+
+        #if DEBUG
+            if isTestMode {
+                processedFolderBatches.append(cappedFolders)
+            }
+        #endif
 
         // In test mode, use the same cap but scan serially to avoid SpyFS thread-safety issues.
         #if DEBUG
@@ -100,7 +102,7 @@ extension FileSystemService {
                     let folderDeltas = try await scanOneLevelAndDiff(folder)
                     deltas.append(contentsOf: folderDeltas)
                 }
-                return FolderScanBatchResult(deltas: deltas, scannedFolders: cappedFolders)
+                return FolderScanBatchResult(deltas: deltas, scannedFolders: scannedFolders)
             }
         #endif
 
@@ -111,7 +113,7 @@ extension FileSystemService {
                 let folderDeltas = try await scanOneLevelAndDiff(folder)
                 deltas.append(contentsOf: folderDeltas)
             }
-            return FolderScanBatchResult(deltas: deltas, scannedFolders: cappedFolders)
+            return FolderScanBatchResult(deltas: deltas, scannedFolders: scannedFolders)
         }
 
         // Use parallel scanning for larger sets with BOUNDED CONCURRENCY
@@ -120,7 +122,7 @@ extension FileSystemService {
         // Use configured parallelism cap (prevents CPU saturation)
         let maxParallel = min(cappedFolders.count, maxParallelScansPerActor)
 
-        let targetParents = cappedFolders
+        let targetParents = scannedFolders
         var preservedChildrenByFolder: [String: Set<String>] = [:]
         preservedChildrenByFolder.reserveCapacity(targetParents.count)
         for path in visitedPaths {
@@ -218,7 +220,7 @@ extension FileSystemService {
             }
         }
 
-        return FolderScanBatchResult(deltas: aggregatedDeltas, scannedFolders: cappedFolders)
+        return FolderScanBatchResult(deltas: aggregatedDeltas, scannedFolders: scannedFolders)
     }
 
     // MARK: - Single-level scanning & removal

@@ -182,17 +182,21 @@ extension FileSystemService {
     func flushPendingEventsNow(
         throughAcceptedWatcherWatermark target: FileSystemWatcherIngressMailbox.Watermark
     ) async -> UInt64 {
+        guard !Task.isCancelled else { return lastServicePublicationSequence }
         drainAcceptedWatcherIngressMailboxPayloads(through: target)
         cancelScheduledCoalescingDelay()
 
         while lastPublishedWatcherAcceptedWatermark < target {
+            guard !Task.isCancelled else { return lastServicePublicationSequence }
             if let watcherBatchProcessingTask {
                 await watcherBatchProcessingTask.value
+                guard !Task.isCancelled else { return lastServicePublicationSequence }
                 drainAcceptedWatcherIngressMailboxPayloads(through: target)
                 cancelScheduledCoalescingDelay()
                 continue
             }
 
+            guard !Task.isCancelled else { return lastServicePublicationSequence }
             guard startProcessingPendingWatcherBatchIfNeeded() else {
                 // A callback cut must remain representable even if accepted payloads
                 // were explicitly abandoned during watcher teardown or produced no deltas.
@@ -1260,7 +1264,7 @@ extension FileSystemService {
         // - nil lastScannedId means "never scanned" → always eligible
         // - Otherwise, only rescan if pendingId > lastScannedId
         let scanCandidates = foldersToScan.union(pendingQuietFolderScanTargets)
-        let eligibleFolders = Set(scanCandidates.filter { folder in
+        let eligibleFolderSet = Set(scanCandidates.filter { folder in
             guard let pendingId = pendingScanTargets[folder] else {
                 return false // No pending scan target (shouldn't happen, but be defensive)
             }
@@ -1269,6 +1273,11 @@ extension FileSystemService {
             }
             return pendingId > lastScannedId // Only rescan if newer events arrived
         })
+        // Carry-over work always precedes newly arrived work. Once a carried folder is
+        // scanned it leaves this set, so capped batches advance through the backlog.
+        let carriedFolders = pendingQuietFolderScanTargets.intersection(eligibleFolderSet).sorted()
+        let newlyEligibleFolders = eligibleFolderSet.subtracting(pendingQuietFolderScanTargets).sorted()
+        let eligibleFolders = carriedFolders + newlyEligibleFolders
 
         // Use parallel scanning for better I/O performance
         if !eligibleFolders.isEmpty {
@@ -1301,7 +1310,7 @@ extension FileSystemService {
                 pendingQuietFolderScanTargets.subtract(scanResult.scannedFolders)
                 if watcherBatchBelongsToCurrentIngressGeneration(batch) {
                     pendingQuietFolderScanTargets.formUnion(
-                        eligibleFolders.subtracting(scanResult.scannedFolders)
+                        eligibleFolderSet.subtracting(scanResult.scannedFolders)
                     )
                     pendingQuietFolderScanTargets.formIntersection(Set(pendingScanTargets.keys))
                 }
@@ -1309,7 +1318,7 @@ extension FileSystemService {
                 print("Error during parallel folder scanning: \(error)")
                 // A failed scan remains pending for a future event, but must not create a
                 // tight quiet-retry loop. The serial fallback gets one immediate attempt.
-                pendingQuietFolderScanTargets.subtract(eligibleFolders)
+                pendingQuietFolderScanTargets.subtract(Set(eligibleFolders))
                 // Fallback to serial scanning if parallel fails
                 for folderRelPath in eligibleFolders {
                     do {

@@ -82,12 +82,19 @@ private final class ToolCallSettlementState: @unchecked Sendable {
 
     private let lock = NSLock()
     private var outcome: Outcome = .pending
+    private var cancellationDeliveryTask: Task<Void, Never>?
 
-    func claim(_ candidate: Outcome) -> Bool {
+    func claim(
+        _ candidate: Outcome,
+        deliverCancellation: @escaping @Sendable () async -> Void
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard case .pending = outcome else { return false }
         outcome = candidate
+        cancellationDeliveryTask = Task.detached {
+            await deliverCancellation()
+        }
         return true
     }
 
@@ -98,6 +105,24 @@ private final class ToolCallSettlementState: @unchecked Sendable {
             outcome = .completed
         }
         return outcome
+    }
+
+    func waitForCancellationDelivery() async {
+        await cancellationDeliveryTaskSnapshot()?.value
+    }
+
+    private func cancellationDeliveryTaskSnapshot() -> Task<Void, Never>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationDeliveryTask
+    }
+}
+
+private struct RegisteredToolCall {
+    let context: RequestContext<CallTool.Result>
+
+    var requestID: ID {
+        context.requestID
     }
 }
 
@@ -111,11 +136,16 @@ actor InteractiveMCPClientSession {
     private let timeoutSleep: TimeoutSleep
 
     private var client: MCP.Client?
-    private var transport: BootstrapSocketMCPTransport?
+    private var transport: (any Transport)?
+    private var requestSendBarrier: MCPRequestSendBarrier?
     private var cachedTools: [MCP.Tool] = []
     private var toolListFetched = false
     private var defaultToolCallTimeout: ToolCallTimeoutPolicy = .seconds(300)
     private(set) var toolsDirty = false
+
+    #if DEBUG
+        private let requestSendWillStart: (@Sendable () async -> Void)?
+    #endif
 
     /// Server info from initialization
     private(set) var serverName: String?
@@ -142,11 +172,16 @@ actor InteractiveMCPClientSession {
         timeoutSleep = { nanoseconds in
             try await Task.sleep(nanoseconds: nanoseconds)
         }
+        #if DEBUG
+            requestSendWillStart = nil
+        #endif
     }
 
     #if DEBUG
         init(
             connectedClientForTesting client: MCP.Client,
+            requestSendBarrier: MCPRequestSendBarrier,
+            requestSendWillStart: (@Sendable () async -> Void)? = nil,
             timeoutSleep: @escaping TimeoutSleep = { nanoseconds in
                 try await Task.sleep(nanoseconds: nanoseconds)
             }
@@ -158,6 +193,8 @@ actor InteractiveMCPClientSession {
             }
             self.timeoutSleep = timeoutSleep
             self.client = client
+            self.requestSendBarrier = requestSendBarrier
+            self.requestSendWillStart = requestSendWillStart
         }
     #endif
 
@@ -174,13 +211,19 @@ actor InteractiveMCPClientSession {
         let connectedFD = try await performBootstrapHandshake()
         logger.debug("Bootstrap handshake complete, FD=\(connectedFD)")
 
-        // Create transport with the connected FD
-        let transport: BootstrapSocketMCPTransport
+        // Create transport with the connected FD and observe completed request writes.
+        let socketTransport: BootstrapSocketMCPTransport
         do {
-            transport = try BootstrapSocketMCPTransport(connectedFD: connectedFD, logger: logger)
+            socketTransport = try BootstrapSocketMCPTransport(connectedFD: connectedFD, logger: logger)
         } catch let error as POSIXDescriptorConfigurationError {
             throw InteractiveSessionError.descriptorConfigurationFailed(errno: error.errnoValue)
         }
+        let requestSendBarrier = MCPRequestSendBarrier()
+        let transport = OrderedMCPTransport(
+            underlying: socketTransport,
+            requestSendBarrier: requestSendBarrier,
+            logger: logger
+        )
 
         // Create MCP client
         let client = MCP.Client(
@@ -188,6 +231,7 @@ actor InteractiveMCPClientSession {
             version: "1.0"
         )
         self.transport = transport
+        self.requestSendBarrier = requestSendBarrier
         self.client = client
         logger.debug("Created MCP client '\(clientName)'")
 
@@ -240,6 +284,7 @@ actor InteractiveMCPClientSession {
             await transport.disconnect()
             self.client = nil
             self.transport = nil
+            self.requestSendBarrier = nil
             cachedTools = []
             toolListFetched = false
             toolsDirty = false
@@ -255,6 +300,7 @@ actor InteractiveMCPClientSession {
         await transport?.disconnect()
         client = nil
         transport = nil
+        requestSendBarrier = nil
         cachedTools = []
         toolListFetched = false
         toolsDirty = false
@@ -325,7 +371,7 @@ actor InteractiveMCPClientSession {
         arguments: [String: Value]?,
         timeout: ToolCallTimeoutPolicy = .default
     ) async throws -> CallTool.Result {
-        guard let client else {
+        guard let client, let requestSendBarrier else {
             throw InteractiveSessionError.notConnected
         }
 
@@ -346,14 +392,15 @@ actor InteractiveMCPClientSession {
         }
 
         logger.debug("Calling tool: \(name)")
-        try Task.checkCancellation()
-        let context: RequestContext<CallTool.Result> = try await client.callTool(
+        let registeredCall = try await registerAndSendToolCall(
+            client: client,
+            requestSendBarrier: requestSendBarrier,
             name: name,
             arguments: args.isEmpty ? nil : args
         )
         let effectiveTimeout = resolvedTimeout(timeout)
         let result = try await awaitToolCallResult(
-            context,
+            registeredCall,
             client: client,
             toolName: name,
             timeoutSeconds: effectiveTimeout
@@ -367,8 +414,31 @@ actor InteractiveMCPClientSession {
         return result
     }
 
+    private func registerAndSendToolCall(
+        client: MCP.Client,
+        requestSendBarrier: MCPRequestSendBarrier,
+        name: String,
+        arguments: [String: Value]?
+    ) async throws -> RegisteredToolCall {
+        #if DEBUG
+            if let requestSendWillStart {
+                await requestSendWillStart()
+            }
+        #endif
+        let request = CallTool.request(.init(name: name, arguments: arguments))
+        await requestSendBarrier.register(requestID: request.id)
+        do {
+            let context = try await client.send(request)
+            try await requestSendBarrier.waitUntilSent(requestID: request.id)
+            return RegisteredToolCall(context: context)
+        } catch {
+            await requestSendBarrier.cancel(requestID: request.id)
+            throw error
+        }
+    }
+
     private func awaitToolCallResult(
-        _ context: RequestContext<CallTool.Result>,
+        _ registeredCall: RegisteredToolCall,
         client: MCP.Client,
         toolName: String,
         timeoutSeconds: TimeInterval?
@@ -381,10 +451,9 @@ actor InteractiveMCPClientSession {
                 } catch {
                     return
                 }
-                guard settlement.claim(.timedOut) else { return }
-                Task.detached {
+                _ = settlement.claim(.timedOut) {
                     try? await client.cancelRequest(
-                        context.requestID,
+                        registeredCall.requestID,
                         reason: "CLI tool call timed out after \(seconds) seconds"
                     )
                 }
@@ -394,24 +463,27 @@ actor InteractiveMCPClientSession {
 
         do {
             let result = try await withTaskCancellationHandler {
-                try await context.value
+                try await registeredCall.context.value
             } onCancel: {
-                guard settlement.claim(.callerCancelled) else { return }
-                Task.detached {
+                _ = settlement.claim(.callerCancelled) {
                     try? await client.cancelRequest(
-                        context.requestID,
+                        registeredCall.requestID,
                         reason: "CLI caller cancelled tool request"
                     )
                 }
             }
+            let outcome = settlement.finish()
+            await settlement.waitForCancellationDelivery()
             return try Self.resolveToolCallSettlement(
-                settlement.finish(),
+                outcome,
                 result: result,
                 toolName: toolName,
                 timeoutSeconds: timeoutSeconds
             )
         } catch {
-            switch settlement.finish() {
+            let outcome = settlement.finish()
+            await settlement.waitForCancellationDelivery()
+            switch outcome {
             case .timedOut:
                 throw InteractiveSessionError.toolCallTimeout(
                     toolName: toolName,

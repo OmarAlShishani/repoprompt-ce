@@ -317,6 +317,46 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         XCTAssertTrue(secondRedundantInitialization.isEmpty)
     }
 
+    func testMaterializerRetriesCodemapInitializationAfterZeroFileIngress() async throws {
+        let logicalRootURL = try makeTemporaryRoot(name: "ProjectionRetryLogical")
+        let physicalRootURL = try makeTemporaryRoot(name: "ProjectionRetryPhysical")
+        let store = WorkspaceFileContextStore()
+        let loadedLogicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+        let logicalRoot = WorkspaceRootRef(
+            id: loadedLogicalRoot.id,
+            name: loadedLogicalRoot.name,
+            fullPath: loadedLogicalRoot.standardizedFullPath
+        )
+        let physicalRoot = WorkspaceRootRef(id: UUID(), name: logicalRoot.name, fullPath: physicalRootURL.path)
+        let binding = Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "retry")
+
+        let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: UUID(),
+            bindings: [binding]
+        )
+        let projection = try XCTUnwrap(materializedProjection)
+        let physicalRootID = try XCTUnwrap(projection.physicalRootRefs.first?.id)
+        let emptyRetry = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
+        XCTAssertTrue(emptyRetry.isEmpty)
+
+        _ = try await store.createFile(
+            rootID: physicalRootID,
+            relativePath: "Sources/App.swift",
+            content: "struct RetryAfterIngressType {\n    func retryMethod() {}\n}\n"
+        )
+        let submittedRetry = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
+        XCTAssertEqual(submittedRetry, [physicalRootID])
+        let redundantRetry = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
+        XCTAssertTrue(redundantRetry.isEmpty)
+
+        let snapshot = try await waitForCodemapSnapshot(
+            store: store,
+            rootID: physicalRootID,
+            relativePath: "Sources/App.swift"
+        )
+        XCTAssertTrue(snapshot.fileAPI?.apiDescription.contains("RetryAfterIngressType") == true)
+    }
+
     func testMaterializedSessionWorktreeScopeReportsAvailable() async throws {
         let logicalRootURL = try makeTemporaryRoot(name: "ProjectionAvailableLogical")
         let physicalRootURL = try makeTemporaryRoot(name: "ProjectionAvailablePhysical")

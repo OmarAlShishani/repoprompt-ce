@@ -35,8 +35,12 @@ struct WorkspaceRootBindingProjection: Equatable {
         Set(replacementsByLogicalRootPath.values.map(\.physicalRoot.standardizedFullPath))
     }
 
+    var canonicalRootPaths: Set<String> {
+        Set(visibleLogicalRoots.map(\.standardizedFullPath)).subtracting(logicalRootPaths)
+    }
+
     var lookupRootScope: WorkspaceLookupRootScope {
-        .sessionBoundWorkspace(logicalRootPaths: logicalRootPaths, physicalRootPaths: physicalRootPaths)
+        .sessionBoundWorkspace(canonicalRootPaths: canonicalRootPaths, physicalRootPaths: physicalRootPaths)
     }
 
     var logicalRootRefs: [WorkspaceRootRef] {
@@ -113,6 +117,16 @@ struct WorkspaceRootBindingProjection: Equatable {
                 ranges: input.ranges
             )
         }
+    }
+
+    func projectedLogicalRootMetadata(forPhysicalPath rawPath: String) -> (rootPath: String, pathWithinRoot: String)? {
+        let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
+        guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {
+            return nil
+        }
+        let relative = String(standardized.dropFirst(boundRoot.physicalRoot.standardizedFullPath.count))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return (boundRoot.logicalRoot.standardizedFullPath, StandardizedPath.relative(relative))
     }
 
     func projectedLogicalDisplayPath(forPhysicalPath rawPath: String, display: FilePathDisplay = .relative) -> String? {

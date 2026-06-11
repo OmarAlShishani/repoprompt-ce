@@ -178,10 +178,10 @@ final class MCPServerViewModel: ObservableObject {
     private let oracleVM: OracleViewModel
     let workspaceManager: WorkspaceManagerViewModel?
     let selectionCoordinator: WorkspaceSelectionCoordinator?
-    var agentWorktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
+    var agentWorktreeBindingStateProvider: (@MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState)?
 
-    func registerAgentWorktreeBindingsProvider(_ provider: @escaping @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]) {
-        agentWorktreeBindingsProvider = provider
+    func registerAgentWorktreeBindingsProvider(_ provider: @escaping @MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState) {
+        agentWorktreeBindingStateProvider = provider
     }
 
     private let workspaceSearch: WorkspaceSearchHandler
@@ -242,7 +242,6 @@ final class MCPServerViewModel: ObservableObject {
                 )
             },
             requireCurrentTabContext: { [self] toolName in try await requireCurrentTabContext(toolName: toolName) },
-            resolveLookupContext: { [self] context in await lookupContext(for: context) },
             rebindChatSessionIfNeeded: { [self] metadata, chatIDString in
                 try rebindOracleChatSessionIfNeeded(metadata: metadata, chatIDString: chatIDString)
             },
@@ -842,9 +841,9 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return nil }
             return await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
         },
-        makeSelectionHintError: { [weak self] paths, operation, lookupRootScope in
+        makeSelectionHintError: { [weak self] paths, operation, lookupContext in
             guard let self else { return "Window deallocated while resolving selection inputs." }
-            return await makeSelectionHintError(paths: paths, operation: operation, lookupRootScope: lookupRootScope)
+            return await makeSelectionHintError(paths: paths, operation: operation, lookupContext: lookupContext)
         },
         performFileAction: { [weak self] action, path, content, newPath, ifExists in
             guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
@@ -985,7 +984,7 @@ final class MCPServerViewModel: ObservableObject {
             forTabID: key.tabID,
             inWorkspaceID: key.workspaceID
         ),
-            agentWorktreeBindingsProvider?(sessionID, key.tabID).isEmpty == false
+            agentWorktreeBindingStateProvider?(sessionID, key.tabID).bindings?.isEmpty == false
         {
             // Worktree-only paths cannot be represented by the logical base file tree. Their
             // canonical selection and badge presentation are already updated by persistence.
@@ -3596,21 +3595,25 @@ final class MCPServerViewModel: ObservableObject {
     private func makeSelectionHintError(
         paths: [String],
         operation: String,
-        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async -> String {
         let trimmed = paths.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-        let roots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupRootScope)
+        let roots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         if roots.isEmpty {
             return "No workspace is currently loaded in this window. Use the 'manage_workspaces' tool with action: 'list' to see available workspaces, then action: 'switch' to load one."
         }
 
-        let rootSummaries = roots.map { "\($0.name) → \($0.fullPath)" }.joined(separator: "; ")
+        let displayRoots = lookupContext.bindingProjection?.visibleLogicalRootRefs ?? roots
+        let rootSummaries = displayRoots.map { "\($0.name) → \($0.fullPath)" }.joined(separator: "; ")
 
         var outside: [String] = []
-        for p in trimmed where p.hasPrefix("/") {
-            let standardized = StandardizedPath.absolute(p)
-            let under = roots.contains { StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) || standardized == $0.standardizedFullPath }
-            if !under { outside.append(p) }
+        for path in trimmed where path.hasPrefix("/") {
+            let standardized = StandardizedPath.absolute(lookupContext.translateInputPath(path))
+            let under = roots.contains {
+                standardized == $0.standardizedFullPath
+                    || StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath)
+            }
+            if !under { outside.append(path) }
         }
 
         var lines: [String] = []
@@ -3686,10 +3689,9 @@ final class MCPServerViewModel: ObservableObject {
         switch await store.rootScopeAvailability(lookupContext.rootScope) {
         case .available:
             break
-        case let .sessionWorktreeUnavailable(missingPhysicalRootPaths):
-            let paths = missingPhysicalRootPaths.joined(separator: ", ")
+        case .sessionWorktreeUnavailable:
             throw MCPError.invalidParams(
-                "The session-bound worktree root is unavailable: \(paths). get_code_structure stopped rather than reading the canonical checkout."
+                "The session-bound worktree root is unavailable. get_code_structure stopped rather than reading the canonical checkout."
             )
         }
 
@@ -3728,16 +3730,24 @@ final class MCPServerViewModel: ObservableObject {
         var snapshots = await store.codemapSnapshotDictionary()
         try Task.checkCancellation()
         let repairLimit = min(max(0, maxResults), Self.maxCodeStructureSelfHealingFiles)
-        let repairFiles = codeStructureFiles.lazy.filter { item in
+        let repairFiles = Array(codeStructureFiles.lazy.filter { item in
             guard snapshots[item.file.id] == nil else { return false }
             let ext = (item.file.name as NSString).pathExtension
             return SyntaxManager.isSupportedFileExtension(ext)
-        }.prefix(repairLimit).map(\.file)
-        let repairResult = try await store.repairMissingCodemapSnapshots(
-            for: Array(repairFiles),
-            timeout: selfHealTimeout
-        )
-        snapshots = repairResult.snapshotsByFileID
+        }.prefix(repairLimit).map(\.file))
+        let repairResult: WorkspaceCodemapRepairResult
+        if repairFiles.isEmpty {
+            repairResult = WorkspaceCodemapRepairResult(
+                snapshotsByFileID: snapshots,
+                pendingFileIDs: []
+            )
+        } else {
+            repairResult = try await store.repairMissingCodemapSnapshots(
+                for: repairFiles,
+                timeout: selfHealTimeout
+            )
+            snapshots = repairResult.snapshotsByFileID
+        }
         try Task.checkCancellation()
 
         var renderable: [RenderableCodeStructure] = []
@@ -3756,8 +3766,11 @@ final class MCPServerViewModel: ObservableObject {
                 )
             } else if repairResult.pendingFileIDs.contains(item.file.id) {
                 pendingPaths.append(item.displayPath)
-            } else if includeUnmappedPaths {
-                unmappedPaths.append(item.displayPath)
+            } else {
+                let ext = (item.file.name as NSString).pathExtension
+                if includeUnmappedPaths || SyntaxManager.isSupportedFileExtension(ext) {
+                    unmappedPaths.append(item.displayPath)
+                }
             }
         }
 
@@ -3777,7 +3790,7 @@ final class MCPServerViewModel: ObservableObject {
         }
         try Task.checkCancellation()
         let content = contentParts.joined(separator: "\n\n")
-        let sortedUnmapped = includeUnmappedPaths && !unmappedPaths.isEmpty ? unmappedPaths.sorted() : nil
+        let sortedUnmapped = unmappedPaths.isEmpty ? nil : unmappedPaths.sorted()
         let sortedPending = pendingPaths.isEmpty ? nil : pendingPaths.sorted()
         return ToolResultDTOs.SelectedCodeStructureDTO(
             fileCount: budgetSelection.includedKeys.count,
@@ -4197,17 +4210,12 @@ final class MCPServerViewModel: ObservableObject {
         }
         let standardizedRoot = (expandedRoot as NSString).standardizingPath
         try validateOracleExportPrimaryRoot(standardizedRoot)
-        // Generated handoff files must live in the same effective root that read_file uses
-        // for this context; otherwise the returned logical path is remapped to a missing file.
-        let effectiveRoot = StandardizedPath.absolute(lookupContext.translateInputPath(standardizedRoot))
-        try validateOracleExportPrimaryRoot(effectiveRoot)
-
         return OracleExportDestination(
             workspaceID: workspace.id,
             windowID: windowID,
             tabID: tabID,
-            primaryRootPath: effectiveRoot,
-            rootScope: lookupContext.rootScope
+            primaryRootPath: standardizedRoot,
+            lookupContext: lookupContext
         )
     }
 

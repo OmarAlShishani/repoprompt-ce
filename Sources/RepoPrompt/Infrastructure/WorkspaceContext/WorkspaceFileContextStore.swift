@@ -1100,6 +1100,7 @@ actor WorkspaceFileContextStore {
     )
     private var codemapSnapshotsByFileID: [UUID: WorkspaceCodemapSnapshot] = [:]
     private var codemapFileIDsByRootID: [UUID: Set<UUID>] = [:]
+    private var initializingSessionWorktreeCodemapRootIDs = Set<UUID>()
     private var initializedSessionWorktreeCodemapRootIDs = Set<UUID>()
     private var cachedCodemapFileAPIAggregate: WorkspaceCodemapFileAPIAggregate?
     private var codemapUpdateContinuations: [UUID: AsyncStream<WorkspaceCodemapUpdateEvent>.Continuation] = [:]
@@ -1632,18 +1633,14 @@ actor WorkspaceFileContextStore {
         let requested = Set(requestedPhysicalRootPaths.map {
             StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
         })
-        let loaded = Set(rootStatesByID.values.compactMap { state -> String? in
-            guard state.root.kind == .sessionWorktree else { return nil }
+        let missing = requested.filter { path in
+            guard let rootID = rootIDsByStandardizedPath[path],
+                  rootStatesByID[rootID]?.root.kind == .sessionWorktree
+            else { return true }
             var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(
-                atPath: state.root.standardizedFullPath,
-                isDirectory: &isDirectory
-            ), isDirectory.boolValue else {
-                return nil
-            }
-            return state.root.standardizedFullPath
-        })
-        let missing = requested.subtracting(loaded).sorted()
+            return !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) ||
+                !isDirectory.boolValue
+        }.sorted()
         return missing.isEmpty
             ? .available
             : .sessionWorktreeUnavailable(missingPhysicalRootPaths: missing)
@@ -3588,6 +3585,12 @@ actor WorkspaceFileContextStore {
         func codemapMemoryCounters() async -> CodeScanActor.CodemapMemoryCounters {
             await codeScanActor.codemapMemoryCounters()
         }
+
+        func setCodemapScanWillStartHandlerForTesting(
+            _ handler: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await codeScanActor.setScanWillStartHandlerForTesting(handler)
+        }
     #endif
 
     private func removeCodemapUpdateContinuation(_ id: UUID) {
@@ -3595,7 +3598,23 @@ actor WorkspaceFileContextStore {
     }
 
     private func clearSessionWorktreeCodemapInitialization(rootIDs: [UUID]) {
+        initializingSessionWorktreeCodemapRootIDs.subtract(rootIDs)
         initializedSessionWorktreeCodemapRootIDs.subtract(rootIDs)
+    }
+
+    private func completeSessionWorktreeCodemapInitialization(
+        requestedRootIDs: [UUID],
+        submittedRootIDs: [UUID]
+    ) {
+        initializingSessionWorktreeCodemapRootIDs.subtract(requestedRootIDs)
+        let completedRootIDs = submittedRootIDs.filter { rootID in
+            guard let root = rootStatesByID[rootID]?.root,
+                  root.kind == .sessionWorktree,
+                  !files(inRoot: rootID).isEmpty
+            else { return false }
+            return true
+        }
+        initializedSessionWorktreeCodemapRootIDs.formUnion(completedRootIDs)
     }
 
     @discardableResult
@@ -4001,6 +4020,7 @@ actor WorkspaceFileContextStore {
         #endif
 
         let removedRootIDSet = Set(statesToUnload.map(\.rootID))
+        initializingSessionWorktreeCodemapRootIDs.subtract(removedRootIDSet)
         initializedSessionWorktreeCodemapRootIDs.subtract(removedRootIDSet)
         rootLoadOrder.removeAll { removedRootIDSet.contains($0) }
         for entry in statesToUnload {
@@ -4559,16 +4579,22 @@ actor WorkspaceFileContextStore {
             guard seen.insert(rootID).inserted,
                   let root = rootStatesByID[rootID]?.root,
                   root.kind == .sessionWorktree,
+                  !files(inRoot: rootID).isEmpty,
+                  !initializingSessionWorktreeCodemapRootIDs.contains(rootID),
                   !initializedSessionWorktreeCodemapRootIDs.contains(rootID)
             else { return false }
             return true
         }
         guard !pendingRootIDs.isEmpty else { return [] }
 
-        initializedSessionWorktreeCodemapRootIDs.formUnion(pendingRootIDs)
+        initializingSessionWorktreeCodemapRootIDs.formUnion(pendingRootIDs)
         Task.detached(priority: .utility) { [store = self, pendingRootIDs] in
             do {
-                try await store.requestInitialRootCodemapScans(rootIDs: pendingRootIDs)
+                let submittedRootIDs = try await store.requestInitialRootCodemapScans(rootIDs: pendingRootIDs)
+                await store.completeSessionWorktreeCodemapInitialization(
+                    requestedRootIDs: pendingRootIDs,
+                    submittedRootIDs: submittedRootIDs
+                )
             } catch {
                 await store.clearSessionWorktreeCodemapInitialization(rootIDs: pendingRootIDs)
             }
@@ -4601,14 +4627,19 @@ actor WorkspaceFileContextStore {
         }
 
         let requests = try await codemapScanRequests(for: missingFiles)
-        let submittedFileIDs = Set(requests.map(\.fileID))
-        if !requests.isEmpty {
+        let submittedFileIDs: Set<UUID>
+        let alreadyScheduledFileIDs: Set<UUID>
+        if requests.isEmpty {
+            submittedFileIDs = []
+            alreadyScheduledFileIDs = []
+        } else {
             let rootFolderPaths = Array(Set(requests.map(\.rootFolderPath)))
-            await codeScanActor.requestScans(
+            let requestResult = await codeScanActor.requestSelfHealingScans(
                 requests,
-                purpose: .selfHealing,
                 rootFolderPaths: rootFolderPaths
             )
+            submittedFileIDs = requestResult.submittedFileIDs
+            alreadyScheduledFileIDs = requestResult.alreadyScheduledFileIDs
         }
 
         if !submittedFileIDs.isEmpty, timeout > .zero {
@@ -4624,10 +4655,11 @@ actor WorkspaceFileContextStore {
 
         try Task.checkCancellation()
         let snapshots = codemapSnapshotDictionary()
-        let targetFileIDs = Set(missingFiles.map(\.id))
         return WorkspaceCodemapRepairResult(
             snapshotsByFileID: snapshots,
-            pendingFileIDs: targetFileIDs.filter { snapshots[$0] == nil }
+            pendingFileIDs: submittedFileIDs
+                .union(alreadyScheduledFileIDs)
+                .filter { snapshots[$0] == nil }
         )
     }
 
@@ -4693,10 +4725,11 @@ actor WorkspaceFileContextStore {
         #endif
     }
 
+    @discardableResult
     func requestInitialRootCodemapScans(
         rootIDs: [UUID],
         purgeCachesOnEmptyInitialRequests: Bool = false
-    ) async throws {
+    ) async throws -> [UUID] {
         await ensureCodeScanResultTask()
         #if DEBUG
             let collectFilesStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -4724,7 +4757,7 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
-        guard !orderedRootIDs.isEmpty else { return }
+        guard !orderedRootIDs.isEmpty else { return [] }
         #if DEBUG
             let buildRequestsStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
@@ -4748,7 +4781,7 @@ actor WorkspaceFileContextStore {
             currentRootIDs.insert(rootID)
             currentRootFolderPaths.append(state.root.standardizedFullPath)
         }
-        guard !currentRootFolderPaths.isEmpty else { return }
+        guard !currentRootFolderPaths.isEmpty else { return [] }
         let currentRequests = requests.filter { request in
             guard let file = filesByID[request.fileID] else { return false }
             return currentRootIDs.contains(file.rootID)
@@ -4756,7 +4789,7 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             let submitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
-        await codeScanActor.requestScans(
+        let submittedFileIDs = await codeScanActor.requestScans(
             currentRequests,
             purpose: .initialRootLoad,
             rootFolderPaths: currentRootFolderPaths,
@@ -4773,6 +4806,11 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
+        let submittedRootIDs = Set(currentRequests.compactMap { request -> UUID? in
+            guard submittedFileIDs.contains(request.fileID) else { return nil }
+            return filesByID[request.fileID]?.rootID
+        })
+        return orderedRootIDs.filter { submittedRootIDs.contains($0) }
     }
 
     func requestCodemapScans(for files: [WorkspaceFileRecord]) async throws {
@@ -6198,10 +6236,10 @@ actor WorkspaceFileContextStore {
             return 1
         case .allLoaded:
             return 2
-        case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
+        case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             var hasher = Hasher()
             hasher.combine("sessionBoundWorkspace")
-            hasher.combine(normalizedSessionSelectorPaths(logicalRootPaths).sorted())
+            hasher.combine(normalizedSessionSelectorPaths(canonicalRootPaths).sorted())
             hasher.combine(normalizedSessionSelectorPaths(physicalRootPaths).sorted())
             return UInt64(bitPattern: Int64(hasher.finalize()))
         }
@@ -6259,13 +6297,13 @@ actor WorkspaceFileContextStore {
             return allRoots.filter { $0.kind == .primaryWorkspace || $0.kind == .workspaceGitData }
         case .allLoaded:
             return allRoots
-        case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
-            let normalizedLogicalRootPaths = normalizedSessionSelectorPaths(logicalRootPaths)
+        case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
+            let normalizedCanonicalRootPaths = normalizedSessionSelectorPaths(canonicalRootPaths)
             let normalizedPhysicalRootPaths = normalizedSessionSelectorPaths(physicalRootPaths)
             return allRoots.filter { root in
                 switch root.kind {
                 case .primaryWorkspace:
-                    !normalizedLogicalRootPaths.contains(root.standardizedFullPath)
+                    normalizedCanonicalRootPaths.contains(root.standardizedFullPath)
                 case .sessionWorktree:
                     normalizedPhysicalRootPaths.contains(root.standardizedFullPath)
                 case .workspaceGitData, .supplementalSystem:

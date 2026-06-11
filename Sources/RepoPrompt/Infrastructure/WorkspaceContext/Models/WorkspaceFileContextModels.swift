@@ -5,7 +5,7 @@ enum WorkspaceLookupRootScope: Hashable {
     case visibleWorkspace
     case visibleWorkspacePlusGitData
     case allLoaded
-    case sessionBoundWorkspace(logicalRootPaths: Set<String>, physicalRootPaths: Set<String>)
+    case sessionBoundWorkspace(canonicalRootPaths: Set<String>, physicalRootPaths: Set<String>)
 }
 
 enum WorkspaceLookupRootScopeAvailability: Equatable {

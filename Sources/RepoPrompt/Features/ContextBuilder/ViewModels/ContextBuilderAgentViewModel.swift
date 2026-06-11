@@ -2882,7 +2882,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         workspaceContext: ContextBuilderWorkspaceContext? = nil
     ) {
         if let workspaceContext {
-            session.runStartContextBuilderPromptIDs = Set(workspaceContext.frozenTabContext.selectedMetaPromptIDs)
+            session.runStartContextBuilderPromptIDs = Set(workspaceContext.frozenTabContext.selectedContextBuilderPromptIDs)
             session.runStartPromptText = workspaceContext.frozenTabContext.promptText
             session.runStartSelection = workspaceContext.frozenTabContext.selection
             debugLog("Captured run-start state from frozen Agent Mode context for tab=\(session.tabID)")

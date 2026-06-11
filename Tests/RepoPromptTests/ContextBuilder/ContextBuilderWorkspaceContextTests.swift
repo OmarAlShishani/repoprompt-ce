@@ -22,6 +22,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         let parentRunID = UUID()
         let tabID = UUID()
         let workspaceID = UUID()
+        let storedPromptID = UUID()
+        let contextBuilderPromptID = UUID()
         let binding = makeBinding(logicalRoot: logicalRoot, worktreeRoot: worktreeRoot)
         let selection = StoredSelection(
             selectedPaths: [logicalRoot.appendingPathComponent("Sources/App.swift").path],
@@ -33,7 +35,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             workspaceID: workspaceID,
             promptText: "Inspect the branch implementation",
             selection: selection,
-            selectedMetaPromptIDs: [UUID()],
+            selectedMetaPromptIDs: [storedPromptID],
+            selectedContextBuilderPromptIDs: [contextBuilderPromptID],
             tabName: "Agent tab",
             runID: parentRunID,
             activeAgentSessionID: sessionID,
@@ -49,9 +52,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         )
 
         XCTAssertEqual(context.parentAgentSessionID, sessionID)
-        XCTAssertEqual(context.parentAgentRunID, parentRunID)
         XCTAssertEqual(context.tabID, tabID)
-        XCTAssertEqual(context.workspaceID, workspaceID)
         XCTAssertEqual(context.providerWorkspacePath, worktreeRoot.standardizedFileURL.path)
         XCTAssertEqual(
             context.lookupContext.translateInputPath(logicalRoot.appendingPathComponent("Sources/App.swift").path),
@@ -65,7 +66,9 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(nested.worktreeBindings, [binding])
         XCTAssertEqual(nested.promptText, snapshot.promptText)
         XCTAssertEqual(nested.selection, snapshot.selection)
-        XCTAssertEqual(nested.selectedMetaPromptIDs, snapshot.selectedMetaPromptIDs)
+        XCTAssertEqual(nested.selectedMetaPromptIDs, [storedPromptID])
+        XCTAssertEqual(nested.selectedContextBuilderPromptIDs, [contextBuilderPromptID])
+        XCTAssertEqual(nested.frozenLookupContext, context.lookupContext)
         XCTAssertTrue(nested.explicitlyBound)
         XCTAssertEqual(nested.readFileAutoSelectionGeneration, 7)
     }
@@ -82,7 +85,6 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
 
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: logicalRoot.path)
-        _ = try await store.loadRoot(path: otherWorkspaceRoot.path)
         let snapshot = MCPServerViewModel.TabContextSnapshot(
             tabID: UUID(),
             windowID: 42,
@@ -105,8 +107,66 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
 
         XCTAssertEqual(context.providerWorkspacePath, logicalRoot.standardizedFileURL.path)
         XCTAssertNil(context.lookupContext.bindingProjection)
+
+        _ = try await store.loadRoot(path: otherWorkspaceRoot.path)
         let frozenRoots = await store.rootRefs(scope: context.lookupContext.rootScope)
         XCTAssertEqual(Set(frozenRoots.map(\.standardizedFullPath)), Set([logicalRoot.standardizedFileURL.path]))
+
+        let nested = context.nestedDiscoveryTabContext(runID: UUID())
+        XCTAssertEqual(nested.frozenLookupContext, context.lookupContext)
+        let nestedLookupContext = try XCTUnwrap(nested.frozenLookupContext)
+        let nestedRoots = await store.rootRefs(scope: nestedLookupContext.rootScope)
+        XCTAssertEqual(Set(nestedRoots.map(\.standardizedFullPath)), Set([logicalRoot.standardizedFileURL.path]))
+    }
+
+    func testResolveFailsClosedWhenWorktreeBindingStateIsUnhydrated() async throws {
+        let logicalRoot = try makeTemporaryDirectory(name: "ContextBuilderUnhydrated")
+        defer { try? FileManager.default.removeItem(at: logicalRoot) }
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let snapshot = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: 44,
+            workspaceID: UUID(),
+            promptText: "Question",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "Unhydrated",
+            runID: UUID(),
+            activeAgentSessionID: UUID(),
+            worktreeBindingState: .unhydrated,
+            explicitlyBound: false
+        )
+
+        do {
+            _ = try await ContextBuilderWorkspaceContext.resolve(
+                from: snapshot,
+                workspaceRepoPaths: [logicalRoot.path],
+                store: store
+            )
+            XCTFail("Expected unhydrated binding state to fail closed")
+        } catch let error as ContextBuilderWorkspaceContextError {
+            XCTAssertEqual(error, .unavailableWorktreeBindingState)
+        }
+    }
+
+    func testAuthoritativeLookupContextFailsClosedInsteadOfAdmittingCanonicalRoots() async throws {
+        let logicalRoot = try makeTemporaryDirectory(name: "ContextBuilderFailClosedLookup")
+        defer { try? FileManager.default.removeItem(at: logicalRoot) }
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: logicalRoot.path)
+
+        let lookupContext = await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
+            source: AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: UUID(),
+                worktreeBindingState: .unhydrated
+            ),
+            store: store
+        )
+
+        let roots = await store.rootRefs(scope: lookupContext.rootScope)
+        XCTAssertTrue(roots.isEmpty)
+        XCTAssertNil(lookupContext.bindingProjection)
     }
 
     func testResolveFailsClosedWhenInheritedWorktreeIsUnavailable() async throws {
@@ -140,8 +200,37 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
                 store: store
             )
             XCTFail("Expected unavailable inherited worktree to fail closed")
-        } catch let error as AgentWorktreeRuntimeWorkspaceError {
-            XCTAssertEqual(error.binding, binding)
+        } catch let error as ContextBuilderWorkspaceContextError {
+            XCTAssertEqual(error, .unavailableWorktreeProjection)
+            XCTAssertFalse(error.localizedDescription.contains(missingWorktree.path))
+        }
+    }
+
+    func testRequiredLookupRejectsBindingOutsideVisibleWorkspace() async throws {
+        let visibleRoot = try makeTemporaryDirectory(name: "VisibleWorkspace")
+        let otherLogicalRoot = try makeTemporaryDirectory(name: "OtherLogicalWorkspace")
+        let otherWorktreeRoot = try makeTemporaryDirectory(name: "OtherWorktree")
+        defer {
+            try? FileManager.default.removeItem(at: visibleRoot)
+            try? FileManager.default.removeItem(at: otherLogicalRoot)
+            try? FileManager.default.removeItem(at: otherWorktreeRoot)
+        }
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: visibleRoot.path)
+        let binding = makeBinding(logicalRoot: otherLogicalRoot, worktreeRoot: otherWorktreeRoot)
+
+        do {
+            _ = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
+                source: AgentWorkspaceLookupContextSource(
+                    activeAgentSessionID: UUID(),
+                    worktreeBindings: [binding]
+                ),
+                store: store
+            )
+            XCTFail("Expected a binding outside the visible workspace to fail closed")
+        } catch let error as AgentWorkspaceLookupContextResolutionError {
+            XCTAssertEqual(error.localizedDescription, AgentWorkspaceLookupContextResolutionError.unavailableProjection.localizedDescription)
         }
     }
 

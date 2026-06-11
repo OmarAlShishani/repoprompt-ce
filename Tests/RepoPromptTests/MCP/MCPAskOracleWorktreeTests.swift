@@ -201,7 +201,8 @@ import XCTest
                         arguments: ["message": "Compare the mixed-availability roots."],
                         timeoutSeconds: 20
                     )
-                    XCTAssertTrue(response.rawJSON.contains(missingWorktreeB.standardizedFileURL.path), response.rawJSON)
+                    XCTAssertTrue(response.rawJSON.contains("worktree projection is unavailable"), response.rawJSON)
+                    XCTAssertFalse(response.rawJSON.contains(missingWorktreeB.standardizedFileURL.path), response.rawJSON)
                     XCTAssertFalse(response.rawJSON.contains("canonical_oracle_mixed_a"), response.rawJSON)
                     XCTAssertFalse(response.rawJSON.contains("canonical_oracle_mixed_b"), response.rawJSON)
                     XCTAssertFalse(response.rawJSON.contains("worktree_oracle_mixed_a"), response.rawJSON)
@@ -251,7 +252,48 @@ import XCTest
                         arguments: ["message": "Inspect the unavailable worktree."],
                         timeoutSeconds: 20
                     )
-                    XCTAssertTrue(response.rawJSON.contains(missingWorktree.standardizedFileURL.path), response.rawJSON)
+                    XCTAssertTrue(response.rawJSON.contains("worktree projection is unavailable"), response.rawJSON)
+                    XCTAssertFalse(response.rawJSON.contains(missingWorktree.standardizedFileURL.path), response.rawJSON)
+                    XCTAssertFalse(response.rawJSON.contains(canonicalSentinel), response.rawJSON)
+                    XCTAssertFalse(capture.wasInvoked)
+
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                } catch {
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleFailsClosedWhenFrozenBindingStateIsUnhydrated() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let capture = OracleWorktreeCapture()
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let canonicalSentinel = "canonical_oracle_unhydrated_must_not_leak"
+                    try write("let value = \"\(canonicalSentinel)\"\n", to: fixture.contextA.fileURL)
+                    let context = makeFrozenContext(
+                        fixture: fixture,
+                        selection: StoredSelection(
+                            selectedPaths: [fixture.contextA.fileURL.path],
+                            codemapAutoEnabled: false
+                        ),
+                        bindings: [],
+                        bindingState: .unhydrated
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
+                    installOracleCapture(capture, on: fixture.contextA.window)
+
+                    let response = try await endpoint.callTool(
+                        name: MCPWindowToolName.askOracle,
+                        arguments: ["message": "Inspect the unknown worktree state."],
+                        timeoutSeconds: 20
+                    )
+                    XCTAssertTrue(response.rawJSON.contains("bindings are not hydrated or are unavailable"), response.rawJSON)
                     XCTAssertFalse(response.rawJSON.contains(canonicalSentinel), response.rawJSON)
                     XCTAssertFalse(capture.wasInvoked)
 
@@ -310,7 +352,8 @@ import XCTest
         private func makeFrozenContext(
             fixture: PersistentMCPTestFixture,
             selection: StoredSelection,
-            bindings: [AgentSessionWorktreeBinding]
+            bindings: [AgentSessionWorktreeBinding],
+            bindingState: AgentSessionWorktreeBindingState? = nil
         ) -> MCPServerViewModel.TabContextSnapshot {
             MCPServerViewModel.TabContextSnapshot(
                 tabID: fixture.contextA.tabID,
@@ -323,6 +366,7 @@ import XCTest
                 runID: UUID(),
                 activeAgentSessionID: UUID(),
                 worktreeBindings: bindings,
+                worktreeBindingState: bindingState,
                 explicitlyBound: false
             )
         }

@@ -2,14 +2,14 @@ import Foundation
 
 struct ContextBuilderWorkspaceContext {
     let parentAgentSessionID: UUID
-    let parentAgentRunID: UUID
-    let tabID: UUID
-    let windowID: Int
-    let workspaceID: UUID
     let frozenTabContext: MCPServerViewModel.TabContextSnapshot
     let worktreeBindings: [AgentSessionWorktreeBinding]
     let lookupContext: WorkspaceLookupContext
     let providerWorkspacePath: String
+
+    var tabID: UUID {
+        frozenTabContext.tabID
+    }
 
     static func resolve(
         from snapshot: MCPServerViewModel.TabContextSnapshot,
@@ -19,18 +19,19 @@ struct ContextBuilderWorkspaceContext {
         guard let parentAgentSessionID = snapshot.activeAgentSessionID else {
             throw ContextBuilderWorkspaceContextError.missingParentAgentSession
         }
-        guard let parentAgentRunID = snapshot.runID else {
+        guard snapshot.runID != nil else {
             throw ContextBuilderWorkspaceContextError.missingParentAgentRun
         }
-        guard let workspaceID = snapshot.workspaceID else {
+        guard snapshot.workspaceID != nil else {
             throw ContextBuilderWorkspaceContextError.missingWorkspace
         }
         guard let fallbackWorkspacePath = workspaceRepoPaths.first else {
             throw ContextBuilderWorkspaceContextError.missingWorkspaceRoot
         }
 
-        let bindings = snapshot.worktreeBindings
-        try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(bindings)
+        guard case let .hydrated(bindings) = snapshot.worktreeBindingState else {
+            throw ContextBuilderWorkspaceContextError.unavailableWorktreeBindingState
+        }
 
         let lookupContext: WorkspaceLookupContext
         if bindings.isEmpty {
@@ -46,44 +47,23 @@ struct ContextBuilderWorkspaceContext {
             }
             lookupContext = WorkspaceLookupContext(
                 rootScope: .sessionBoundWorkspace(
-                    logicalRootPaths: loadedPrimaryRootPaths.subtracting(requestedRootPaths),
+                    canonicalRootPaths: requestedRootPaths,
                     physicalRootPaths: []
                 ),
                 bindingProjection: nil
             )
         } else {
-            guard let projection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-                sessionID: parentAgentSessionID,
-                bindings: bindings
-            ),
-                !projection.isEmpty
-            else {
+            do {
+                lookupContext = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
+                    source: AgentWorkspaceLookupContextSource(
+                        activeAgentSessionID: parentAgentSessionID,
+                        worktreeBindingState: .hydrated(bindings)
+                    ),
+                    store: store
+                )
+            } catch {
                 throw ContextBuilderWorkspaceContextError.unavailableWorktreeProjection
             }
-
-            let requestedPhysicalRootPaths = Set(bindings.compactMap {
-                AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath($0.worktreeRootPath)
-            })
-            guard requestedPhysicalRootPaths.isSubset(of: projection.physicalRootPaths) else {
-                throw ContextBuilderWorkspaceContextError.unavailableWorktreeProjection
-            }
-
-            let loadedRoots = await store.rootRefs(scope: projection.lookupRootScope)
-            let loadedPaths = Set(loadedRoots.compactMap { root in
-                AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(root.standardizedFullPath)
-            })
-            guard projection.physicalRootRefs.allSatisfy({ root in
-                guard let path = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(root.standardizedFullPath) else {
-                    return false
-                }
-                return loadedPaths.contains(path)
-            }) else {
-                throw ContextBuilderWorkspaceContextError.unavailableWorktreeProjection
-            }
-            lookupContext = WorkspaceLookupContext(
-                rootScope: projection.lookupRootScope,
-                bindingProjection: projection
-            )
         }
 
         guard let providerWorkspacePath = try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
@@ -95,10 +75,6 @@ struct ContextBuilderWorkspaceContext {
 
         let context = ContextBuilderWorkspaceContext(
             parentAgentSessionID: parentAgentSessionID,
-            parentAgentRunID: parentAgentRunID,
-            tabID: snapshot.tabID,
-            windowID: snapshot.windowID,
-            workspaceID: workspaceID,
             frozenTabContext: snapshot,
             worktreeBindings: bindings,
             lookupContext: lookupContext,
@@ -109,12 +85,16 @@ struct ContextBuilderWorkspaceContext {
     }
 
     func validateAvailability() throws {
-        try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(worktreeBindings)
+        do {
+            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(worktreeBindings)
+        } catch {
+            throw ContextBuilderWorkspaceContextError.unavailableWorktreeProjection
+        }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: providerWorkspacePath, isDirectory: &isDirectory),
               isDirectory.boolValue
         else {
-            throw ContextBuilderWorkspaceContextError.unavailableProviderWorkspace(providerWorkspacePath)
+            throw ContextBuilderWorkspaceContextError.unavailableProviderWorkspace
         }
     }
 
@@ -127,10 +107,12 @@ struct ContextBuilderWorkspaceContext {
             promptText: source.promptText,
             selection: source.selection,
             selectedMetaPromptIDs: source.selectedMetaPromptIDs,
+            selectedContextBuilderPromptIDs: source.selectedContextBuilderPromptIDs,
             tabName: source.tabName,
             runID: runID,
             activeAgentSessionID: parentAgentSessionID,
-            worktreeBindings: worktreeBindings,
+            worktreeBindingState: .hydrated(worktreeBindings),
+            frozenLookupContext: lookupContext,
             explicitlyBound: source.explicitlyBound,
             readFileAutoSelectionGeneration: source.readFileAutoSelectionGeneration
         )
@@ -143,8 +125,9 @@ enum ContextBuilderWorkspaceContextError: LocalizedError, Equatable {
     case missingWorkspace
     case missingWorkspaceRoot
     case unavailableWorkspaceProjection
+    case unavailableWorktreeBindingState
     case unavailableWorktreeProjection
-    case unavailableProviderWorkspace(String)
+    case unavailableProviderWorkspace
 
     var errorDescription: String? {
         switch self {
@@ -158,10 +141,12 @@ enum ContextBuilderWorkspaceContextError: LocalizedError, Equatable {
             "context_builder requires a project workspace root for the invoking Agent Mode run."
         case .unavailableWorkspaceProjection:
             "The invoking Agent Mode workspace roots could not be loaded. Context Builder stopped rather than using the visible workspace."
+        case .unavailableWorktreeBindingState:
+            "The invoking Agent Mode worktree bindings are not hydrated or are unavailable. Context Builder stopped rather than falling back to the canonical checkout."
         case .unavailableWorktreeProjection:
             "The invoking Agent Mode worktree bindings could not be loaded. Context Builder stopped rather than falling back to the canonical checkout."
-        case let .unavailableProviderWorkspace(path):
-            "The invoking Agent Mode workspace path is unavailable: \(path). Context Builder stopped rather than falling back to another checkout."
+        case .unavailableProviderWorkspace:
+            "The invoking Agent Mode workspace is unavailable. Context Builder stopped rather than falling back to another checkout."
         }
     }
 }

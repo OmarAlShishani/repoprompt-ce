@@ -132,19 +132,33 @@ import XCTest
 
                     let runs = state.runs
                     XCTAssertEqual(runs.count, 2)
+                    let logicalRelativeFilePath = String(
+                        logicalFile.standardizedFileURL.path.dropFirst(logicalRoot.standardizedFileURL.path.count)
+                    ).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                     for run in runs {
                         XCTAssertEqual(run.workspacePath, worktreeRoot.standardizedFileURL.path)
                         XCTAssertTrue(run.userMessage.contains("BranchOnly.swift"), run.userMessage)
                         XCTAssertFalse(run.userMessage.contains(canonicalSentinel), run.userMessage)
                         XCTAssertFalse(run.userMessage.contains(worktreeRoot.path), run.userMessage)
-                        for output in [run.tree, run.read, run.search, run.codeStructure, run.selection] {
+                        for output in [run.tree, run.read, run.search, run.codeStructure, run.selection, run.workspaceContext] {
                             XCTAssertFalse(output.contains(canonicalSentinel), output)
+                            XCTAssertFalse(output.contains(worktreeRoot.path), output)
                         }
                         XCTAssertTrue(run.tree.contains("BranchOnly.swift"), run.tree)
                         XCTAssertTrue(run.read.contains(worktreeSentinel), run.read)
                         XCTAssertTrue(run.search.contains(worktreeSentinel), run.search)
-                        XCTAssertTrue(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                        if run.codeStructure.contains("Codemap generation pending") {
+                            XCTAssertTrue(run.codeStructure.contains("Files with codemap**: 0"), run.codeStructure)
+                            XCTAssertTrue(run.codeStructure.contains("### Files still awaiting codemap"), run.codeStructure)
+                            assertLogicalPath(logicalRelativeFilePath, in: run.codeStructure)
+                            XCTAssertFalse(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                        } else {
+                            XCTAssertFalse(run.codeStructure.contains("Without codemap"), run.codeStructure)
+                            XCTAssertTrue(run.codeStructure.contains(worktreeSentinel), run.codeStructure)
+                        }
                         XCTAssertTrue(run.selection.contains(logicalFile.lastPathComponent), run.selection)
+                        XCTAssertTrue(run.workspaceContext.contains(logicalFile.lastPathComponent), run.workspaceContext)
+                        XCTAssertTrue(run.workspaceContext.contains("session-bound worktree"), run.workspaceContext)
                     }
 
                     let followUps = state.followUps
@@ -166,16 +180,43 @@ import XCTest
                         ),
                         store: fixture.contextA.window.workspaceFileContextStore
                     )
-                    let finalSelection = try XCTUnwrap(
-                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)?.selection
-                    )
+                    let followUpSelection = try XCTUnwrap(followUps.first?.selection)
                     let expected = await fixture.contextA.window.mcpServer.buildTabSelectionReply(
-                        from: finalSelection,
+                        from: followUpSelection,
                         includeBlocks: false,
                         display: .relative,
                         codeMapUsageOverride: .auto,
                         lookupContextOverride: lookupContext
                     )
+                    XCTAssertEqual(
+                        Set(expected.files?.compactMap(\.rootPath) ?? []),
+                        Set([logicalRoot.standardizedFileURL.path])
+                    )
+                    let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(expected)
+                    XCTAssertTrue(formattedSelection.contains(logicalRoot.standardizedFileURL.path), formattedSelection)
+                    XCTAssertFalse(formattedSelection.contains(worktreeRoot.standardizedFileURL.path), formattedSelection)
+
+                    let slicedSelection = StoredSelection(
+                        selectedPaths: [logicalFile.path],
+                        autoCodemapPaths: [],
+                        slices: [logicalFile.path: [LineRange(start: 1, end: 1)]],
+                        codemapAutoEnabled: false
+                    )
+                    let slicedReply = await fixture.contextA.window.mcpServer.buildTabSelectionReply(
+                        from: slicedSelection,
+                        includeBlocks: false,
+                        display: .relative,
+                        codeMapUsageOverride: .none,
+                        lookupContextOverride: lookupContext
+                    )
+                    XCTAssertEqual(
+                        Set(slicedReply.fileSlices?.compactMap(\.rootPath) ?? []),
+                        Set([logicalRoot.standardizedFileURL.path])
+                    )
+                    let formattedSlices = ToolOutputFormatter.formatSelectionReplyToString(slicedReply)
+                    XCTAssertTrue(formattedSlices.contains(logicalRoot.standardizedFileURL.path), formattedSlices)
+                    XCTAssertFalse(formattedSlices.contains(worktreeRoot.standardizedFileURL.path), formattedSlices)
+
                     XCTAssertEqual(state.accounting.count, 2)
                     for accounting in state.accounting {
                         XCTAssertEqual(accounting.totalTokens, expected.totalTokens ?? 0)
@@ -247,7 +288,8 @@ import XCTest
                         arguments: ["instructions": "Inspect the unavailable worktree."],
                         timeoutSeconds: 20
                     )
-                    XCTAssertTrue(response.rawJSON.contains(missingWorktree.standardizedFileURL.path), response.rawJSON)
+                    XCTAssertTrue(response.rawJSON.contains("worktree bindings could not be loaded"), response.rawJSON)
+                    XCTAssertFalse(response.rawJSON.contains(missingWorktree.standardizedFileURL.path), response.rawJSON)
                     XCTAssertFalse(response.rawJSON.contains(canonicalSentinel), response.rawJSON)
                     XCTAssertEqual(state.providerCreationCount, 0)
                     XCTAssertTrue(state.runs.isEmpty)
@@ -349,6 +391,14 @@ import XCTest
             let result = try XCTUnwrap(object["result"] as? [String: Any])
             let content = try XCTUnwrap(result["content"] as? [[String: Any]])
             return content.compactMap { $0["text"] as? String }.joined()
+        }
+
+        private func assertLogicalPath(_ logicalPath: String, in output: String) {
+            let parts = logicalPath.split(separator: "/", maxSplits: 1).map(String.init)
+            let root = parts.first ?? logicalPath
+            let pathWithinRoot = parts.count > 1 ? parts[1] : logicalPath
+            XCTAssertTrue(output.contains("- **\(root)**"), output)
+            XCTAssertTrue(output.contains("  - `\(pathWithinRoot)`"), output)
         }
 
         private func makeBinding(
@@ -485,7 +535,8 @@ import XCTest
                     MCPWindowToolName.readFile,
                     MCPWindowToolName.search,
                     MCPWindowToolName.getCodeStructure,
-                    MCPWindowToolName.manageSelection
+                    MCPWindowToolName.manageSelection,
+                    MCPWindowToolName.workspaceContext
                 ]
             )
             self.endpoint = endpoint
@@ -525,6 +576,13 @@ import XCTest
                 ],
                 timeoutSeconds: 20
             ))
+            let workspaceContext = try await toolResultText(endpoint.callTool(
+                name: MCPWindowToolName.workspaceContext,
+                arguments: [
+                    "include": ["selection", "tree", "tokens"]
+                ],
+                timeoutSeconds: 30
+            ))
             await state.recordRun(ContextBuilderWorktreeProbeState.Run(
                 workspacePath: workspacePath,
                 userMessage: message.userMessage,
@@ -532,7 +590,8 @@ import XCTest
                 read: read,
                 search: search,
                 codeStructure: codeStructure,
-                selection: selection
+                selection: selection,
+                workspaceContext: workspaceContext
             ))
 
             return AsyncThrowingStream { continuation in
@@ -581,6 +640,7 @@ import XCTest
             let search: String
             let codeStructure: String
             let selection: String
+            let workspaceContext: String
         }
 
         struct FollowUp {

@@ -271,7 +271,7 @@ enum ToolResultDTOs {
         let content: String
         /// Paths (display-form) that are selected but have **no codemap** available
         let unmappedPaths: [String]?
-        /// Paths whose targeted codemap repair did not finish before the bounded wait expired
+        /// Paths still awaiting a codemap after repair scheduling
         let pendingPaths: [String]?
         /// Number of additional files with codemaps omitted due to `max_results` cap
         let omittedCount: Int?

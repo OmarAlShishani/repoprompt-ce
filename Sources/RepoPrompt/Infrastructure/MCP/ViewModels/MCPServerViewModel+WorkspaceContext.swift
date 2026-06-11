@@ -53,7 +53,8 @@ extension MCPServerViewModel {
             let gathered = await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
             let evaluation = await evaluateVirtualPromptEntries(
                 for: effectiveSelection,
-                codeMapUsage: gathered.codeMapUsage
+                codeMapUsage: gathered.codeMapUsage,
+                rootScope: lookupContext.rootScope
             )
             let reply = await SelectionReplyAssembler.buildSelectedFilesReply(
                 collections: gathered,
@@ -66,9 +67,6 @@ extension MCPServerViewModel {
             )
             collections = gathered
             selectionReply = reply
-        } else if includeSelection {
-            // Always use .auto mode for normalized view
-            selectionReply = await (buildTabSelectedFilesReply(from: context.selection, codeMapUsageOverride: .auto)).0
         }
 
         let selectionDTO = includeSelection ? selectionReply : nil
@@ -202,7 +200,8 @@ extension MCPServerViewModel {
                     for: context,
                     resolvedContext: resolvedCfg,
                     selectedFiles: selectedFiles,
-                    codemapFiles: codemapFiles
+                    codemapFiles: codemapFiles,
+                    lookupContext: lookupContext
                 )
                 tokenStatsDTO = Self.makeTokenStats(
                     filesTokens: fileTokens,
@@ -299,7 +298,8 @@ extension MCPServerViewModel {
         let entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult]? = if let evaluationSelection {
             await evaluateVirtualPromptEntries(
                 for: evaluationSelection,
-                codeMapUsage: collections.codeMapUsage
+                codeMapUsage: collections.codeMapUsage,
+                rootScope: lookupContext.rootScope
             ).entryResultsByFileID
         } else {
             nil

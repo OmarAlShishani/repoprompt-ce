@@ -69,6 +69,72 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertNotNil(snapshotAfterRepair)
     }
 
+    #if DEBUG
+        func testActiveWorktreeScanIsPreservedAndReportedPendingWithoutWaiting() async throws {
+            let logicalRootURL = try makeTemporaryRoot(name: "ActiveScanLogical")
+            let worktreeRootURL = try makeTemporaryRoot(name: "ActiveScanWorktree")
+            let fileURL = worktreeRootURL.appendingPathComponent("Sources/App.swift")
+            try write(
+                "struct OriginalActiveType {\n    func originalMethod() {}\n}\n",
+                to: fileURL
+            )
+
+            let window = try await makeWindow(root: logicalRootURL)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let store = window.workspaceFileContextStore
+            let logicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+            let worktreeRoot = try await store.loadRoot(path: worktreeRootURL.path, kind: .sessionWorktree)
+            let projection = makeProjection(logicalRoot: logicalRoot, physicalRoot: worktreeRoot, worktreeID: "active")
+            let lookupContext = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+            let file = try await fileRecord(at: fileURL, store: store, rootScope: projection.lookupRootScope)
+            let fileID = file.id
+            let scanGate = AsyncGate()
+            await store.setCodemapScanWillStartHandlerForTesting { scannedFileID in
+                guard scannedFileID == fileID else { return }
+                await scanGate.markStartedAndWaitForRelease()
+            }
+            defer {
+                Task {
+                    await scanGate.release()
+                    await store.setCodemapScanWillStartHandlerForTesting(nil)
+                }
+            }
+
+            let submittedRootIDs = try await store.requestInitialRootCodemapScans(rootIDs: [worktreeRoot.id])
+            XCTAssertEqual(submittedRootIDs, [worktreeRoot.id])
+            await scanGate.waitUntilStarted()
+            try write(
+                "struct ReplacementMustNotCancelActiveType {\n    func replacementMethod() {}\n}\n",
+                to: fileURL
+            )
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date().addingTimeInterval(2)],
+                ofItemAtPath: fileURL.path
+            )
+
+            let clock = ContinuousClock()
+            let start = clock.now
+            let dto = try await window.mcpServer.buildCodeStructureDTO(
+                fromRecords: [file],
+                maxResults: 10,
+                includeUnmappedPaths: false,
+                lookupContext: lookupContext,
+                selfHealTimeout: .seconds(4)
+            )
+            let elapsed = start.duration(to: clock.now)
+
+            XCTAssertLessThan(elapsed, .seconds(2))
+            XCTAssertNil(dto.unmappedPaths)
+            XCTAssertEqual(dto.pendingPaths, ["Sources/App.swift"])
+
+            await scanGate.release()
+            let snapshot = try await waitForCodemapSnapshot(store: store, fileID: fileID)
+            await store.setCodemapScanWillStartHandlerForTesting(nil)
+            XCTAssertTrue(snapshot.fileAPI?.apiDescription.contains("OriginalActiveType") == true)
+            XCTAssertFalse(snapshot.fileAPI?.apiDescription.contains("ReplacementMustNotCancelActiveType") == true)
+        }
+    #endif
+
     func testSwitchingCodeStructureScopeFromWorktreeAToBDoesNotReuseA() async throws {
         let logicalRootURL = try makeTemporaryRoot(name: "SwitchLogical")
         let worktreeAURL = try makeTemporaryRoot(name: "SwitchA")
@@ -196,7 +262,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             XCTFail("Expected deleted worktree scope to fail closed")
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("stopped rather than reading the canonical checkout"), error.localizedDescription)
-            XCTAssertTrue(error.localizedDescription.contains(worktreeRootURL.standardizedFileURL.path), error.localizedDescription)
+            XCTAssertFalse(error.localizedDescription.contains(worktreeRootURL.standardizedFileURL.path), error.localizedDescription)
         }
 
         let availability = await store.rootScopeAvailability(projection.lookupRootScope)
@@ -211,7 +277,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let worktreeRootURL = try makeTemporaryRoot(name: "BoundedWorktree")
         for index in 1 ... 3 {
             try write(
-                "struct BoundedType\(index) {}\n",
+                "struct BoundedType\(index) {\n    func boundedMethod\(index)() {}\n}\n",
                 to: worktreeRootURL.appendingPathComponent("Sources/File\(index).swift")
             )
         }
@@ -240,6 +306,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         XCTAssertLessThanOrEqual(dto.fileCount, 1)
         XCTAssertNil(dto.pendingPaths)
+        XCTAssertEqual(dto.unmappedPaths, ["Sources/File2.swift", "Sources/File3.swift"])
         let firstSnapshot = await store.codemapSnapshot(fileID: files[0].id)
         let secondSnapshot = await store.codemapSnapshot(fileID: files[1].id)
         let thirdSnapshot = await store.codemapSnapshot(fileID: files[2].id)
@@ -283,7 +350,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             XCTFail("Expected unavailable worktree scope to fail closed")
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("stopped rather than reading the canonical checkout"), error.localizedDescription)
-            XCTAssertTrue(error.localizedDescription.contains(missingWorktreeURL.standardizedFileURL.path), error.localizedDescription)
+            XCTAssertFalse(error.localizedDescription.contains(missingWorktreeURL.standardizedFileURL.path), error.localizedDescription)
         }
 
         let availability = await store.rootScopeAvailability(projection.lookupRootScope)
@@ -291,6 +358,23 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             availability,
             .sessionWorktreeUnavailable(missingPhysicalRootPaths: [missingWorktreeURL.standardizedFileURL.path])
         )
+    }
+
+    private func waitForCodemapSnapshot(
+        store: WorkspaceFileContextStore,
+        fileID: UUID,
+        timeout: Duration = .seconds(6)
+    ) async throws -> WorkspaceCodemapSnapshot {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let snapshot = await store.codemapSnapshot(fileID: fileID) {
+                return snapshot
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Timed out waiting for codemap snapshot")
+        throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 1)
     }
 
     private func makeWindow(root: URL) async throws -> WindowState {
@@ -386,6 +470,41 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
 }
+
+#if DEBUG
+    private actor AsyncGate {
+        private var started = false
+        private var released = false
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func markStartedAndWaitForRelease() async {
+            started = true
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+
+        func waitUntilStarted() async {
+            guard !started else { return }
+            await withCheckedContinuation { continuation in
+                startWaiters.append(continuation)
+            }
+        }
+
+        func release() {
+            released = true
+            let waiters = releaseWaiters
+            releaseWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+    }
+#endif
 
 private extension Sequence {
     func asyncMap<T>(_ transform: (Element) async throws -> T) async rethrows -> [T] {

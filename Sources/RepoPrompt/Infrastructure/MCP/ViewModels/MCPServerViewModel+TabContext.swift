@@ -40,9 +40,9 @@ extension MCPServerViewModel {
         let workspaceID: UUID?
         var promptText: String
         var selection: StoredSelection
-        /// Canonical selection observed when this snapshot last synchronized with the tab store.
-        /// A final commit uses this baseline to avoid overwriting selection persisted by a newer connection.
-        var selectionBaseline: StoredSelection
+        /// Monotonic canonical selection revision observed when this snapshot last synchronized.
+        /// A final commit uses it to avoid overwriting selection persisted by a newer connection.
+        var selectionRevision: UInt64
         /// Selected stored prompt IDs for computing meta tokens in tab-context snapshots.
         var selectedMetaPromptIDs: [UUID]
         /// Tab name for MCP metadata block generation.
@@ -66,7 +66,7 @@ extension MCPServerViewModel {
             workspaceID: UUID?,
             promptText: String,
             selection: StoredSelection,
-            selectionBaseline: StoredSelection? = nil,
+            selectionRevision: UInt64 = 0,
             selectedMetaPromptIDs: [UUID],
             tabName: String,
             runID: UUID?,
@@ -80,7 +80,7 @@ extension MCPServerViewModel {
             self.workspaceID = workspaceID
             self.promptText = promptText
             self.selection = selection
-            self.selectionBaseline = selectionBaseline ?? selection
+            self.selectionRevision = selectionRevision
             self.selectedMetaPromptIDs = selectedMetaPromptIDs
             self.tabName = tabName
             self.runID = runID
@@ -545,7 +545,12 @@ extension MCPServerViewModel {
                     let nameChanged = bound.tabName != snapshot.name
                     if selectionChanged || promptChanged || metaChanged || nameChanged {
                         bound.selection = incomingSelection
-                        bound.selectionBaseline = incomingSelection
+                        if let workspaceID = bound.workspaceID {
+                            bound.selectionRevision = manager.selectionRevisionForMCP(
+                                workspaceID: workspaceID,
+                                tabID: bound.tabID
+                            )
+                        }
                         bound.promptText = snapshot.promptText
                         bound.selectedMetaPromptIDs = snapshot.selectedMetaPromptIDs
                         bound.tabName = snapshot.name
@@ -775,6 +780,10 @@ extension MCPServerViewModel {
             workspaceID: captured.workspaceID,
             promptText: snapshot.promptText,
             selection: snapshot.selection,
+            selectionRevision: manager.selectionRevisionForMCP(
+                workspaceID: captured.workspaceID,
+                tabID: snapshot.id
+            ),
             selectedMetaPromptIDs: snapshot.selectedMetaPromptIDs,
             tabName: snapshot.name,
             runID: runID,
@@ -817,6 +826,10 @@ extension MCPServerViewModel {
                 workspaceID: captured.workspaceID,
                 promptText: snapshot.promptText,
                 selection: snapshot.selection,
+                selectionRevision: workspaceManager?.selectionRevisionForMCP(
+                    workspaceID: captured.workspaceID,
+                    tabID: snapshot.id
+                ) ?? 0,
                 selectedMetaPromptIDs: snapshot.selectedMetaPromptIDs,
                 tabName: snapshot.name,
                 runID: runID,
@@ -832,6 +845,12 @@ extension MCPServerViewModel {
             workspaceID: resolvedWorkspaceID,
             promptText: composeSnapshot.promptText,
             selection: composeSnapshot.selection,
+            selectionRevision: resolvedWorkspaceID.map {
+                workspaceManager?.selectionRevisionForMCP(
+                    workspaceID: $0,
+                    tabID: composeSnapshot.id
+                ) ?? 0
+            } ?? 0,
             selectedMetaPromptIDs: composeSnapshot.selectedMetaPromptIDs,
             tabName: composeSnapshot.name,
             runID: runID,
@@ -2569,8 +2588,10 @@ extension MCPServerViewModel {
 
         var updatedTab = manager.workspaces[workspaceIndex].composeTabs[tabIndex]
         let isActive = (manager.workspaces[workspaceIndex].activeComposeTabID == updatedTab.id)
-        let canonicalSelectionAdvanced = updatedTab.selection != context.selection
-            && updatedTab.selection != context.selectionBaseline
+        let canonicalSelectionAdvanced = manager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: context.tabID
+        ) != context.selectionRevision
 
         if canonicalSelectionAdvanced {
             tabContextLog("commitTabContext preserving newer canonical selection tab=\(context.tabID) window=\(context.windowID) runID=\(context.runID?.uuidString ?? "nil")")

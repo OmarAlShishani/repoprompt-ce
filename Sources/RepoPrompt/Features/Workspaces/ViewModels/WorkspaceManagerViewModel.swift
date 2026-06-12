@@ -302,6 +302,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         return selectionRevision(workspaceID: workspaceID, tabID: tabID)
     }
 
+    func selectionRevisionForMCP(workspaceID: UUID, tabID: UUID) -> UInt64 {
+        selectionRevision(workspaceID: workspaceID, tabID: tabID)
+    }
+
     private func selectionRevision(workspaceID: UUID, tabID: UUID?) -> UInt64 {
         guard let tabID else { return 0 }
         return selectionRevisionByWorkspaceTab[WorkspaceTabSelectionKey(workspaceID: workspaceID, tabID: tabID), default: 0]

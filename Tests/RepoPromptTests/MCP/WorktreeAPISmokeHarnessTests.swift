@@ -184,9 +184,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
         // Exec-mode CLI disconnect is asynchronous. Exercise the stale cleanup ordering where
         // an older bound snapshot commits after the setter has persisted newer canonical state.
-        let staleCommitSucceeded = await window.mcpServer.commitAndClearTabContext(
-            connectionID: staleConnectionID
-        )
+        let staleCleanup = Task { @MainActor in
+            await window.mcpServer.commitAndClearTabContext(connectionID: staleConnectionID)
+        }
+        let staleCommitSucceeded = await staleCleanup.value
         XCTAssertTrue(staleCommitSucceeded)
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)

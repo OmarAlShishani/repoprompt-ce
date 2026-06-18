@@ -1464,8 +1464,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             }
 
             await store.setRootLoadWillStartHandler(nil)
-            let loadedRoots = await store.roots()
-            XCTAssertTrue(loadedRoots.isEmpty)
+            let lateRootUnloaded = await waitForAsyncCondition {
+                let loadedRoots = await store.roots()
+                return loadedRoots.isEmpty
+            }
+            XCTAssertTrue(lateRootUnloaded)
             let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
             XCTAssertEqual(ownership.installedOwnerCount, 0)
             XCTAssertEqual(ownership.provisionalOwnerCount, 0)

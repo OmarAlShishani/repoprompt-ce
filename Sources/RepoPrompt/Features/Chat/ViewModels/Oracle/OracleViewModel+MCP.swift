@@ -78,21 +78,21 @@ extension OracleViewModel {
                 sourceTabID: source.sourceTabID,
                 sourceAgentSessionID: source.sourceAgentSessionID,
                 sourceAgentRunID: source.sourceAgentRunID,
-                targetWorkspaceID: context.targetWorkspaceID,
-                targetTabID: context.targetTabID,
-                targetAgentSessionID: context.targetAgentSessionID,
+                targetWorkspaceID: context.target.workspaceID,
+                targetTabID: context.target.tabID,
+                targetAgentSessionID: context.target.agentSessionID,
                 targetAgentRunID: context.targetRunID,
                 exactSelectedArtifactPaths: Set(source.exactSelectedIdentities),
-                targetBoundCheckouts: context.targetBoundCheckouts
+                targetBoundCheckouts: context.target.boundCheckouts
             )
             let delegatedReviewContext = FrozenPromptGitReviewContext(
                 artifactCapability: source.reviewGitContext.artifactCapability?.delegated(artifactDelegation),
                 artifactDelegationConsumer: SelectedGitArtifactDelegationConsumer(
-                    workspaceID: context.targetWorkspaceID,
-                    tabID: context.targetTabID,
-                    agentSessionID: context.targetAgentSessionID,
+                    workspaceID: context.target.workspaceID,
+                    tabID: context.target.tabID,
+                    agentSessionID: context.target.agentSessionID,
                     agentRunID: context.targetRunID,
-                    boundCheckouts: context.targetBoundCheckouts
+                    boundCheckouts: context.target.boundCheckouts
                 ),
                 compareIntent: source.reviewGitContext.compareIntent,
                 displayContext: source.reviewGitContext.displayContext

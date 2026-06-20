@@ -459,6 +459,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             sel,
                             workspaceID: committedTab.identity.workspaceID,
                             tabID: committedTab.identity.tabID,
+                            selectionRevision: committedTab.selectionRevision,
                             store: dependencies.promptVM.workspaceFileContextStore
                         )
                         let finalCanonical = await MainActor.run { () -> (ComposeTabState?, UInt64) in

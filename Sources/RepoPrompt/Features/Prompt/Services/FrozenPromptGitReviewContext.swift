@@ -182,6 +182,17 @@ struct FrozenBoundCheckoutIdentity: Equatable, Hashable {
         self.repositoryID = repositoryID
         self.worktreeID = worktreeID
     }
+
+    init(binding: AgentSessionWorktreeBinding) {
+        self.init(
+            logicalRootPath: binding.logicalRootPath,
+            logicalRootName: binding.logicalRootName
+                ?? (StandardizedPath.absolute(binding.logicalRootPath) as NSString).lastPathComponent,
+            physicalWorktreeRootPath: binding.worktreeRootPath,
+            repositoryID: binding.repositoryID,
+            worktreeID: binding.worktreeID
+        )
+    }
 }
 
 /// Frozen logical labels for future multi-checkout rendering and diagnostics.
@@ -242,16 +253,7 @@ extension FrozenPromptGitReviewContext {
             standardizedRelativePath: "_git_data"
         )
         let gitDataRoot = await store.exactRootRef(path: gitDataPath, kind: .workspaceGitData)
-        let boundCheckouts = bindings.map {
-            FrozenBoundCheckoutIdentity(
-                logicalRootPath: $0.logicalRootPath,
-                logicalRootName: $0.logicalRootName
-                    ?? (StandardizedPath.absolute($0.logicalRootPath) as NSString).lastPathComponent,
-                physicalWorktreeRootPath: $0.worktreeRootPath,
-                repositoryID: $0.repositoryID,
-                worktreeID: $0.worktreeID
-            )
-        }
+        let boundCheckouts = bindings.map(FrozenBoundCheckoutIdentity.init(binding:))
         let visibleRootCheckouts = await FrozenVisibleGitCheckoutResolver().resolve(
             workspaceRootPaths: workspaceRootPaths,
             bindings: bindings,

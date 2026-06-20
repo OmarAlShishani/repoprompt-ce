@@ -76,9 +76,14 @@ struct ContextBuilderWorkspaceContext {
             store: store
         )
         let reviewTargetResolution = await ContextBuilderReviewTargetResolver().resolve(
-            snapshot: snapshot,
-            lookupContext: lookupContext,
-            reviewGitContext: reviewGitContext,
+            input: ContextBuilderReviewTargetInput(
+                workspaceID: workspaceID,
+                tabID: snapshot.tabID,
+                selectionRevision: snapshot.selectionRevision,
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext
+            ),
             store: store
         )
 
@@ -140,6 +145,7 @@ struct ContextBuilderWorkspaceContext {
         _ selection: StoredSelection,
         workspaceID: UUID,
         tabID: UUID,
+        selectionRevision: UInt64,
         store: WorkspaceFileContextStore
     ) async throws {
         guard case let .available(target) = reviewTargetResolution else {
@@ -147,12 +153,15 @@ struct ContextBuilderWorkspaceContext {
             throw ContextBuilderReviewTargetUnavailableReason.missingFrozenTarget
         }
         if let reason = await ContextBuilderReviewTargetResolver().validateSelection(
-            selection,
-            workspaceID: workspaceID,
-            tabID: tabID,
+            input: ContextBuilderReviewTargetInput(
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selectionRevision: selectionRevision,
+                selection: selection,
+                lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext
+            ),
             frozenTarget: target,
-            lookupContext: lookupContext,
-            reviewGitContext: reviewGitContext,
             store: store
         ) {
             throw reason

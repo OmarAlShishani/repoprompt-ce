@@ -124,7 +124,29 @@ enum ContextBuilderReviewTargetResolution: Equatable {
     }
 }
 
+struct ContextBuilderReviewTargetInput {
+    let workspaceID: UUID
+    let tabID: UUID
+    let selectionRevision: UInt64
+    let selection: StoredSelection
+    let lookupContext: WorkspaceLookupContext
+    let reviewGitContext: FrozenPromptGitReviewContext
+}
+
 struct ContextBuilderReviewTargetResolver {
+    private struct OwnershipPipelineResult {
+        let ordinarySelectionIdentities: [String]
+        let selectedArtifactIdentities: [String]
+        let checkouts: [ContextBuilderReviewCheckoutTarget]
+        let primaryCheckout: ContextBuilderReviewCheckoutTarget
+        let artifactCapability: SelectedGitArtifactCapability?
+    }
+
+    private enum OwnershipPipelineResolution {
+        case available(OwnershipPipelineResult)
+        case unavailable(ContextBuilderReviewTargetUnavailableReason)
+    }
+
     private let ownershipResolver: ReviewGitSelectedPathOwnershipResolver
     private let vcsService: VCSService
 
@@ -136,19 +158,36 @@ struct ContextBuilderReviewTargetResolver {
     }
 
     func resolve(
-        snapshot: MCPServerViewModel.TabContextSnapshot,
-        lookupContext: WorkspaceLookupContext,
-        reviewGitContext: FrozenPromptGitReviewContext,
+        input: ContextBuilderReviewTargetInput,
         store: WorkspaceFileContextStore
     ) async -> ContextBuilderReviewTargetResolution {
-        guard let workspaceID = snapshot.workspaceID else {
-            return .unavailable(.workspaceOrTabMismatch)
+        switch await resolveOwnership(input: input, store: store) {
+        case let .unavailable(reason):
+            .unavailable(reason)
+        case let .available(ownership):
+            .available(ContextBuilderReviewTarget(
+                workspaceID: input.workspaceID,
+                tabID: input.tabID,
+                sourceSelectionRevision: input.selectionRevision,
+                initialOrdinarySelectionIdentities: ownership.ordinarySelectionIdentities,
+                initialSelectedArtifactIdentities: ownership.selectedArtifactIdentities,
+                checkouts: ownership.checkouts,
+                primaryCheckout: ownership.primaryCheckout,
+                artifactCapability: ownership.artifactCapability,
+                displayContext: input.reviewGitContext.displayContext
+            ))
         }
-        let physicalSelection = lookupContext.physicalizeSelection(snapshot.selection)
+    }
+
+    private func resolveOwnership(
+        input: ContextBuilderReviewTargetInput,
+        store: WorkspaceFileContextStore
+    ) async -> OwnershipPipelineResolution {
+        let physicalSelection = input.lookupContext.physicalizeSelection(input.selection)
         let candidates = WorkspaceGitDiffSelectionResolver.candidates(from: physicalSelection)
         guard !candidates.isEmpty else { return .unavailable(.emptySelection) }
 
-        let artifactCapability = reviewGitContext.artifactCapability
+        let artifactCapability = input.reviewGitContext.artifactCapability
         let artifactPaths = candidates.filter { rawPath in
             guard let capability = artifactCapability else {
                 return Self.looksLikeGitDataPath(rawPath)
@@ -186,7 +225,7 @@ struct ContextBuilderReviewTargetResolver {
         let ordinaryResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
             for: physicalSelection,
             store: store,
-            rootScope: lookupContext.rootScope.excludingWorkspaceGitData,
+            rootScope: input.lookupContext.rootScope.excludingWorkspaceGitData,
             folderPolicy: .expandFolders,
             profile: .mcpSelection,
             allowFilesystemFallback: false,
@@ -200,7 +239,7 @@ struct ContextBuilderReviewTargetResolver {
         do {
             ownership = try await ownershipResolver.resolve(
                 ordinaryResolution,
-                displayContext: reviewGitContext.displayContext
+                displayContext: input.reviewGitContext.displayContext
             )
         } catch {
             return .unavailable(.checkoutIdentityChanged)
@@ -209,7 +248,7 @@ struct ContextBuilderReviewTargetResolver {
             return .unavailable(.nonGitSelection(count: ownership.pathIssues.count))
         }
 
-        let scopedRoots = await store.rootRefs(scope: lookupContext.rootScope.excludingWorkspaceGitData)
+        let scopedRoots = await store.rootRefs(scope: input.lookupContext.rootScope.excludingWorkspaceGitData)
         let ordinaryTargets: [ContextBuilderReviewCheckoutTarget]
         do {
             ordinaryTargets = try ownership.checkouts.map {
@@ -221,7 +260,7 @@ struct ContextBuilderReviewTargetResolver {
                     kind: $0.kind,
                     selectedPaths: $0.selectedPaths,
                     scopedRoots: scopedRoots,
-                    lookupContext: lookupContext
+                    lookupContext: input.lookupContext
                 )
             }
         } catch {
@@ -239,7 +278,7 @@ struct ContextBuilderReviewTargetResolver {
                     kind: provenance.kind,
                     selectedPaths: [provenance.checkoutRootPath],
                     scopedRoots: scopedRoots,
-                    lookupContext: lookupContext
+                    lookupContext: input.lookupContext
                 )
             }
         } catch {
@@ -276,16 +315,12 @@ struct ContextBuilderReviewTargetResolver {
             targets[0]
         }
 
-        return .available(ContextBuilderReviewTarget(
-            workspaceID: workspaceID,
-            tabID: snapshot.tabID,
-            sourceSelectionRevision: snapshot.selectionRevision,
-            initialOrdinarySelectionIdentities: ordinaryResolution.paths.sorted(),
-            initialSelectedArtifactIdentities: artifactPaths.map(StandardizedPath.absolute).sorted(),
+        return .available(OwnershipPipelineResult(
+            ordinarySelectionIdentities: ordinaryResolution.paths.sorted(),
+            selectedArtifactIdentities: artifactPaths.map(StandardizedPath.absolute).sorted(),
             checkouts: targets,
             primaryCheckout: primary,
-            artifactCapability: artifactCapability,
-            displayContext: reviewGitContext.displayContext
+            artifactCapability: artifactCapability
         ))
     }
 
@@ -328,43 +363,22 @@ struct ContextBuilderReviewTargetResolver {
     }
 
     func validateSelection(
-        _ selection: StoredSelection,
-        workspaceID: UUID,
-        tabID: UUID,
+        input: ContextBuilderReviewTargetInput,
         frozenTarget: ContextBuilderReviewTarget,
-        lookupContext: WorkspaceLookupContext,
-        reviewGitContext: FrozenPromptGitReviewContext,
         store: WorkspaceFileContextStore
     ) async -> ContextBuilderReviewTargetUnavailableReason? {
-        guard frozenTarget.workspaceID == workspaceID, frozenTarget.tabID == tabID else {
+        guard frozenTarget.workspaceID == input.workspaceID, frozenTarget.tabID == input.tabID else {
             return .workspaceOrTabMismatch
         }
-        var snapshot = MCPServerViewModel.TabContextSnapshot(
-            tabID: tabID,
-            windowID: 0,
-            workspaceID: workspaceID,
-            promptText: "",
-            selection: selection,
-            selectionRevision: frozenTarget.sourceSelectionRevision,
-            selectedMetaPromptIDs: [],
-            tabName: "",
-            runID: nil,
-            frozenLookupContext: lookupContext,
-            explicitlyBound: false
-        )
-        snapshot.contextBuilderReviewTargetResolution = .available(frozenTarget)
-        let resolution = await resolve(
-            snapshot: snapshot,
-            lookupContext: lookupContext,
-            reviewGitContext: reviewGitContext,
-            store: store
-        )
-        guard case let .available(current) = resolution else {
-            if case let .unavailable(reason) = resolution { return reason }
-            return .selectionOwnershipChanged
+        let current: OwnershipPipelineResult
+        switch await resolveOwnership(input: input, store: store) {
+        case let .available(ownership):
+            current = ownership
+        case let .unavailable(reason):
+            return reason
         }
-        guard current.identityKeys.isSubset(of: frozenTarget.identityKeys),
-              !current.checkouts.isEmpty
+        guard !current.checkouts.isEmpty,
+              Set(current.checkouts.map(\.identityKey)).isSubset(of: frozenTarget.identityKeys)
         else { return .selectionOwnershipChanged }
         return await revalidate(frozenTarget, store: store)
     }

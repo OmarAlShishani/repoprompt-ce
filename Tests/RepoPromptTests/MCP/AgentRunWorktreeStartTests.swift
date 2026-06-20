@@ -566,7 +566,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             viewModel.mcpBindPendingAgentRunOracleReviewContext(tabID: target.tabID, runID: runID)
         )
         XCTAssertEqual(delegated.targetRunID, runID)
-        XCTAssertEqual(delegated.targetWorktreeBindings, [targetBinding])
+        XCTAssertEqual(delegated.target.worktreeBindings, [targetBinding])
         XCTAssertEqual(delegated.capturedSource?.sourceWorktreeBindings, [])
         XCTAssertEqual(delegated.capturedSource?.promptText, "frozen canonical prompt")
         XCTAssertEqual(delegated.capturedSource?.exactSelectedIdentities, [selectedPath])
@@ -820,7 +820,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             runID: mismatchedRunID
         ))
         XCTAssertEqual(unboundDelegated.capturedSource?.sourceWorktreeBindings, [binding])
-        XCTAssertEqual(unboundDelegated.targetWorktreeBindings, [])
+        XCTAssertEqual(unboundDelegated.target.worktreeBindings, [])
         XCTAssertNotNil(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
             tabID: mismatchedTarget.tabID,
             workspaceID: workspaceID,

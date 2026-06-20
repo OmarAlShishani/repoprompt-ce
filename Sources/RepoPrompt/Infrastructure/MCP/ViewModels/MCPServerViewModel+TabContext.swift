@@ -2531,7 +2531,8 @@ extension MCPServerViewModel {
             policy: .requireExplicitOrRunScoped
         )
         guard Self.isExactRunScopedTabContext(resolved),
-              resolved.snapshot.workspaceID == target.workspaceID,
+              let workspaceID = resolved.snapshot.workspaceID,
+              workspaceID == target.workspaceID,
               resolved.snapshot.tabID == target.tabID,
               resolved.snapshot.contextBuilderReviewTargetResolution == .available(target),
               let lookupContext = resolved.snapshot.frozenLookupContext
@@ -2544,12 +2545,15 @@ extension MCPServerViewModel {
             displayContext: target.displayContext
         )
         if let reason = await ContextBuilderReviewTargetResolver().validateSelection(
-            resolved.snapshot.selection,
-            workspaceID: target.workspaceID,
-            tabID: target.tabID,
+            input: ContextBuilderReviewTargetInput(
+                workspaceID: workspaceID,
+                tabID: resolved.snapshot.tabID,
+                selectionRevision: resolved.snapshot.selectionRevision,
+                selection: resolved.snapshot.selection,
+                lookupContext: lookupContext,
+                reviewGitContext: reviewContext
+            ),
             frozenTarget: target,
-            lookupContext: lookupContext,
-            reviewGitContext: reviewContext,
             store: promptVM.workspaceFileContextStore
         ) {
             throw reason

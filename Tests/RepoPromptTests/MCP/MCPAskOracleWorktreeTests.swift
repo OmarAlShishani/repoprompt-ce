@@ -119,14 +119,16 @@ import XCTest
             )
             let delegated = DelegatedAgentRunOracleReviewContext(
                 source: .captured(capturedSource),
-                targetTabID: childTabID,
-                targetWorkspaceID: childWorkspaceID,
-                targetAgentSessionID: childSessionID,
-                targetActivationID: UUID(),
-                targetRunID: childRunID,
-                expectedParentSessionID: sourceSessionID,
-                targetWorktreeBindings: [],
-                validationFailure: nil
+                target: AgentRunOracleReviewTargetSnapshot(
+                    tabID: childTabID,
+                    workspaceID: childWorkspaceID,
+                    agentSessionID: childSessionID,
+                    activationID: UUID(),
+                    expectedParentSessionID: sourceSessionID,
+                    worktreeBindings: [],
+                    validationFailure: nil
+                ),
+                targetRunID: childRunID
             )
             let packaging = try OracleViewModel.OracleSendPackagingContext(delegated: delegated)
             let context = OracleViewModel.OracleSendTabContext(
@@ -1670,7 +1672,7 @@ import XCTest
                         if childCreateWorktree {
                             XCTAssertEqual(actualTargetBindings.count, 1)
                         }
-                        XCTAssertEqual(delegated.targetWorktreeBindings, expectedTargetBindings)
+                        XCTAssertEqual(delegated.target.worktreeBindings, expectedTargetBindings)
                         if bindings.isEmpty {
                             XCTAssertNil(startSession["parent_session_id"])
                             XCTAssertNil(delegated.source.sourceAgentSessionID)

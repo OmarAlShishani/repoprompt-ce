@@ -173,6 +173,273 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             if case .rejected = $0 { return true }
             return false
         })
+
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: .sessionBoundWorkspace(
+                canonicalRootPaths: [linked.standardizedFileURL.path],
+                physicalRootPaths: []
+            ),
+            bindingProjection: nil
+        )
+        let targetResolution = await ContextBuilderReviewTargetResolver().resolve(
+            input: ContextBuilderReviewTargetInput(
+                workspaceID: capability.workspaceID,
+                tabID: linkedTabID,
+                selectionRevision: 1,
+                selection: StoredSelection(
+                    selectedPaths: [linked.appendingPathComponent("Sources/Feature.swift").path],
+                    codemapAutoEnabled: false
+                ),
+                lookupContext: lookupContext,
+                reviewGitContext: reviewContext
+            ),
+            store: store
+        )
+        let policy = MCPContextBuilderGitReviewPolicy()
+        let linkedRepo = GitRepoDescriptor(rootURL: linked)
+        let admission = try await policy.admit(
+            resolution: targetResolution,
+            hasExplicitSelector: true,
+            requestsArtifactPublication: true,
+            operation: .diff,
+            allRepositories: [GitRepoDescriptor(rootURL: canonical), linkedRepo],
+            store: store
+        )
+        let fence = try XCTUnwrap(admission.publicationFence)
+        let linkedManifest = try XCTUnwrap(try GitDiffSnapshotStore().readManifest(
+            workspaceDirectory: workspaceDirectory,
+            repoKey: linkedRepo.repoKey,
+            snapshotID: linkedSet.snapshotRef.snapshotID
+        ))
+        try await policy.validatePublishedOutcomes(
+            [MCPContextBuilderGitPublishedOutcome(
+                repository: linkedRepo,
+                manifest: linkedManifest,
+                hasPublishedArtifacts: true
+            )],
+            publishedArtifactSetCount: 1,
+            fence: fence,
+            store: store
+        )
+        do {
+            try await policy.validatePublishedOutcomes(
+                [MCPContextBuilderGitPublishedOutcome(
+                    repository: linkedRepo,
+                    manifest: nil,
+                    hasPublishedArtifacts: true
+                )],
+                publishedArtifactSetCount: 1,
+                fence: fence,
+                store: store
+            )
+            XCTFail("Expected incomplete Context Builder publication metadata to fail")
+        } catch {
+            XCTAssertEqual(
+                error as? MCPContextBuilderGitReviewPolicyError,
+                .incompletePublishedMetadata
+            )
+        }
+        do {
+            try await policy.validatePublishedOutcomes(
+                [MCPContextBuilderGitPublishedOutcome(
+                    repository: GitRepoDescriptor(rootURL: canonical),
+                    manifest: linkedManifest,
+                    hasPublishedArtifacts: true
+                )],
+                publishedArtifactSetCount: 1,
+                fence: fence,
+                store: store
+            )
+            XCTFail("Expected mismatched Context Builder publication repository to fail")
+        } catch {
+            XCTAssertEqual(
+                error as? MCPContextBuilderGitReviewPolicyError,
+                .publishedRepositoryMismatch
+            )
+        }
+    }
+
+    func testContextBuilderMultiRepoOutcomesPreserveCompleteAndPartialPublicationReadiness() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: "MCPContextBuilderMultiRepoPublication")
+        defer { fixture.cleanup() }
+
+        let firstRoot = try fixture.makeRepository(
+            named: "first",
+            files: ["Sources/First.swift": "let first = 1\n"]
+        )
+        let secondRoot = try fixture.makeRepository(
+            named: "second",
+            files: ["Sources/Second.swift": "let second = 1\n"]
+        )
+        let firstFile = firstRoot.appendingPathComponent("Sources/First.swift")
+        let secondFile = secondRoot.appendingPathComponent("Sources/Second.swift")
+        try fixture.write("let first = 2\n", to: "Sources/First.swift", at: firstRoot)
+        try fixture.write("let second = 2\n", to: "Sources/Second.swift", at: secondRoot)
+
+        let workspaceDirectory = fixture.sandbox.appendingPathComponent("workspace", isDirectory: true)
+        let gitDataRoot = workspaceDirectory.appendingPathComponent("_git_data", isDirectory: true)
+        try FileManager.default.createDirectory(at: gitDataRoot, withIntermediateDirectories: true)
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: gitDataRoot.path, kind: .workspaceGitData)
+        _ = try await store.loadRoot(path: firstRoot.path, kind: .primaryWorkspace)
+        _ = try await store.loadRoot(path: secondRoot.path, kind: .primaryWorkspace)
+        let exactGitDataRootValue = await store.exactRootRef(
+            path: gitDataRoot.path,
+            kind: .workspaceGitData
+        )
+        let exactGitDataRoot = try XCTUnwrap(exactGitDataRootValue)
+
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let rootPaths = [firstRoot.path, secondRoot.path]
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: .sessionBoundWorkspace(
+                canonicalRootPaths: Set(rootPaths),
+                physicalRootPaths: []
+            ),
+            bindingProjection: nil
+        )
+        let reviewContext = await FrozenPromptGitReviewContext.make(
+            workspaceID: workspaceID,
+            workspaceDirectoryPath: workspaceDirectory.path,
+            workspaceRootPaths: rootPaths,
+            tabID: tabID,
+            sessionID: nil,
+            bindings: [],
+            base: "HEAD",
+            store: store
+        )
+        let targetResolution = await ContextBuilderReviewTargetResolver().resolve(
+            input: ContextBuilderReviewTargetInput(
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selectionRevision: 1,
+                selection: StoredSelection(
+                    selectedPaths: [firstFile.path, secondFile.path],
+                    codemapAutoEnabled: false
+                ),
+                lookupContext: lookupContext,
+                reviewGitContext: reviewContext
+            ),
+            store: store
+        )
+        let firstRepo = GitRepoDescriptor(rootURL: firstRoot)
+        let secondRepo = GitRepoDescriptor(rootURL: secondRoot)
+        let policy = MCPContextBuilderGitReviewPolicy()
+        let admission = try await policy.admit(
+            resolution: targetResolution,
+            hasExplicitSelector: false,
+            requestsArtifactPublication: true,
+            operation: .diff,
+            allRepositories: [firstRepo, secondRepo],
+            store: store
+        )
+        let fence = try XCTUnwrap(admission.publicationFence)
+        XCTAssertEqual(
+            Set(admission.implicitRepositories?.map(\.repoKey) ?? []),
+            Set([firstRepo.repoKey, secondRepo.repoKey])
+        )
+
+        let firstSet = try await publish(
+            repoURL: firstRoot,
+            workspaceDirectory: workspaceDirectory,
+            snapshotID: "2026-06-20/1700",
+            tabID: tabID
+        )
+        let secondSet = try await publish(
+            repoURL: secondRoot,
+            workspaceDirectory: workspaceDirectory,
+            snapshotID: "2026-06-20/1701",
+            tabID: tabID
+        )
+        let firstManifest = try XCTUnwrap(try GitDiffSnapshotStore().readManifest(
+            workspaceDirectory: workspaceDirectory,
+            repoKey: firstRepo.repoKey,
+            snapshotID: firstSet.snapshotRef.snapshotID
+        ))
+        let secondManifest = try XCTUnwrap(try GitDiffSnapshotStore().readManifest(
+            workspaceDirectory: workspaceDirectory,
+            repoKey: secondRepo.repoKey,
+            snapshotID: secondSet.snapshotRef.snapshotID
+        ))
+        try await policy.validatePublishedOutcomes(
+            [
+                MCPContextBuilderGitPublishedOutcome(
+                    repository: firstRepo,
+                    manifest: firstManifest,
+                    hasPublishedArtifacts: true
+                ),
+                MCPContextBuilderGitPublishedOutcome(
+                    repository: secondRepo,
+                    manifest: secondManifest,
+                    hasPublishedArtifacts: true
+                )
+            ],
+            publishedArtifactSetCount: 2,
+            fence: fence,
+            store: store
+        )
+        let completeIngress = await store.ingressPublishedGitArtifacts(
+            WorkspacePublishedGitArtifactIngressRequest(
+                root: exactGitDataRoot,
+                artifacts: firstSet.orderedArtifacts + secondSet.orderedArtifacts
+            )
+        )
+        XCTAssertTrue(completeIngress.failuresByArtifact.isEmpty)
+        for published in [firstSet, secondSet] {
+            XCTAssertEqual(
+                completeIngress.selectionReadyArtifacts(for: published),
+                published.primarySelectionArtifacts
+            )
+            XCTAssertEqual(
+                completeIngress.advertisementReadyArtifacts(for: published),
+                published.advertisedSelectionArtifacts
+            )
+        }
+
+        let partialFirstSet = try await publish(
+            repoURL: firstRoot,
+            workspaceDirectory: workspaceDirectory,
+            snapshotID: "2026-06-20/1702",
+            tabID: tabID
+        )
+        let partialFirstManifest = try XCTUnwrap(try GitDiffSnapshotStore().readManifest(
+            workspaceDirectory: workspaceDirectory,
+            repoKey: firstRepo.repoKey,
+            snapshotID: partialFirstSet.snapshotRef.snapshotID
+        ))
+        try await policy.validatePublishedOutcomes(
+            [
+                MCPContextBuilderGitPublishedOutcome(
+                    repository: firstRepo,
+                    manifest: partialFirstManifest,
+                    hasPublishedArtifacts: true
+                ),
+                MCPContextBuilderGitPublishedOutcome(
+                    repository: secondRepo,
+                    manifest: nil,
+                    hasPublishedArtifacts: false
+                )
+            ],
+            publishedArtifactSetCount: 1,
+            fence: fence,
+            store: store
+        )
+        let partialIngress = await store.ingressPublishedGitArtifacts(
+            WorkspacePublishedGitArtifactIngressRequest(
+                root: exactGitDataRoot,
+                artifacts: partialFirstSet.orderedArtifacts
+            )
+        )
+        XCTAssertTrue(partialIngress.failuresByArtifact.isEmpty)
+        XCTAssertEqual(
+            partialIngress.selectionReadyArtifacts(for: partialFirstSet),
+            partialFirstSet.primarySelectionArtifacts
+        )
+        XCTAssertEqual(
+            partialIngress.advertisementReadyArtifacts(for: partialFirstSet),
+            partialFirstSet.advertisedSelectionArtifacts
+        )
     }
 
     func testMultiRepoPartialReadinessNeverClaimsMissingPatch() async throws {

@@ -705,6 +705,21 @@ import XCTest
                         $0.contains("/_git_data/")
                     }
                     XCTAssertEqual(artifactPaths.count, 2)
+                    let mapPath = try XCTUnwrap(artifactPaths.first { $0.hasSuffix("/MAP.txt") })
+                    let manifestURL = URL(fileURLWithPath: mapPath)
+                        .deletingLastPathComponent()
+                        .appendingPathComponent("manifest.json")
+                    let manifest = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL))
+                            as? [String: Any]
+                    )
+                    XCTAssertEqual(manifest["repoKey"] as? String, GitRepoDescriptor(rootURL: ceRoot).repoKey)
+                    XCTAssertEqual(
+                        (manifest["repoRoot"] as? String).map(GitRepoRootAuthorization.canonicalPath),
+                        GitRepoRootAuthorization.canonicalPath(ceRoot.path)
+                    )
+                    XCTAssertFalse(gitOutput.contains(classicMarker), gitOutput)
+                    XCTAssertEqual(state.providerCreationCount, 1)
 
                     fixture.contextA.window.promptManager
                         .setAutomaticReviewGitDiffProviderOverrideForTesting(nil)

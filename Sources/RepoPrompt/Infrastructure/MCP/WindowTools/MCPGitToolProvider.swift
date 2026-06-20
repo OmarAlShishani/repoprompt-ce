@@ -445,33 +445,31 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         let hasExplicitSelector = explicitTokens != nil || !(explicitRepoKey?.isEmpty ?? true)
         let requestsArtifactPublication = args["artifacts"]?.boolValue == true
         let frozenResolution = try await dependencies.resolveImplicitContextBuilderGitTarget(metadata)
-        let frozenTarget: ContextBuilderReviewTarget?
-        switch frozenResolution {
-        case let .available(target):
-            if let reason = await ContextBuilderReviewTargetResolver().revalidate(
-                target,
+        let contextBuilderPolicy = MCPContextBuilderGitReviewPolicy()
+        let contextBuilderOperation: MCPContextBuilderGitReviewOperation = switch op {
+        case .status: .status
+        case .diff: .diff
+        case .log: .log
+        case .show: .show
+        case .blame: .blame
+        }
+        let contextBuilderAdmission: MCPContextBuilderGitReviewAdmission
+        do {
+            contextBuilderAdmission = try await contextBuilderPolicy.admit(
+                resolution: frozenResolution,
+                hasExplicitSelector: hasExplicitSelector,
+                requestsArtifactPublication: requestsArtifactPublication,
+                operation: contextBuilderOperation,
+                allRepositories: allRepos,
                 store: dependencies.promptVM.workspaceFileContextStore
-            ) {
-                throw MCPError.invalidParams(reason.localizedDescription)
-            }
-            frozenTarget = target
-        case let .unavailable(reason):
-            if !hasExplicitSelector || requestsArtifactPublication {
-                throw MCPError.invalidParams(reason.localizedDescription)
-            }
-            frozenTarget = nil
-        case nil:
-            frozenTarget = nil
+            )
+        } catch let error as MCPContextBuilderGitReviewPolicyError {
+            throw MCPError.invalidParams(error.localizedDescription)
         }
 
         var repos: [GitRepoDescriptor]
-        if !hasExplicitSelector, let frozenTarget {
-            guard let frozenRepos = frozenTarget.repositories(from: allRepos), !frozenRepos.isEmpty else {
-                throw MCPError.invalidParams(
-                    ContextBuilderReviewTargetUnavailableReason.checkoutIdentityChanged.localizedDescription
-                )
-            }
-            repos = frozenRepos
+        if let implicitRepositories = contextBuilderAdmission.implicitRepositories {
+            repos = implicitRepositories
         } else if let repoKey = explicitRepoKey, !repoKey.isEmpty {
             guard let match = allRepos.first(where: { $0.repoKey == repoKey }) else {
                 let available = allRepos.map(\.repoKey).joined(separator: ", ")
@@ -482,9 +480,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             guard let ambientDefaultRepo = allRepos.first else {
                 throw MCPError.invalidParams("No VCS repository found in loaded roots.")
             }
-            let defaultRepo = frozenTarget.flatMap { target in
-                allRepos.first(where: target.primaryCheckout.matches)
-            } ?? ambientDefaultRepo
+            let defaultRepo = contextBuilderAdmission.preferredDefaultRepository ?? ambientDefaultRepo
             let resolver = GitRepoTargetResolver()
             do {
                 repos = try await resolver.resolveRepoRoots(
@@ -498,20 +494,16 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             }
         }
 
-        if requestsArtifactPublication, let frozenTarget {
-            guard repos.allSatisfy(frozenTarget.contains) else {
-                throw MCPError.invalidParams(
-                    "Context Builder Git artifacts may only be published for the frozen selected repository target."
+        if let publicationFence = contextBuilderAdmission.publicationFence {
+            do {
+                try contextBuilderPolicy.validatePublicationRepositories(
+                    repos,
+                    fence: publicationFence
                 )
+            } catch let error as MCPContextBuilderGitReviewPolicyError {
+                throw MCPError.invalidParams(error.localizedDescription)
             }
-            try await dependencies.validateContextBuilderGitArtifactSelection(metadata, frozenTarget)
-        }
-        if !hasExplicitSelector, frozenTarget != nil, repos.count > 1,
-           op != .status, op != .diff
-        {
-            throw MCPError.invalidParams(
-                "The frozen Context Builder selection owns multiple repositories; specify repo_root or repo_key for this operation."
-            )
+            try await dependencies.validateContextBuilderGitArtifactSelection(metadata, publicationFence.target)
         }
 
         // Tool-level admission is keyed by every repository touched by this request. WI-9's
@@ -561,10 +553,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
         func preparePublishedArtifacts(
             _ publishedSets: [GitDiffPublishedArtifactSet],
-            frozenManifestTargets: [(
-                manifest: GitDiffSnapshotManifest,
-                target: ContextBuilderReviewCheckoutTarget
-            )] = []
+            publishedOutcomes: [MCPContextBuilderGitPublishedOutcome] = []
         ) async throws -> MCPGitArtifactReadinessPreparation {
             guard !publishedSets.isEmpty else {
                 stagedAdvertisementsByInvocation[advertisementInvocationID] = []
@@ -595,23 +584,17 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             }
 
             try Task.checkCancellation()
-            if let frozenTarget {
-                let uniqueTargetCount = Set(frozenManifestTargets.map(\.target.identityKey)).count
-                guard frozenManifestTargets.count == publishedSets.count,
-                      uniqueTargetCount == frozenManifestTargets.count,
-                      frozenManifestTargets.allSatisfy({ $0.target.matches($0.manifest) })
-                else {
-                    stagedAdvertisementsByInvocation[advertisementInvocationID] = []
-                    throw MCPError.invalidParams(
-                        "Published Git artifact checkout did not match its requested frozen Context Builder target."
+            if let publicationFence = contextBuilderAdmission.publicationFence {
+                do {
+                    try await contextBuilderPolicy.validatePublishedOutcomes(
+                        publishedOutcomes,
+                        publishedArtifactSetCount: publishedSets.count,
+                        fence: publicationFence,
+                        store: dependencies.promptVM.workspaceFileContextStore
                     )
-                }
-                if let reason = await ContextBuilderReviewTargetResolver().revalidate(
-                    frozenTarget,
-                    store: dependencies.promptVM.workspaceFileContextStore
-                ) {
+                } catch let error as MCPContextBuilderGitReviewPolicyError {
                     stagedAdvertisementsByInvocation[advertisementInvocationID] = []
-                    throw MCPError.invalidParams(reason.localizedDescription)
+                    throw MCPError.invalidParams(error.localizedDescription)
                 }
             }
 
@@ -1154,36 +1137,12 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     let perRepoResults = outcomes.map(\.result)
                     let collectedDiffs = outcomes.compactMap(\.diff)
                     let publishedSets = outcomes.compactMap(\.publishedArtifacts)
-                    var frozenManifestTargets: [(
-                        manifest: GitDiffSnapshotManifest,
-                        target: ContextBuilderReviewCheckoutTarget
-                    )] = []
-                    if let frozenTarget {
-                        for (repo, outcome) in zip(repos, outcomes) {
-                            switch (outcome.manifest, outcome.publishedArtifacts) {
-                            case (nil, nil):
-                                continue
-                            case let (.some(manifest), .some(_)):
-                                guard let expectedTarget = frozenTarget.checkout(matching: repo) else {
-                                    stagedAdvertisementsByInvocation[advertisementInvocationID] = []
-                                    throw MCPError.invalidParams(
-                                        "Published Git artifact repository did not match the frozen Context Builder target."
-                                    )
-                                }
-                                frozenManifestTargets.append((manifest, expectedTarget))
-                            default:
-                                stagedAdvertisementsByInvocation[advertisementInvocationID] = []
-                                throw MCPError.invalidParams(
-                                    "Published Git artifact metadata was incomplete for the frozen Context Builder target."
-                                )
-                            }
-                        }
-                        guard frozenManifestTargets.count == publishedSets.count else {
-                            stagedAdvertisementsByInvocation[advertisementInvocationID] = []
-                            throw MCPError.invalidParams(
-                                "Published Git artifact outcomes did not match the frozen Context Builder target."
-                            )
-                        }
+                    let publishedOutcomes = zip(repos, outcomes).map { repo, outcome in
+                        MCPContextBuilderGitPublishedOutcome(
+                            repository: repo,
+                            manifest: outcome.manifest,
+                            hasPublishedArtifacts: outcome.publishedArtifacts != nil
+                        )
                     }
                     var manifestsBySnapshotDir: [String: GitDiffSnapshotManifest] = [:]
                     for outcome in outcomes {
@@ -1194,7 +1153,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
                     let readiness = try await preparePublishedArtifacts(
                         publishedSets,
-                        frozenManifestTargets: frozenManifestTargets
+                        publishedOutcomes: publishedOutcomes
                     )
                     let decoratedRepoResults = try await MCPGitToolProjection.decorateArtifactRepoResults(
                         perRepoResults,
@@ -1232,21 +1191,6 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     tabID: tabID
                 )
 
-                let frozenManifestTargets: [(
-                    manifest: GitDiffSnapshotManifest,
-                    target: ContextBuilderReviewCheckoutTarget
-                )]
-                if let frozenTarget {
-                    guard let expectedTarget = frozenTarget.checkout(matching: primaryRepo) else {
-                        stagedAdvertisementsByInvocation[advertisementInvocationID] = []
-                        throw MCPError.invalidParams(
-                            "Published Git artifact repository did not match the frozen Context Builder target."
-                        )
-                    }
-                    frozenManifestTargets = [(manifest, expectedTarget)]
-                } else {
-                    frozenManifestTargets = []
-                }
                 let snapshotID = manifest.snapshotID
                 let snapshotDirURL = store.snapshotDir(workspaceDirectory: workspaceDirectory, repoKey: primaryRepo.repoKey, snapshotID: snapshotID)
                 let snapshotDirRel = store.snapshotRelativePath(repoKey: primaryRepo.repoKey, snapshotID: snapshotID)
@@ -1262,7 +1206,11 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 )
                 let readiness = try await preparePublishedArtifacts(
                     [projection.publishedArtifacts],
-                    frozenManifestTargets: frozenManifestTargets
+                    publishedOutcomes: [MCPContextBuilderGitPublishedOutcome(
+                        repository: primaryRepo,
+                        manifest: manifest,
+                        hasPublishedArtifacts: true
+                    )]
                 )
                 let autoSelectedPrimaryArtifacts = readiness.autoSelectedAliases
                 let primaryArtifacts = try await MCPGitToolProjection.makePrimaryArtifactsDTO(

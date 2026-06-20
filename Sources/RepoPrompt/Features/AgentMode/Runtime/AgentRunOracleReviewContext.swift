@@ -161,50 +161,38 @@ enum AgentRunOracleReviewSource: Equatable {
 /// A captured source staged for one exact child control activation. It has no run identity and
 /// therefore cannot yet be consumed by Oracle. Source packaging and target conversation bindings
 /// are independent checkout domains; only the frozen target snapshot must match the later consumer.
+struct AgentRunOracleReviewTargetSnapshot: Equatable {
+    let tabID: UUID
+    let workspaceID: UUID
+    let agentSessionID: UUID
+    let activationID: UUID
+    let expectedParentSessionID: UUID?
+    let worktreeBindings: [AgentSessionWorktreeBinding]
+    let validationFailure: AgentRunOracleReviewUnavailableReason?
+
+    var boundCheckouts: [FrozenBoundCheckoutIdentity] {
+        worktreeBindings.map(FrozenBoundCheckoutIdentity.init(binding:))
+    }
+}
+
 struct PendingAgentRunOracleReviewContext: Equatable {
     let source: AgentRunOracleReviewSource
-    let targetTabID: UUID
-    let targetWorkspaceID: UUID
-    let targetAgentSessionID: UUID
-    let targetActivationID: UUID
-    let expectedParentSessionID: UUID?
-    let targetWorktreeBindings: [AgentSessionWorktreeBinding]
-    let validationFailure: AgentRunOracleReviewUnavailableReason?
+    let target: AgentRunOracleReviewTargetSnapshot
 }
 
 /// The only delegated form that may be used for Oracle review packaging.
 struct DelegatedAgentRunOracleReviewContext: Equatable {
     let source: AgentRunOracleReviewSource
-    let targetTabID: UUID
-    let targetWorkspaceID: UUID
-    let targetAgentSessionID: UUID
-    let targetActivationID: UUID
+    let target: AgentRunOracleReviewTargetSnapshot
     let targetRunID: UUID
-    let expectedParentSessionID: UUID?
-    let targetWorktreeBindings: [AgentSessionWorktreeBinding]
-    let validationFailure: AgentRunOracleReviewUnavailableReason?
-
-    var targetBoundCheckouts: [FrozenBoundCheckoutIdentity] {
-        targetWorktreeBindings.map { binding in
-            FrozenBoundCheckoutIdentity(
-                logicalRootPath: binding.logicalRootPath,
-                logicalRootName: binding.logicalRootName
-                    ?? (StandardizedPath.absolute(binding.logicalRootPath) as NSString)
-                    .lastPathComponent,
-                physicalWorktreeRootPath: binding.worktreeRootPath,
-                repositoryID: binding.repositoryID,
-                worktreeID: binding.worktreeID
-            )
-        }
-    }
 
     var capturedSource: AgentRunOracleReviewSource.Captured? {
-        guard validationFailure == nil, case let .captured(source) = source else { return nil }
+        guard target.validationFailure == nil, case let .captured(source) = source else { return nil }
         return source
     }
 
     var unavailableReason: AgentRunOracleReviewUnavailableReason? {
-        if let validationFailure { return validationFailure }
+        if let validationFailure = target.validationFailure { return validationFailure }
         guard case let .unavailable(source) = source else { return nil }
         return source.reason
     }

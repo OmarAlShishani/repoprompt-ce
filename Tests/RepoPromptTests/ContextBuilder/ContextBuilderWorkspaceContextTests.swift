@@ -178,11 +178,33 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(nested.selectionRevision, 37)
         XCTAssertEqual(nested.contextBuilderReviewTargetResolution, context.reviewTargetResolution)
 
+        try await context.validateFinalReviewSelection(
+            StoredSelection(selectedPaths: [selectedFile.path], codemapAutoEnabled: false),
+            workspaceID: target.workspaceID,
+            tabID: target.tabID,
+            selectionRevision: 38,
+            store: store
+        )
+
+        do {
+            try await context.validateFinalReviewSelection(
+                StoredSelection(selectedPaths: [selectedFile.path], codemapAutoEnabled: false),
+                workspaceID: UUID(),
+                tabID: target.tabID,
+                selectionRevision: 39,
+                store: store
+            )
+            XCTFail("Expected final selection workspace provenance mismatch to fail")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            XCTAssertEqual(reason, .workspaceOrTabMismatch)
+        }
+
         do {
             try await context.validateFinalReviewSelection(
                 StoredSelection(selectedPaths: [classicFile.path], codemapAutoEnabled: false),
                 workspaceID: target.workspaceID,
                 tabID: target.tabID,
+                selectionRevision: 40,
                 store: store
             )
             XCTFail("Expected final selection ownership outside the frozen CE target to fail")

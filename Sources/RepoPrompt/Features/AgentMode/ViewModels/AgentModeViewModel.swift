@@ -6086,13 +6086,15 @@ final class AgentModeViewModel: ObservableObject {
         mcpRemoveAgentRunOracleReviewContexts(sessionID: targetSessionID)
         pendingAgentRunOracleReviewContextsBySessionID[targetSessionID] = PendingAgentRunOracleReviewContext(
             source: source,
-            targetTabID: targetTabID,
-            targetWorkspaceID: targetWorkspaceID,
-            targetAgentSessionID: targetSessionID,
-            targetActivationID: controlContext.activationID,
-            expectedParentSessionID: expectedParentSessionID,
-            targetWorktreeBindings: session.worktreeBindings,
-            validationFailure: validationFailure
+            target: AgentRunOracleReviewTargetSnapshot(
+                tabID: targetTabID,
+                workspaceID: targetWorkspaceID,
+                agentSessionID: targetSessionID,
+                activationID: controlContext.activationID,
+                expectedParentSessionID: expectedParentSessionID,
+                worktreeBindings: session.worktreeBindings,
+                validationFailure: validationFailure
+            )
         )
     }
 
@@ -6111,8 +6113,8 @@ final class AgentModeViewModel: ObservableObject {
 
         let key = AgentRunOracleReviewKey(sessionID: sessionID, runID: runID)
         if let existing = delegatedAgentRunOracleReviewContextsByKey[key],
-           existing.targetTabID == tabID,
-           existing.targetActivationID == controlContext.activationID
+           existing.target.tabID == tabID,
+           existing.target.activationID == controlContext.activationID
         {
             return existing
         }
@@ -6120,10 +6122,10 @@ final class AgentModeViewModel: ObservableObject {
             return nil
         }
 
-        var validationFailure = pending.validationFailure
-        if pending.targetTabID != tabID
-            || pending.targetActivationID != controlContext.activationID
-            || pending.targetAgentSessionID != sessionID
+        var validationFailure = pending.target.validationFailure
+        if pending.target.tabID != tabID
+            || pending.target.activationID != controlContext.activationID
+            || pending.target.agentSessionID != sessionID
         {
             validationFailure = .targetActivationMismatch
         }
@@ -6133,16 +6135,19 @@ final class AgentModeViewModel: ObservableObject {
             validationFailure = .pendingContextAlreadyConsumed
         }
 
+        let target = AgentRunOracleReviewTargetSnapshot(
+            tabID: pending.target.tabID,
+            workspaceID: pending.target.workspaceID,
+            agentSessionID: pending.target.agentSessionID,
+            activationID: pending.target.activationID,
+            expectedParentSessionID: pending.target.expectedParentSessionID,
+            worktreeBindings: pending.target.worktreeBindings,
+            validationFailure: validationFailure
+        )
         let delegated = DelegatedAgentRunOracleReviewContext(
             source: pending.source,
-            targetTabID: pending.targetTabID,
-            targetWorkspaceID: pending.targetWorkspaceID,
-            targetAgentSessionID: pending.targetAgentSessionID,
-            targetActivationID: pending.targetActivationID,
-            targetRunID: runID,
-            expectedParentSessionID: pending.expectedParentSessionID,
-            targetWorktreeBindings: pending.targetWorktreeBindings,
-            validationFailure: validationFailure
+            target: target,
+            targetRunID: runID
         )
         pendingAgentRunOracleReviewContextsBySessionID.removeValue(forKey: sessionID)
         delegatedAgentRunOracleReviewContextsByKey = delegatedAgentRunOracleReviewContextsByKey.filter {
@@ -6170,23 +6175,23 @@ final class AgentModeViewModel: ObservableObject {
             }
             return nil
         }
-        guard delegated.targetTabID == tabID,
-              delegated.targetWorkspaceID == workspaceID,
-              delegated.targetAgentSessionID == sessionID,
+        guard delegated.target.tabID == tabID,
+              delegated.target.workspaceID == workspaceID,
+              delegated.target.agentSessionID == sessionID,
               delegated.targetRunID == runID
         else {
             throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch
         }
         guard let session = sessions[tabID],
               session.activeAgentSessionID == sessionID,
-              session.parentSessionID == delegated.expectedParentSessionID,
+              session.parentSessionID == delegated.target.expectedParentSessionID,
               session.mcpControlContext?.sessionID == sessionID,
-              session.mcpControlContext?.activationID == delegated.targetActivationID
+              session.mcpControlContext?.activationID == delegated.target.activationID
         else {
             throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch
         }
         guard Self.agentRunOracleReviewBindingsMatch(
-            source: delegated.targetWorktreeBindings,
+            source: delegated.target.worktreeBindings,
             target: session.worktreeBindings
         ) else {
             throw AgentRunOracleReviewUnavailableReason.targetBindingMismatch

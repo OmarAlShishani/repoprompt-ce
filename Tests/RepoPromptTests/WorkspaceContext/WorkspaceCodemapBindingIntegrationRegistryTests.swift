@@ -26,6 +26,41 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
         let missingCandidate = await catalog.resolveManifestBinding(missingEpoch, "Sources/Value.swift")
         XCTAssertNil(missingCandidate)
 
+        let firstPage = try await projectionPage(catalog.readProjectionCatalogPage(
+            WorkspaceCodemapProjectionCatalogPageRequest(
+                rootEpoch: firstEpoch,
+                token: nil,
+                cursor: nil,
+                maximumEntryCount: 1,
+                maximumPathByteCount: 64
+            )
+        ))
+        let secondPage = try await projectionPage(catalog.readProjectionCatalogPage(
+            WorkspaceCodemapProjectionCatalogPageRequest(
+                rootEpoch: secondEpoch,
+                token: nil,
+                cursor: nil,
+                maximumEntryCount: 1,
+                maximumPathByteCount: 64
+            )
+        ))
+        XCTAssertEqual(firstPage.token.rootEpoch, firstEpoch)
+        XCTAssertEqual(secondPage.token.rootEpoch, secondEpoch)
+        let currentToken = await catalog.revalidateProjectionCatalogToken(firstEpoch, firstPage.token)
+        XCTAssertEqual(currentToken, .current)
+        let foreignToken = await catalog.revalidateProjectionCatalogToken(firstEpoch, secondPage.token)
+        XCTAssertEqual(foreignToken, .stale)
+        let missingPage = await catalog.readProjectionCatalogPage(
+            WorkspaceCodemapProjectionCatalogPageRequest(
+                rootEpoch: missingEpoch,
+                token: nil,
+                cursor: nil,
+                maximumEntryCount: 1,
+                maximumPathByteCount: 64
+            )
+        )
+        XCTAssertEqual(missingPage, .unavailable(.rootNotCurrent))
+
         let sourceReader = registry.makeValidatedSourceReaderClient()
         let firstIdentity = try XCTUnwrap(identity(rootEpoch: firstEpoch, fileID: firstFileID))
         let secondIdentity = try XCTUnwrap(identity(rootEpoch: secondEpoch, fileID: secondFileID))
@@ -222,7 +257,49 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
             catalogClient: WorkspaceCodemapBindingCatalogClient { epoch, relativePath in
                 guard epoch == rootEpoch else { return nil }
                 return candidate(rootEpoch: epoch, fileID: fileID, relativePath: relativePath)
+            } readProjectionCatalogPage: { request in
+                guard request.rootEpoch == rootEpoch else { return .stale }
+                let token = projectionToken(rootEpoch: rootEpoch)
+                guard request.token == nil || request.token == token else { return .stale }
+                switch WorkspaceCodemapProjectionCatalogPage.validated(
+                    request: request,
+                    token: token,
+                    entries: [],
+                    nextCursor: nil,
+                    isEnd: true,
+                    supportedCandidateCountThroughPage: 0
+                ) {
+                case let .success(page):
+                    return .page(page)
+                case .failure:
+                    return .unavailable(.catalogUnavailable)
+                }
+            } revalidateProjectionCatalogToken: { epoch, token in
+                guard epoch == rootEpoch, token.rootEpoch == rootEpoch else { return .stale }
+                return token == projectionToken(rootEpoch: rootEpoch) ? .current : .stale
             }
+        )
+    }
+
+    private func projectionPage(
+        _ disposition: WorkspaceCodemapProjectionCatalogPageDisposition
+    ) throws -> WorkspaceCodemapProjectionCatalogPage {
+        guard case let .page(page) = disposition else {
+            throw RegistryTestError.expectedProjectionPage
+        }
+        return page
+    }
+
+    private static func projectionToken(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapProjectionCatalogToken {
+        WorkspaceCodemapProjectionCatalogToken(
+            rootEpoch: rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: 1,
+            ingressGeneration: 1,
+            projectionInvalidationGeneration: 1
         )
     }
 
@@ -301,6 +378,10 @@ private final class RegistryWeakEndpointBox {
     init(_ value: WorkspaceCodemapBindingIntegrationEndpoint) {
         self.value = value
     }
+}
+
+private enum RegistryTestError: Error {
+    case expectedProjectionPage
 }
 
 private actor RegistryRouteGate {

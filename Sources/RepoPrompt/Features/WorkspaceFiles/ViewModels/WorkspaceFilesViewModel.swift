@@ -454,11 +454,6 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     private typealias RootKey = String
 
-    private struct AutomaticCodemapTargetIdentity: Hashable {
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let fileID: UUID
-    }
-
     private struct RootLoadToken: Equatable {
         let rootKey: RootKey
         let lifecycleGeneration: UInt64
@@ -673,6 +668,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     }
 
     private(set) var selectionStateRevision: UInt64 = 0
+    @Published private(set) var codemapMarkerReadinessRevision: UInt64 = 0
 
     @Published private(set) var selectedFiles: [FileViewModel] = [] {
         didSet {
@@ -1187,6 +1183,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     #endif
     private var workspaceStoreDeltaBridgeTask: Task<Void, Never>?
     private var codemapSelectionGraphReadinessTask: Task<Void, Never>?
+    private var codemapMarkerReadinessTask: Task<Void, Never>?
     private let alwaysReadableHomeDirectoryURL: URL
     private let automaticCodemapSelectionRequestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
     private let automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
@@ -1214,6 +1211,7 @@ class WorkspaceFilesViewModel: ObservableObject {
 
         subscribeToWorkspaceStoreDeltaEvents()
         subscribeToCodemapSelectionGraphReadinessUpdates()
+        subscribeToCodemapMarkerReadinessUpdates()
         subscribeToPartitionStoreSaves()
         subscribeToFileSystemPreferenceChanges()
     }
@@ -1231,6 +1229,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         // Cancel the subscriptions if this VM goes away
         workspaceStoreDeltaBridgeTask?.cancel()
         codemapSelectionGraphReadinessTask?.cancel()
+        codemapMarkerReadinessTask?.cancel()
         autoCodemapSyncTask?.cancel()
         for task in sliceRebaseTasksByFullPath.values {
             task.cancel()
@@ -1414,6 +1413,16 @@ class WorkspaceFilesViewModel: ObservableObject {
             let stream = await workspaceFileContextStore.codemapSelectionGraphReadinessUpdates()
             for await event in stream {
                 handleCodemapSelectionGraphReadiness(event)
+            }
+        }
+    }
+
+    private func subscribeToCodemapMarkerReadinessUpdates() {
+        codemapMarkerReadinessTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await workspaceFileContextStore.codemapMarkerReadinessUpdates()
+            for await event in stream {
+                handleCodemapMarkerReadiness(event)
             }
         }
     }
@@ -2366,6 +2375,14 @@ class WorkspaceFilesViewModel: ObservableObject {
               visibleRootFolders.contains(where: { $0.id == event.rootEpoch.rootID })
         else { return }
         scheduleAutoCodemapSync(readinessTriggered: true)
+    }
+
+    @MainActor
+    private func handleCodemapMarkerReadiness(
+        _ event: WorkspaceCodemapMarkerReadinessEvent
+    ) {
+        guard visibleRootFolders.contains(where: { $0.id == event.rootEpoch.rootID }) else { return }
+        codemapMarkerReadinessRevision &+= 1
     }
 
     func cancelAllLoadingTasks() {
@@ -10894,6 +10911,45 @@ extension WorkspaceFilesViewModel {
         func waitForAutoCodemapSyncForTesting() async {
             await autoCodemapSyncTask?.value
         }
+
+        @MainActor
+        func reconstructAutomaticCodemapTargetsForTesting(
+            receiptTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+            revalidatedTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+            sourceIDs: [UUID],
+            filesByID: [UUID: FileViewModel]
+        ) -> [FileViewModel]? {
+            reconstructAutomaticCodemapTargets(
+                receiptTargets: receiptTargets,
+                revalidatedTargets: revalidatedTargets,
+                sourceIDs: sourceIDs,
+                filesByID: filesByID
+            )
+        }
+
+        @MainActor
+        func rejectInvalidAutomaticCodemapTargetsForTesting(
+            receiptTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+            revalidatedTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+            sourceIDs: [UUID],
+            filesByID: [UUID: FileViewModel]
+        ) -> Bool {
+            guard reconstructAutomaticCodemapTargets(
+                receiptTargets: receiptTargets,
+                revalidatedTargets: revalidatedTargets,
+                sourceIDs: sourceIDs,
+                filesByID: filesByID
+            ) != nil else {
+                rejectAutomaticCodemapPublicationForRetry()
+                return true
+            }
+            return false
+        }
+
+        @MainActor
+        var automaticCodemapReadinessRetryPendingForTesting: Bool {
+            autoCodemapReadinessRetryPending
+        }
     #endif
 
     @MainActor
@@ -10916,6 +10972,9 @@ extension WorkspaceFilesViewModel {
         autoCodemapReadinessRetryPending = false
         let generation = autoCodemapSelectionGeneration
         let sourceIDs = visibleSelectedFileIDs()
+        if !autoCodemapFiles.isEmpty {
+            resetAutoCodemapFiles([])
+        }
         await resolveAutomaticCodemaps(generation: generation, sourceIDs: sourceIDs)
     }
 
@@ -10956,6 +11015,9 @@ extension WorkspaceFilesViewModel {
         autoCodemapSelectionGeneration &+= 1
         let generation = autoCodemapSelectionGeneration
         let sourceIDs = visibleSelectedFileIDs()
+        if !autoCodemapFiles.isEmpty {
+            resetAutoCodemapFiles([])
+        }
         autoCodemapSyncTask = Task(priority: .utility) { [weak self] in
             try? await Task.sleep(nanoseconds: 400_000_000)
             guard let self else { return }
@@ -11013,6 +11075,12 @@ extension WorkspaceFilesViewModel {
                 rootScope: .visibleWorkspace
             )
         } catch {
+            if automaticCodemapSelectionIsCurrent(
+                generation: generation,
+                sourceIDs: sourceIDs
+            ) {
+                resetAutoCodemapFiles([])
+            }
             return
         }
         guard automaticCodemapSelectionIsCurrent(
@@ -11022,15 +11090,20 @@ extension WorkspaceFilesViewModel {
         switch result.aggregateCoverage {
         case .complete, .partial:
             break
-        case .pending, .busy:
+        case .incomplete, .pending, .busy:
+            resetAutoCodemapFiles([])
             if autoCodemapReadinessRetryAvailable {
                 autoCodemapReadinessRetryPending = true
             }
             return
         case .unavailable, .stale, .budget:
+            resetAutoCodemapFiles([])
             return
         }
-        guard let receipt = result.publicationReceipt else { return }
+        guard let receipt = result.publicationReceipt else {
+            resetAutoCodemapFiles([])
+            return
+        }
         let publication = await workspaceFileContextStore
             .revalidateAutomaticCodemapSelectionForPublication(
                 receipt,
@@ -11040,25 +11113,64 @@ extension WorkspaceFilesViewModel {
         guard automaticCodemapSelectionIsCurrent(
             generation: generation,
             sourceIDs: sourceIDs
-        ), case let .current(targets) = publication
-        else { return }
-        autoCodemapReadinessRetryAvailable = true
-        autoCodemapReadinessRetryPending = false
+        ) else { return }
+        guard case let .current(targets) = publication else {
+            rejectAutomaticCodemapPublicationForRetry()
+            return
+        }
+        guard let resolvedTargets = reconstructAutomaticCodemapTargets(
+            receiptTargets: receipt.targets,
+            revalidatedTargets: targets,
+            sourceIDs: sourceIDs,
+            filesByID: fileHierarchyIndex.filesByID
+        ) else {
+            rejectAutomaticCodemapPublicationForRetry()
+            return
+        }
+        guard receipt.publicationPermit.withCurrent({
+            autoCodemapReadinessRetryAvailable = true
+            autoCodemapReadinessRetryPending = false
+            resetAutoCodemapFiles(resolvedTargets)
+            return true
+        }) == true else {
+            resetAutoCodemapFiles([])
+            if autoCodemapReadinessRetryAvailable {
+                autoCodemapReadinessRetryPending = true
+            }
+            return
+        }
+    }
+
+    @MainActor
+    private func reconstructAutomaticCodemapTargets(
+        receiptTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+        revalidatedTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+        sourceIDs: [UUID],
+        filesByID: [UUID: FileViewModel]
+    ) -> [FileViewModel]? {
+        guard revalidatedTargets == receiptTargets else { return nil }
+
         let sourceIDSet = Set(sourceIDs)
-        var seenTargets = Set<AutomaticCodemapTargetIdentity>()
-        let resolvedTargets = targets.compactMap { target -> FileViewModel? in
-            let identity = AutomaticCodemapTargetIdentity(
-                rootEpoch: target.rootEpoch,
-                fileID: target.fileID
-            )
+        var seenTargetFileIDs = Set<UUID>()
+        var resolvedTargets: [FileViewModel] = []
+        resolvedTargets.reserveCapacity(receiptTargets.count)
+        for target in receiptTargets {
             guard !sourceIDSet.contains(target.fileID),
-                  seenTargets.insert(identity).inserted,
-                  let file = fileHierarchyIndex.filesByID[target.fileID],
+                  seenTargetFileIDs.insert(target.fileID).inserted,
+                  let file = filesByID[target.fileID],
                   file.rootIdentifier == target.rootEpoch.rootID
             else { return nil }
-            return file
+            resolvedTargets.append(file)
         }
-        resetAutoCodemapFiles(resolvedTargets)
+        return resolvedTargets
+    }
+
+    @MainActor
+    private func rejectAutomaticCodemapPublicationForRetry() {
+        resetAutoCodemapFiles([])
+        if autoCodemapReadinessRetryAvailable {
+            autoCodemapReadinessRetryPending = true
+        }
     }
 
     /// UI/test compatibility snapshot of the current checkbox/slice/codemap mirror.

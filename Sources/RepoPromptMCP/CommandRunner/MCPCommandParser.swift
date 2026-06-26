@@ -744,8 +744,7 @@ enum MCPCommandParser {
             let limitFlags = [
                 ("max_files", flags["max-files"] ?? flags["max_files"]),
                 ("max_edges", flags["max-edges"] ?? flags["max_edges"]),
-                ("max_codemap_tokens", flags["max-codemap-tokens"] ?? flags["max_codemap_tokens"]),
-                ("wait_ms", flags["wait-ms"] ?? flags["wait_ms"])
+                ("max_codemap_tokens", flags["max-codemap-tokens"] ?? flags["max_codemap_tokens"])
             ]
             for (key, raw) in limitFlags {
                 if let raw, let value = Int(raw) {

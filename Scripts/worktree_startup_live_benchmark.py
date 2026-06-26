@@ -31,7 +31,7 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
 DEBUG_TOOL = "__repoprompt_debug_diagnostics"
-WORKSPACE_PREFIX = "RPCE 8E Bench "
+WORKSPACE_PREFIXES = ("RPCE 8E Bench ", "RPCE Search Bench ")
 DEFAULT_OUTPUT_ROOT = "/tmp/rpce-worktree-startup/v1"
 BENCHMARK_GATE_KEY = "agent_mode.worktree_startup_benchmark_diagnostics_enabled"
 OWNERSHIP_MARKER_NAME = ".rpce-worktree-startup-benchmark.json"
@@ -90,6 +90,39 @@ METRICS = (
 )
 TOOL_METRICS = ("first_search", "first_read")
 ALL_METRICS = METRICS + TOOL_METRICS
+CODEMAP_GATE_MINIMUM_SUPPORTED_FILES = 5_000
+CODEMAP_GATE_MINIMUM_COLD_SAMPLES = 20
+CODEMAP_GATE_MINIMUM_WARM_SAMPLES = 40
+CODEMAP_GATE_WAIT_MILLISECONDS = 10_000
+CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS = 500
+CODEMAP_TREE_LEGEND = "(+ denotes code-map available)"
+CODEMAP_GATE_SENTINEL = "RPCE_CODEMAP_GATE_OK"
+CODEMAP_TEMP_OWNERSHIP_MARKER = ".rpce-codemap-gate-owned.json"
+CODEMAP_BASELINE_LEDGER_KIND = "codemap-gate-baseline-ledger"
+CODEMAP_REQUIRED_METRICS = (
+    "cold_individual_structure", "warm_individual_structure",
+    "cold_directory_structure", "warm_directory_structure",
+    "tree_marker_availability", "first_search", "first_read",
+    "root_readiness", "queue_wait", "operation_duration",
+    "memory_peak_resident_delta_mb", "memory_retained_resident_delta_mb",
+    "memory_peak_physical_footprint_delta_mb",
+    "memory_retained_physical_footprint_delta_mb",
+)
+CODEMAP_REQUIRED_GATES = (
+    "exact cold/warm sample counts",
+    "complete p50/p95 metric inventory",
+    "all codemap content/path/tree scenarios",
+    "every request within 10s + 500ms",
+    "root/search/read p95 regression <= 10%",
+    "warm structure p50/p95 regression <= 10%",
+    "memory delta p95 regression <= 10%",
+    "owned cleanup complete",
+    "owner-only raw artifacts and privacy scan",
+)
+CODEMAP_PRIVACY_KEYS = {
+    "ok", "scanned_file_count", "failure_codes",
+    "allowlisted_root_sha256", "allowlisted_prompt_sha256",
+}
 
 
 class BenchmarkError(RuntimeError):
@@ -110,6 +143,20 @@ def sha256_bytes(value: bytes) -> str:
 
 def canonical_json(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def load_strict_json(path: Path, label: str) -> tuple[Any, bytes]:
+    raw = path.read_bytes()
+    try:
+        value = json.loads(
+            raw,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {constant}")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError) as error:
+        raise BenchmarkError(f"{label} is not strict finite JSON") from error
+    return value, raw
 
 
 def secure_write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
@@ -173,71 +220,264 @@ def structured_json_objects(value: Any) -> Iterable[dict[str, Any]]:
 def canonicalize_evidence_path(path: str, root_path: str) -> str:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
+        parts = candidate.parts
+        if parts and parts[0] == Path(root_path).name:
+            candidate = Path(*parts[1:])
         candidate = Path(root_path) / candidate
     return str(candidate.resolve(strict=False))
 
 
-def structured_mcp_record(value: Any, tool: str) -> dict[str, Any]:
-    keys_by_tool = {
-        "file_search": {"matches", "total_matches"},
-        "read_file": {"path", "content"},
-        "manage_selection": {"files"},
-        "get_code_structure": {"files"},
+def attribute_result_path(
+    raw_path: str,
+    *,
+    explicit_root_path: str | None,
+    bound_root_paths: list[str] | None,
+    enriched_root_path: str | None,
+) -> tuple[str, str]:
+    roots = bound_root_paths or ([enriched_root_path] if enriched_root_path else [])
+    roots = [str(Path(root).expanduser().resolve(strict=False)) for root in roots]
+    candidate = Path(raw_path).expanduser()
+    attributed_root: str | None = None
+    relative = candidate
+    if explicit_root_path is not None:
+        attributed_root = str(Path(explicit_root_path).expanduser().resolve(strict=False))
+        if roots and attributed_root not in roots:
+            raise BenchmarkError("result file root attribution was not present in the atomic binding")
+    elif candidate.is_absolute():
+        matches = [
+            root for root in roots
+            if Path(root) == candidate or Path(root) in candidate.parents
+        ]
+        if len(matches) != 1:
+            raise BenchmarkError("absolute result path did not resolve to exactly one bound root")
+        attributed_root = matches[0]
+    else:
+        prefix_matches = [
+            root for root in roots if candidate.parts and Path(root).name == candidate.parts[0]
+        ]
+        if len(prefix_matches) == 1:
+            attributed_root = prefix_matches[0]
+            relative = Path(*candidate.parts[1:])
+        elif len(prefix_matches) > 1:
+            raise BenchmarkError("relative result path matched multiple bound roots with the same name")
+        elif len(roots) == 1:
+            attributed_root = roots[0]
+        else:
+            raise BenchmarkError("relative result path lacked unambiguous bound-root attribution")
+    if attributed_root is None:
+        raise BenchmarkError("result path omitted root attribution")
+    canonical = (
+        candidate.resolve(strict=False)
+        if candidate.is_absolute()
+        else (Path(attributed_root) / relative).resolve(strict=False)
+    )
+    root = Path(attributed_root)
+    if canonical == root or root not in canonical.parents:
+        raise BenchmarkError("result path escaped its attributed root")
+    return str(canonical), attributed_root
+
+
+def benchmark_final_response(value: Any) -> Any:
+    if isinstance(value, dict) and "_benchmark_response" in value:
+        return value["_benchmark_response"]
+    return value
+
+
+def benchmark_binding(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or "_benchmark_response" not in value:
+        return None
+    binding = value.get("_benchmark_binding")
+    if (
+        value.get("_benchmark_output_valid") is not True
+        or value.get("_benchmark_binding_valid") is not True
+        or not isinstance(binding, dict)
+    ):
+        raise BenchmarkError("CLI call omitted exact atomic context binding evidence")
+    if binding.get("context_id") != value.get("_benchmark_requested_context_id"):
+        raise BenchmarkError("CLI call binding context did not match the requested context")
+    return binding
+
+
+def binding_root_paths(value: Any) -> list[str] | None:
+    binding = benchmark_binding(value)
+    if binding is None:
+        return None
+    paths = binding.get("repo_paths")
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise BenchmarkError("CLI binding omitted loaded root paths")
+    return [str(Path(path).expanduser().resolve(strict=False)) for path in paths]
+
+
+def tool_payload(value: Any, tool: str) -> dict[str, Any]:
+    signatures = {
+        "file_search": lambda item: isinstance(item.get("total_matches"), int)
+        and isinstance(item.get("content_match_groups"), list),
+        "read_file": lambda item: isinstance(item.get("display_path"), str)
+        and isinstance(item.get("content"), str),
+        "manage_selection": lambda item: isinstance(item.get("status"), str)
+        and isinstance(item.get("files"), list)
+        and ("total_tokens" in item or "codemap_auto_enabled" in item),
+        "get_code_structure": lambda item: isinstance(item.get("status"), str)
+        and isinstance(item.get("files"), list)
+        and ("issues" in item or "retry" in item or "summary" in item),
+        "get_file_tree": lambda item: isinstance(item.get("tree"), str)
+        and isinstance(item.get("uses_legend"), bool),
     }
-    required_any = keys_by_tool[tool]
-    candidates: list[dict[str, Any]] = []
-    for candidate in structured_json_objects(value):
-        declared_tool = candidate.get("tool") or candidate.get("tool_name")
-        if declared_tool is not None and str(declared_tool).split("__")[-1] != tool:
+    declared: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for candidate in structured_json_objects(benchmark_final_response(value)):
+        candidate_tool = candidate.get("tool") or candidate.get("tool_name")
+        if candidate_tool is not None:
+            if str(candidate_tool).split("__")[-1] == tool:
+                declared.append(candidate)
             continue
-        typed_negative = (
-            candidate.get("status") in {"not_found", "unavailable", "removed"}
-            and (isinstance(candidate.get("issue"), dict) or isinstance(candidate.get("issue_code"), str))
-        )
-        if isinstance(candidate.get("status"), str) and (required_any & set(candidate) or typed_negative):
-            candidates.append(candidate)
+        if signatures[tool](candidate):
+            current.append(candidate)
+    candidates = declared or current
     if len(candidates) != 1:
-        raise BenchmarkError(f"{tool} response requires exactly one structured status/root/file record")
-    record = candidates[0]
-    root = record.get("root")
-    if not isinstance(root, dict):
-        raise BenchmarkError(f"{tool} structured record omitted root")
-    root_id = root.get("id") or root.get("root_id")
-    root_path = root.get("path") or root.get("root_path")
-    root_type = root.get("type") or root.get("root_type")
-    if not all(isinstance(item, str) and item for item in (root_id, root_path, root_type)):
-        raise BenchmarkError(f"{tool} structured record omitted canonical root identity/type")
-    validate_uuid(root_id, f"{tool} root id")
-    files_raw = record.get("matches") if tool == "file_search" else record.get("files")
-    if tool == "read_file":
-        if not isinstance(files_raw, list):
-            files_raw = [] if not isinstance(record.get("path"), str) else [{
-                "path": record.get("path"),
-                "type": record.get("file_type") or record.get("type"),
+        raise BenchmarkError(f"{tool} response requires exactly one recognizable tool payload")
+    return candidates[0]
+
+
+def structured_mcp_record(
+    value: Any,
+    tool: str,
+    *,
+    expected_root_id: str,
+    expected_root_path: str,
+    expected_root_type: str,
+) -> dict[str, Any]:
+    record = tool_payload(value, tool)
+    canonical_root_path = str(Path(expected_root_path).expanduser().resolve(strict=False))
+    bound_paths = binding_root_paths(value)
+    if bound_paths is not None and canonical_root_path not in bound_paths:
+        raise BenchmarkError(f"{tool} binding did not include the expected root")
+    expected_root = {
+        "id": str(uuid.UUID(expected_root_id)).upper(),
+        "path": canonical_root_path,
+        "type": expected_root_type,
+    }
+    enriched_root = record.get("root")
+    enriched_root_path: str | None = None
+    if isinstance(enriched_root, dict):
+        root_id = enriched_root.get("id") or enriched_root.get("root_id")
+        root_path = enriched_root.get("path") or enriched_root.get("root_path")
+        root_type = enriched_root.get("type") or enriched_root.get("root_type")
+        if not all(isinstance(item, str) and item for item in (root_id, root_path, root_type)):
+            raise BenchmarkError(f"{tool} structured root identity was incomplete")
+        actual_root = {
+            "id": str(uuid.UUID(root_id)).upper(),
+            "path": str(Path(root_path).expanduser().resolve(strict=False)),
+            "type": root_type,
+        }
+        enriched_root_path = actual_root["path"]
+        if actual_root != expected_root:
+            raise BenchmarkError(f"{tool} returned the wrong canonical root")
+
+    files_raw: list[dict[str, Any]]
+    if tool == "file_search" and isinstance(record.get("content_match_groups"), list):
+        files_raw = []
+        for group in record["content_match_groups"]:
+            if not isinstance(group, dict) or not isinstance(group.get("path"), str):
+                raise BenchmarkError("file_search match group omitted path")
+            lines = group.get("lines")
+            if not isinstance(lines, list):
+                raise BenchmarkError("file_search match group omitted lines")
+            content = "\n".join(
+                line.get("line_text", "") for line in lines if isinstance(line, dict)
+            )
+            files_raw.append({"path": group["path"], "type": "file", "content": content})
+    elif tool == "file_search":
+        raw = record.get("matches")
+        files_raw = raw if isinstance(raw, list) else []
+    elif tool == "read_file" and isinstance(record.get("display_path"), str):
+        files_raw = [{
+            "path": record["display_path"], "type": "file", "content": record.get("content"),
+        }]
+    elif tool == "read_file":
+        raw = record.get("files")
+        if not isinstance(raw, list) and isinstance(record.get("path"), str):
+            raw = [{
+                "path": record["path"],
+                "type": record.get("file_type") or record.get("type") or "file",
                 "content": record.get("content"),
             }]
-    if not isinstance(files_raw, list):
-        raise BenchmarkError(f"{tool} structured record omitted file records")
+        files_raw = raw if isinstance(raw, list) else []
+    else:
+        raw = record.get("files")
+        files_raw = raw if isinstance(raw, list) else []
+
     files: list[dict[str, Any]] = []
     for file in files_raw:
-        if not isinstance(file, dict) or not isinstance(file.get("path"), str):
+        if not isinstance(file, dict):
+            raise BenchmarkError(f"{tool} returned a non-object file record")
+        raw_path = file.get("path_within_root") or file.get("path")
+        if not isinstance(raw_path, str):
             raise BenchmarkError(f"{tool} file record omitted path")
+        source_root = file.get("root_path")
+        explicit_root = source_root if isinstance(source_root, str) else None
+        canonical_path, attributed_root = attribute_result_path(
+            raw_path,
+            explicit_root_path=explicit_root,
+            bound_root_paths=bound_paths,
+            enriched_root_path=enriched_root_path,
+        )
         file_type = file.get("type") or file.get("file_type") or file.get("kind")
         if not isinstance(file_type, str) or not file_type:
-            raise BenchmarkError(f"{tool} file record omitted type")
+            file_type = Path(raw_path).suffix.lstrip(".") if tool == "get_code_structure" else "file"
         files.append({
-            "path": canonicalize_evidence_path(file["path"], root_path),
+            "path": canonical_path,
+            "root_path": attributed_root,
             "type": file_type,
             "content": file.get("content") or file.get("text") or file.get("code"),
         })
     result = dict(record)
-    result["root"] = {
-        "id": str(uuid.UUID(root_id)).upper(),
-        "path": str(Path(root_path).expanduser().resolve(strict=False)),
-        "type": root_type,
-    }
+    result["status"] = record.get("status") or "success"
+    result["root"] = expected_root
     result["files"] = files
     return result
+
+
+def request_path_evidence(
+    value: Any,
+    tool: str,
+    *,
+    expected_root_path: str,
+    expected_file_path: str | None,
+) -> None:
+    if not isinstance(value, dict) or "_benchmark_payload" not in value:
+        return
+    payload = value.get("_benchmark_payload")
+    if not isinstance(payload, dict):
+        raise BenchmarkError(f"{tool} call omitted request payload evidence")
+    raw_paths: list[str] = []
+    if tool == "file_search":
+        filters = payload.get("filter")
+        paths = filters.get("paths") if isinstance(filters, dict) else None
+        raw_paths = paths if isinstance(paths, list) and all(isinstance(path, str) for path in paths) else []
+    elif tool == "read_file":
+        raw_paths = [payload["path"]] if isinstance(payload.get("path"), str) else []
+    elif tool == "get_code_structure":
+        if payload.get("scope") == "selected":
+            return
+        paths = payload.get("paths")
+        raw_paths = paths if isinstance(paths, list) and all(isinstance(path, str) for path in paths) else []
+    else:
+        return
+    if not raw_paths:
+        raise BenchmarkError(f"{tool} call omitted explicit path routing")
+    root = Path(expected_root_path).resolve(strict=False)
+    canonical_paths = [Path(canonicalize_evidence_path(path, str(root))) for path in raw_paths]
+    if any(path != root and root not in path.parents for path in canonical_paths):
+        raise BenchmarkError(f"{tool} request escaped the expected root")
+    if expected_file_path is not None:
+        expected = Path(canonicalize_evidence_path(expected_file_path, str(root)))
+        if tool == "read_file" and canonical_paths != [expected]:
+            raise BenchmarkError("read_file request did not target the exact expected file")
+        if tool in {"file_search", "get_code_structure"} and not any(
+            path == expected or path in expected.parents for path in canonical_paths
+        ):
+            raise BenchmarkError(f"{tool} request did not scope the expected file")
 
 
 def require_structured_success(
@@ -251,11 +491,18 @@ def require_structured_success(
     expected_file_type: str,
     expected_content: str | None = None,
     require_only_file: bool = True,
+    allow_other_roots: bool = False,
 ) -> dict[str, Any]:
     if not call_succeeded(value):
         raise BenchmarkError(f"{tool} transport/tool call failed")
-    record = structured_mcp_record(value, tool)
-    if record.get("status") not in {"ok", "completed", "ready", "success"}:
+    request_path_evidence(
+        value, tool, expected_root_path=expected_root_path, expected_file_path=expected_file_path
+    )
+    record = structured_mcp_record(
+        value, tool, expected_root_id=expected_root_id,
+        expected_root_path=expected_root_path, expected_root_type=expected_root_type,
+    )
+    if record.get("status") not in {"ok", "complete", "completed", "ready", "success"}:
         raise BenchmarkError(f"{tool} returned non-success status")
     expected_root = {
         "id": str(uuid.UUID(expected_root_id)).upper(),
@@ -265,11 +512,19 @@ def require_structured_success(
     if record["root"] != expected_root:
         raise BenchmarkError(f"{tool} returned the wrong canonical root")
     expected_path = canonicalize_evidence_path(expected_file_path, expected_root_path)
-    matches = [file for file in record["files"] if file["path"] == expected_path]
+    matches = [
+        file for file in record["files"]
+        if file["path"] == expected_path
+        and file.get("root_path") in (None, expected_root["path"])
+    ]
     if len(matches) != 1:
         raise BenchmarkError(f"{tool} did not return exactly the expected file")
     if require_only_file and len(record["files"]) != 1:
         raise BenchmarkError(f"{tool} returned cross-root or extra files")
+    if not allow_other_roots and any(
+        file.get("root_path") not in (None, expected_root["path"]) for file in record["files"]
+    ):
+        raise BenchmarkError(f"{tool} returned files from another bound root")
     if matches[0]["type"] != expected_file_type:
         raise BenchmarkError(f"{tool} returned the wrong file type")
     if expected_content is not None and expected_content not in str(matches[0].get("content") or ""):
@@ -288,25 +543,123 @@ def require_structured_removed(
     expected_root_id: str,
     expected_root_path: str,
     expected_root_type: str,
+    expected_file_path: str | None = None,
+    require_absent_bound_root: bool = False,
 ) -> dict[str, Any]:
-    if not call_succeeded(value):
-        raise BenchmarkError(f"{tool} removed-root check had transport/tool failure")
-    record = structured_mcp_record(value, tool)
-    if record.get("status") not in {"not_found", "unavailable", "removed"}:
-        raise BenchmarkError(f"{tool} removed-root check lacked typed removed/unavailable status")
-    issue = record.get("issue")
-    issue_code = issue.get("code") if isinstance(issue, dict) else record.get("issue_code")
-    if issue_code not in {"root_not_found", "root_removed", "root_unavailable", "git_root_unavailable"}:
-        raise BenchmarkError(f"{tool} removed-root check lacked typed issue code")
-    expected_id = str(uuid.UUID(expected_root_id)).upper()
-    if record["root"] != {
-        "id": expected_id, "path": str(Path(expected_root_path).resolve(strict=False)),
-        "type": expected_root_type,
-    }:
-        raise BenchmarkError(f"{tool} removed-root check returned wrong root identity")
-    if record["files"]:
-        raise BenchmarkError(f"{tool} removed-root check returned stale files")
-    return record
+    request_path_evidence(
+        value, tool, expected_root_path=expected_root_path, expected_file_path=expected_file_path
+    )
+    bound_paths = binding_root_paths(value)
+    canonical_root = str(Path(expected_root_path).resolve(strict=False))
+    payload = tool_payload(value, tool) if tool != "read_file" or call_succeeded(value) else None
+    if isinstance(payload, dict) and isinstance(payload.get("root"), dict):
+        if require_absent_bound_root and (
+            bound_paths is None or canonical_root in bound_paths
+        ):
+            raise BenchmarkError(
+                "enriched removed Git-root evidence required the root absent from atomic binding"
+            )
+        enriched_root = payload["root"]
+        raw_root_id = enriched_root.get("id") or enriched_root.get("root_id")
+        raw_root_path = enriched_root.get("path") or enriched_root.get("root_path")
+        raw_root_type = enriched_root.get("type") or enriched_root.get("root_type")
+        if not all(isinstance(item, str) and item for item in (
+            raw_root_id, raw_root_path, raw_root_type,
+        )):
+            raise BenchmarkError(f"{tool} enriched removed-root identity was incomplete")
+        expected_root = {
+            "id": str(uuid.UUID(expected_root_id)).upper(),
+            "path": canonical_root,
+            "type": expected_root_type,
+        }
+        actual_root = {
+            "id": str(uuid.UUID(raw_root_id)).upper(),
+            "path": str(Path(raw_root_path).resolve(strict=False)),
+            "type": raw_root_type,
+        }
+        raw_files = payload.get("matches") if tool == "file_search" else payload.get("files")
+        record = dict(payload)
+        record["root"] = actual_root
+        record["files"] = raw_files if isinstance(raw_files, list) else []
+        issue = record.get("issue")
+        issue_code = issue.get("code") if isinstance(issue, dict) else record.get("issue_code")
+        allowed_issue_codes = (
+            {"root_not_found", "root_removed", "root_unavailable", "path_not_found"}
+            if require_absent_bound_root else
+            {"root_not_found", "root_removed", "root_unavailable", "git_root_unavailable"}
+        )
+        if (
+            call_succeeded(value)
+            and actual_root == expected_root
+            and record.get("status") in {"not_found", "unavailable", "removed"}
+            and issue_code in allowed_issue_codes
+            and not record["files"]
+        ):
+            return record
+        raise BenchmarkError(f"{tool} enriched removed-root evidence was invalid")
+    if tool == "file_search":
+        if not call_succeeded(value) or bound_paths is None or canonical_root in bound_paths:
+            raise BenchmarkError("file_search removal check lacked successful absent-root binding")
+        if (
+            payload.get("total_matches") != 0
+            or payload.get("matched_files") != 0
+            or payload.get("searched_files") != 0
+            or payload.get("content_match_groups")
+        ):
+            raise BenchmarkError("file_search removal check returned stale matches")
+        return {
+            "status": "removed", "root": {
+                "id": str(uuid.UUID(expected_root_id)).upper(), "path": canonical_root,
+                "type": expected_root_type,
+            }, "files": [], "issue": {"code": "root_removed"},
+        }
+    if tool == "get_code_structure":
+        if not call_succeeded(value) or not isinstance(payload, dict):
+            raise BenchmarkError("get_code_structure unavailable check failed")
+        issues = payload.get("issues")
+        codes = {
+            issue.get("code") for issue in issues if isinstance(issue, dict)
+        } if isinstance(issues, list) else set()
+        root_present = bound_paths is not None and canonical_root in bound_paths
+        if require_absent_bound_root:
+            if bound_paths is None or root_present:
+                raise BenchmarkError(
+                    "removed Git-root structure check required the root absent from atomic binding"
+                )
+            allowed_codes = {"path_not_found"}
+        else:
+            if bound_paths is None or not root_present:
+                raise BenchmarkError(
+                    "non-Git structure check required the current root in atomic binding"
+                )
+            allowed_codes = {"git_root_unavailable"}
+        if payload.get("status") != "unavailable" or payload.get("files") or not (codes & allowed_codes):
+            raise BenchmarkError("get_code_structure unavailable check lacked exact issue/root evidence")
+        return {
+            "status": "unavailable", "root": {
+                "id": str(uuid.UUID(expected_root_id)).upper(), "path": canonical_root,
+                "type": expected_root_type,
+            }, "files": [], "issue": {"code": sorted(codes & allowed_codes)[0]},
+        }
+    if tool == "read_file":
+        stderr = value.get("_benchmark_stderr") if isinstance(value, dict) else None
+        expected_path = canonicalize_evidence_path(expected_file_path or "", canonical_root)
+        if (
+            call_succeeded(value)
+            or bound_paths is None
+            or canonical_root in bound_paths
+            or not isinstance(stderr, str)
+            or expected_path not in stderr
+            or "not inside any loaded folder" not in stderr
+        ):
+            raise BenchmarkError("read_file removal check lacked exact absent-root path rejection")
+        return {
+            "status": "removed", "root": {
+                "id": str(uuid.UUID(expected_root_id)).upper(), "path": canonical_root,
+                "type": expected_root_type,
+            }, "files": [], "issue": {"code": "root_removed"},
+        }
+    raise BenchmarkError(f"unsupported removed-root tool {tool}")
 
 
 def structured_success_evidence(value: Any, tool: str, **expected: Any) -> dict[str, Any]:
@@ -336,8 +689,14 @@ def structured_empty_success_evidence(
     try:
         if not call_succeeded(value):
             raise BenchmarkError(f"{tool} transport/tool call failed")
-        record = structured_mcp_record(value, tool)
-        if record.get("status") not in {"ok", "completed", "ready", "success"}:
+        record = structured_mcp_record(
+            value, tool, expected_root_id=expected_root_id,
+            expected_root_path=expected_root_path, expected_root_type=expected_root_type,
+        )
+        request_path_evidence(
+            value, tool, expected_root_path=expected_root_path, expected_file_path=None
+        )
+        if record.get("status") not in {"ok", "complete", "completed", "ready", "success"}:
             raise BenchmarkError(f"{tool} returned non-success status")
         expected_root = {
             "id": str(uuid.UUID(expected_root_id)).upper(),
@@ -398,11 +757,54 @@ def response_worktree_paths(value: Any) -> list[str]:
         if not isinstance(candidate, dict):
             continue
         if any(key in candidate for key in ("worktree_id", "worktree_path", "worktree")):
-            for key in ("path", "worktree_path"):
+            for key in ("path", "worktree_path", "worktree_root_path"):
                 path = candidate.get(key)
                 if isinstance(path, str) and path.startswith("/"):
                     paths.add(path)
     return sorted(paths)
+
+
+def response_worktree_binding_set(value: Any) -> set[tuple[str, str]]:
+    bindings: set[tuple[str, str]] = set()
+    for candidate in structured_json_objects(benchmark_final_response(value)):
+        raw_id = candidate.get("worktree_id") or candidate.get("id")
+        raw_path = candidate.get("worktree_root_path") or candidate.get("worktree_path")
+        if not isinstance(raw_id, str) or not raw_id:
+            continue
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            continue
+        bindings.add((raw_id, str(Path(raw_path).resolve(strict=False))))
+    return bindings
+
+
+def child_inheritance_evidence(
+    parent_response: Any,
+    child_response: Any,
+    *,
+    parent_context_id: str,
+    parent_worktree_path: str,
+) -> dict[str, Any]:
+    child_context_id = response_context_id(child_response)
+    parent_bindings = response_worktree_binding_set(parent_response)
+    child_bindings = response_worktree_binding_set(child_response)
+    canonical_parent_worktree = str(Path(parent_worktree_path).resolve(strict=False))
+    distinct_context = (
+        isinstance(child_context_id, str)
+        and child_context_id.upper() != parent_context_id.upper()
+    )
+    exact_binding_set = bool(
+        parent_bindings
+        and child_bindings == parent_bindings
+        and any(path == canonical_parent_worktree for _, path in child_bindings)
+    )
+    return {
+        "ok": distinct_context and exact_binding_set,
+        "distinct_child_context": distinct_context,
+        "child_context_id": child_context_id,
+        "exact_worktree_binding_set": exact_binding_set,
+        "parent_worktree_bindings": sorted(parent_bindings),
+        "child_worktree_bindings": sorted(child_bindings),
+    }
 
 
 def git_work_records(value: Any) -> list[dict[str, Any]]:
@@ -524,6 +926,64 @@ def run_local(command: list[str], cwd: Path, *, check: bool = True) -> subproces
     if check and process.returncode:
         raise BenchmarkError(f"{' '.join(command)} failed: {process.stderr.strip()}")
     return process
+
+
+def resolve_commit_oid(root: Path, base_ref: str) -> str:
+    process = run_local(
+        ["git", "rev-parse", "--verify", f"{base_ref}^{{commit}}"], root, check=False
+    )
+    oid = process.stdout.strip().lower()
+    if process.returncode or re.fullmatch(r"[0-9a-f]{40,64}", oid) is None:
+        raise BenchmarkError(f"base-ref {base_ref!r} did not resolve to one commit OID")
+    return oid
+
+
+def validate_planned_base_commit(plan: dict[str, Any], root: Path) -> str:
+    dataset = plan.get("dataset")
+    if not isinstance(dataset, dict):
+        raise BenchmarkError("plan omitted dataset")
+    base_ref = dataset.get("base_ref")
+    planned_oid = dataset.get("base_commit_oid")
+    if not isinstance(base_ref, str) or not isinstance(planned_oid, str):
+        raise BenchmarkError("plan omitted immutable base commit OID")
+    if re.fullmatch(r"[0-9a-f]{40,64}", planned_oid.lower()) is None:
+        raise BenchmarkError("plan base commit OID was invalid")
+    current_oid = resolve_commit_oid(root, base_ref)
+    if current_oid != planned_oid.lower():
+        raise BenchmarkError(
+            f"base-ref {base_ref!r} moved from planned commit {planned_oid} to {current_oid}"
+        )
+    return planned_oid.lower()
+
+
+def validate_tracked_read_fixture(
+    root: Path,
+    *,
+    base_ref: str,
+    read_path: str,
+    search_marker: str,
+    read_marker: str,
+) -> str:
+    relative = Path(read_path)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise BenchmarkError("read-path must be root-relative and remain inside the root")
+    object_name = f"{base_ref}:{relative.as_posix()}"
+    exists = run_local(["git", "cat-file", "-e", object_name], root, check=False)
+    if exists.returncode:
+        raise BenchmarkError(
+            f"read-path {relative.as_posix()!r} does not exist in exact base-ref {base_ref!r}"
+        )
+    blob = run_local(["git", "cat-file", "blob", object_name], root, check=False)
+    if blob.returncode:
+        raise BenchmarkError(
+            f"read-path {relative.as_posix()!r} is not a readable blob in exact base-ref {base_ref!r}"
+        )
+    missing = [marker for marker in (search_marker, read_marker) if marker not in blob.stdout]
+    if missing:
+        raise BenchmarkError(
+            f"tracked read-path blob in {base_ref!r} omitted required marker(s): {missing}"
+        )
+    return sha256_bytes(blob.stdout.encode())
 
 
 def resolve_cli(raw: str | None) -> Path:
@@ -654,10 +1114,44 @@ class TimedCall:
     returncode: int
 
 
+def parse_atomic_cli_output(
+    stdout: str,
+    *,
+    expected_context_id: str,
+    expected_window_id: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw_documents = stdout.strip().split("\n\n---\n\n")
+    if len(raw_documents) != 2 or any(not document.strip() for document in raw_documents):
+        raise BenchmarkError("atomic CLI output must contain exactly binding then tool-result JSON")
+    documents: list[Any] = []
+    for raw_document in raw_documents:
+        try:
+            documents.append(json.loads(raw_document))
+        except json.JSONDecodeError as error:
+            raise BenchmarkError("atomic CLI output contained non-JSON content") from error
+    binding_document, final_response = documents
+    if not isinstance(binding_document, dict) or not isinstance(binding_document.get("binding"), dict):
+        raise BenchmarkError("atomic CLI output first document was not a binding result")
+    if not isinstance(final_response, dict) or isinstance(final_response.get("binding"), dict):
+        raise BenchmarkError("atomic CLI output second document was not the tool result")
+    binding = binding_document["binding"]
+    binding_context = binding.get("context_id")
+    if (
+        not isinstance(binding_context, str)
+        or binding_context.upper() != expected_context_id.upper()
+        or binding.get("window_id") != expected_window_id
+    ):
+        raise BenchmarkError("atomic CLI binding did not match the requested context/window")
+    return binding, final_response
+
+
 class CLIRunner:
-    def __init__(self, cli: Path, window_id: int, cwd: Path, artifact: Path | None = None) -> None:
+    def __init__(
+        self, cli: Path, window_id: int, context_id: str, cwd: Path, artifact: Path | None = None
+    ) -> None:
         self.cli = cli
         self.window_id = window_id
+        self.context_id = validate_uuid(context_id, "context-id")
         self.cwd = cwd
         self.artifact = artifact
         self.lock = threading.Lock()
@@ -677,8 +1171,11 @@ class CLIRunner:
         *,
         timeout: float = 300,
         check: bool = True,
+        context_id: str | None = None,
     ) -> Any:
-        return self.timed_call(label, tool, payload, timeout=timeout, check=check).response
+        return self.timed_call(
+            label, tool, payload, timeout=timeout, check=check, context_id=context_id
+        ).response
 
     def timed_call(
         self,
@@ -688,12 +1185,22 @@ class CLIRunner:
         *,
         timeout: float = 300,
         check: bool = True,
+        context_id: str | None = None,
     ) -> TimedCall:
         routed = dict(payload)
         routed.setdefault("_windowID", self.window_id)
+        payload_context = routed.get("context_id")
+        target_context = validate_uuid(
+            context_id or (payload_context if isinstance(payload_context, str) else self.context_id),
+            "context-id",
+        )
+        payload_json = json.dumps(routed, separators=(",", ":"), sort_keys=True)
+        command_text = (
+            f"bind_context op=bind context_id={target_context} && "
+            f"call {tool} {payload_json}"
+        )
         command = [
-            str(self.cli), "--raw-json", "-w", str(self.window_id), "-c", tool,
-            "-j", json.dumps(routed, separators=(",", ":"), sort_keys=True),
+            str(self.cli), "--raw-json", "-w", str(self.window_id), "-e", command_text,
         ]
         started_ns = time.monotonic_ns()
         process = subprocess.run(command, cwd=self.cwd, text=True, capture_output=True, timeout=timeout)
@@ -716,20 +1223,35 @@ class CLIRunner:
                 append_ndjson(self.artifact / "raw-cli-calls.ndjson", record)
         if check and process.returncode:
             raise BenchmarkError(f"{label} failed ({process.returncode}): {process.stderr.strip()}")
-        if not process.stdout.strip():
-            response: Any = {}
-        else:
-            try:
-                response = json.loads(process.stdout)
-            except json.JSONDecodeError as error:
-                if check:
-                    raise BenchmarkError(f"{label} returned non-JSON stdout") from error
-                response = {"unparsed_stdout": process.stdout, "returncode": process.returncode}
+        output_error: str | None = None
+        try:
+            binding, final_response = parse_atomic_cli_output(
+                process.stdout,
+                expected_context_id=target_context,
+                expected_window_id=self.window_id,
+            )
+        except BenchmarkError as error:
+            if check:
+                raise BenchmarkError(f"{label}: {error}") from error
+            binding, final_response = None, {}
+            output_error = str(error)
+        output_valid = output_error is None
+        response: Any = {
+            "_benchmark_response": final_response,
+            "_benchmark_binding": binding,
+            "_benchmark_requested_context_id": target_context,
+            "_benchmark_payload": routed,
+            "_benchmark_tool": tool,
+            "_benchmark_started_monotonic_ns": started_ns,
+            "_benchmark_finished_monotonic_ns": finished_ns,
+            "_benchmark_binding_valid": output_valid,
+            "_benchmark_output_valid": output_valid,
+        }
+        if output_error is not None:
+            response["_benchmark_output_error"] = output_error
         if not check and process.returncode:
-            response = {
-                "_benchmark_cli_returncode": process.returncode,
-                "_benchmark_response": response,
-            }
+            response["_benchmark_cli_returncode"] = process.returncode
+            response["_benchmark_stderr"] = process.stderr
         return TimedCall(response, started_ns, finished_ns, process.returncode)
 
     def describe(self, tool: str) -> str:
@@ -754,8 +1276,9 @@ def plan_command(args: argparse.Namespace) -> int:
     read_path = Path(args.read_path)
     if read_path.is_absolute() or ".." in read_path.parts:
         raise BenchmarkError("read-path must be root-relative and remain inside the root")
-    if not args.workspace_name.startswith(WORKSPACE_PREFIX):
-        raise BenchmarkError(f"workspace-name must start with {WORKSPACE_PREFIX!r}")
+    if not args.workspace_name.startswith(WORKSPACE_PREFIXES):
+        allowed = ", ".join(repr(prefix) for prefix in WORKSPACE_PREFIXES)
+        raise BenchmarkError(f"workspace-name must start with one of: {allowed}")
     if args.asserted_file_count < 100_000:
         raise BenchmarkError("asserted-file-count must be at least 100000 for the large-workspace lane")
     if args.retained_samples < 3:
@@ -764,6 +1287,11 @@ def plan_command(args: argparse.Namespace) -> int:
         raise BenchmarkError("warmups must be at least 1")
     if args.invocations_per_series < 1:
         raise BenchmarkError("invocations-per-series must be at least 1")
+    base_commit_oid = resolve_commit_oid(root, args.base_ref)
+    read_blob_sha256 = validate_tracked_read_fixture(
+        root, base_ref=base_commit_oid, read_path=str(read_path),
+        search_marker=args.search_marker, read_marker=args.read_marker,
+    )
     marker_path, marker, marker_sha256 = validate_ownership_marker(
         root,
         workspace_id=validate_uuid(args.workspace_id, "workspace-id"),
@@ -788,9 +1316,11 @@ def plan_command(args: argparse.Namespace) -> int:
             "label": args.dataset_label,
             "asserted_file_count": args.asserted_file_count,
             "base_ref": args.base_ref,
+            "base_commit_oid": base_commit_oid,
             "search_marker": args.search_marker,
             "read_path": str(read_path),
             "read_marker": args.read_marker,
+            "read_blob_sha256": read_blob_sha256,
             "code_file_type": args.code_file_type,
         },
         "matrix": {
@@ -880,6 +1410,62 @@ def self_test_command(_args: argparse.Namespace) -> int:
             root, workspace_id=workspace_id, root_id=root_id, owner_token=owner_token
         )
         checks["ownership_marker"] = len(marker_digest) == 64
+        run_local(["git", "init", "-q"], root)
+        tracked_fixture = root / "tracked-marker.swift"
+        tracked_fixture.write_text(
+            "// RPCE_TRACKED_SEARCH\nlet RPCE_TRACKED_READ = true\n", encoding="utf-8"
+        )
+        bad_fixture = root / "tracked-bad.swift"
+        bad_fixture.write_text("// RPCE_TRACKED_SEARCH\n", encoding="utf-8")
+        run_local(["git", "add", tracked_fixture.name, bad_fixture.name], root)
+        run_local([
+            "git", "-c", "user.name=RPCE Harness", "-c", "user.email=harness@example.invalid",
+            "commit", "-q", "-m", "self-test fixture",
+        ], root)
+        planned_oid = resolve_commit_oid(root, "HEAD")
+        oid_plan = {"dataset": {"base_ref": "HEAD", "base_commit_oid": planned_oid}}
+        checks["immutable_base_oid_resolved"] = (
+            validate_planned_base_commit(oid_plan, root) == planned_oid
+        )
+        tracked_digest = validate_tracked_read_fixture(
+            root, base_ref="HEAD", read_path=tracked_fixture.name,
+            search_marker="RPCE_TRACKED_SEARCH", read_marker="RPCE_TRACKED_READ",
+        )
+        tracked_fixture.write_text("working tree content is intentionally irrelevant\n", encoding="utf-8")
+        checks["tracked_fixture_exact_base_ref"] = tracked_digest == validate_tracked_read_fixture(
+            root, base_ref="HEAD", read_path=tracked_fixture.name,
+            search_marker="RPCE_TRACKED_SEARCH", read_marker="RPCE_TRACKED_READ",
+        )
+        (root / "untracked-marker.swift").write_text(
+            "// RPCE_TRACKED_SEARCH\nlet RPCE_TRACKED_READ = true\n", encoding="utf-8"
+        )
+        try:
+            validate_tracked_read_fixture(
+                root, base_ref="HEAD", read_path="untracked-marker.swift",
+                search_marker="RPCE_TRACKED_SEARCH", read_marker="RPCE_TRACKED_READ",
+            )
+            checks["untracked_fixture_rejected"] = False
+        except BenchmarkError:
+            checks["untracked_fixture_rejected"] = True
+        try:
+            validate_tracked_read_fixture(
+                root, base_ref="HEAD", read_path=bad_fixture.name,
+                search_marker="RPCE_TRACKED_SEARCH", read_marker="RPCE_TRACKED_READ",
+            )
+            checks["tracked_fixture_missing_marker_rejected"] = False
+        except BenchmarkError:
+            checks["tracked_fixture_missing_marker_rejected"] = True
+        (root / "drift.txt").write_text("drift\n", encoding="utf-8")
+        run_local(["git", "add", "drift.txt"], root)
+        run_local([
+            "git", "-c", "user.name=RPCE Harness", "-c", "user.email=harness@example.invalid",
+            "commit", "-q", "-m", "move symbolic ref",
+        ], root)
+        try:
+            validate_planned_base_commit(oid_plan, root)
+            checks["moving_symbolic_base_rejected"] = False
+        except BenchmarkError:
+            checks["moving_symbolic_base_rejected"] = True
 
     correlation = str(uuid.uuid4()).upper()
     session = str(uuid.uuid4()).upper()
@@ -915,30 +1501,306 @@ def self_test_command(_args: argparse.Namespace) -> int:
             "filter": {"paths": [str(fixture_file)]},
         })),
         "</tool_call>",
-        '<tool_result name="mcp__file_search" status="ok">',
-        html.escape(json.dumps(search_record)), "</tool_result>",
+        '<tool_result name="mcp__file_search"/>',
         '<tool_call name="mcp__read_file">',
         html.escape(json.dumps({"path": str(fixture_file)})), "</tool_call>",
-        '<tool_result name="mcp__read_file" status="ok">',
-        html.escape(json.dumps(read_record)), "</tool_result>",
+        '<tool_result name="mcp__read_file"/>',
         "<assistant>RPCE_INHERITED_CHILD_OK</assistant>",
     ))
     transcript_evidence = verify_agent_file_tool_transcript(
         transcript, expected_output="RPCE_INHERITED_CHILD_OK", expected_marker=marker,
-        expected_file_path=str(fixture_file), expected_root_id=fixture_root_id,
-        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file),
     )
-    checks["nested_structured_tool_records"] = transcript_evidence["call_count"] == 2
+    checks["nested_spartan_tool_events"] = (
+        transcript_evidence["call_count"] == 2
+        and transcript_evidence["reported_result_status_count"] == 0
+    )
+    parent_transcript = "".join([
+        "".join((
+            '<tool_call name="mcp__file_search">',
+            html.escape(json.dumps({
+                "pattern": marker, "regex": False,
+                "filter": {"paths": [str(fixture_file)]},
+            })),
+            "</tool_call>",
+            '<tool_result name="mcp__file_search"/>',
+            '<tool_call name="mcp__read_file">',
+            html.escape(json.dumps({"path": str(fixture_file)})), "</tool_call>",
+            '<tool_result name="mcp__read_file"/>',
+        ))
+        for _ in range(10)
+    ]) + "<assistant>RPCE_ACTIVE_PARENT_OK</assistant>"
+    parent_transcript_evidence = verify_agent_file_tool_transcript(
+        parent_transcript, expected_output="RPCE_ACTIVE_PARENT_OK", expected_marker=marker,
+        expected_file_path=str(fixture_file), expected_pairs=10,
+    )
+    checks["parent_exact_twenty_alternating_calls"] = (
+        parent_transcript_evidence["call_count"] == 20
+        and parent_transcript_evidence["search_call_count"] == 10
+        and parent_transcript_evidence["read_call_count"] == 10
+    )
+    try:
+        verify_agent_file_tool_transcript(
+            parent_transcript.replace(
+                "<assistant>", '<tool_call name="Bash">{}</tool_call><assistant>', 1
+            ),
+            expected_output="RPCE_ACTIVE_PARENT_OK", expected_marker=marker,
+            expected_file_path=str(fixture_file), expected_pairs=10,
+        )
+        checks["parent_substitute_tool_rejected"] = False
+    except BenchmarkError:
+        checks["parent_substitute_tool_rejected"] = True
+    try:
+        parse_agent_transcript_records(
+            '<tool_call tool="Bash">{}</tool_call><assistant>RPCE_ACTIVE_PARENT_OK</assistant>'
+        )
+        checks["malformed_tool_event_rejected"] = False
+    except BenchmarkError:
+        checks["malformed_tool_event_rejected"] = True
+    try:
+        parse_agent_transcript_records(
+            '<shell_call name="Bash">{}</shell_call><assistant>RPCE_ACTIVE_PARENT_OK</assistant>'
+        )
+        checks["substitute_event_encoding_rejected"] = False
+    except BenchmarkError:
+        checks["substitute_event_encoding_rejected"] = True
     try:
         verify_agent_file_tool_transcript(
             "<assistant>file_search read_file RPCE_INHERITED_CHILD_OK</assistant>",
             expected_output="RPCE_INHERITED_CHILD_OK", expected_marker=marker,
-            expected_file_path=str(fixture_file), expected_root_id=fixture_root_id,
-            expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+            expected_file_path=str(fixture_file),
         )
         checks["nested_prompt_text_rejected"] = False
     except BenchmarkError:
         checks["nested_prompt_text_rejected"] = True
+
+    fixture_context = str(uuid.uuid4()).upper()
+    atomic_binding_document = {
+        "binding": {"context_id": fixture_context, "window_id": 1, "repo_paths": [str(fixture_root)]}
+    }
+    atomic_result_document = {"status": "ok"}
+    atomic_stdout = (
+        json.dumps(atomic_binding_document) + "\n\n---\n\n" + json.dumps(atomic_result_document)
+    )
+    parsed_binding, parsed_result = parse_atomic_cli_output(
+        atomic_stdout, expected_context_id=fixture_context, expected_window_id=1
+    )
+    checks["atomic_exact_two_documents"] = (
+        parsed_binding == atomic_binding_document["binding"]
+        and parsed_result == atomic_result_document
+    )
+    for name, stdout in {
+        "atomic_extra_document_rejected": atomic_stdout + "\n\n---\n\n{}",
+        "atomic_reordered_documents_rejected": (
+            json.dumps(atomic_result_document) + "\n\n---\n\n" + json.dumps(atomic_binding_document)
+        ),
+        "atomic_missing_result_rejected": json.dumps(atomic_binding_document),
+    }.items():
+        try:
+            parse_atomic_cli_output(
+                stdout, expected_context_id=fixture_context, expected_window_id=1
+            )
+            checks[name] = False
+        except BenchmarkError:
+            checks[name] = True
+    parent_context_fixture = str(uuid.uuid4()).upper()
+    child_context_fixture = str(uuid.uuid4()).upper()
+    worktree_binding_fixture = {
+        "worktree_id": "wt_fixture", "worktree_root_path": str(fixture_root),
+    }
+    parent_start_fixture = {
+        "session": {"context_id": parent_context_fixture},
+        "worktree_bindings": [worktree_binding_fixture],
+    }
+    child_start_fixture = {
+        "session": {"context_id": child_context_fixture},
+        "worktree_bindings": [worktree_binding_fixture],
+    }
+    checks["child_distinct_context_exact_binding_set"] = child_inheritance_evidence(
+        parent_start_fixture, child_start_fixture,
+        parent_context_id=parent_context_fixture, parent_worktree_path=str(fixture_root),
+    )["ok"]
+    same_context_child = json.loads(json.dumps(child_start_fixture))
+    same_context_child["session"]["context_id"] = parent_context_fixture
+    checks["child_same_context_rejected"] = not child_inheritance_evidence(
+        parent_start_fixture, same_context_child,
+        parent_context_id=parent_context_fixture, parent_worktree_path=str(fixture_root),
+    )["ok"]
+    different_binding_child = json.loads(json.dumps(child_start_fixture))
+    different_binding_child["worktree_bindings"][0]["worktree_id"] = "wt_other"
+    checks["child_binding_id_mismatch_rejected"] = not child_inheritance_evidence(
+        parent_start_fixture, different_binding_child,
+        parent_context_id=parent_context_fixture, parent_worktree_path=str(fixture_root),
+    )["ok"]
+
+    def routed_response(
+        response: dict[str, Any],
+        *,
+        roots: list[str] | None = None,
+        payload: dict[str, Any] | None = None,
+        returncode: int | None = None,
+        stderr: str | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "_benchmark_response": response,
+            "_benchmark_binding": {
+                "context_id": fixture_context, "window_id": 1,
+                "repo_paths": roots if roots is not None else [str(fixture_root)],
+            },
+            "_benchmark_requested_context_id": fixture_context,
+            "_benchmark_binding_valid": True,
+            "_benchmark_output_valid": True,
+            "_benchmark_payload": payload or {},
+        }
+        if returncode is not None:
+            result["_benchmark_cli_returncode"] = returncode
+        if stderr is not None:
+            result["_benchmark_stderr"] = stderr
+        return result
+
+    workspace_fixture_id = str(uuid.uuid4()).upper()
+    workspace_wrapper = routed_response({
+        "workspaces": [{
+            "id": workspace_fixture_id, "name": "planned-workspace",
+            "repo_paths": [str(fixture_root)],
+        }],
+    })
+    workspace_wrapper["_benchmark_binding"]["workspace_id"] = workspace_fixture_id
+    checks["workspace_inventory_ignores_atomic_binding"] = (
+        workspace_inventory_record(workspace_wrapper, workspace_fixture_id).get("name")
+        == "planned-workspace"
+    )
+    scope_wrapper = routed_response({
+        "scope": {
+            "window_id": 1, "workspace_id": workspace_fixture_id,
+            "context_id": fixture_context, "root_id": fixture_root_id,
+        },
+    })
+    scope_wrapper["_benchmark_binding"]["root_id"] = str(uuid.uuid4()).upper()
+    checks["scope_ignores_atomic_binding"] = (
+        scope_response_record(scope_wrapper).get("root_id") == fixture_root_id
+    )
+
+    actual_search = routed_response({
+        "total_matches": 1, "total_files": 1, "matched_files": 1,
+        "searched_files": 1, "content_matches": 1, "path_matches": 0,
+        "limit_hit": False, "content_match_groups": [{
+            "path": f"{fixture_root.name}/{fixture_file.name}",
+            "lines": [{"line_number": 1, "line_text": marker}],
+        }],
+    }, payload={
+        "pattern": marker, "regex": False,
+        "filter": {"paths": [str(fixture_file)]},
+    })
+    actual_read = routed_response({
+        "content": marker, "display_path": f"{fixture_root.name}/{fixture_file.name}",
+        "first_line": 1, "last_line": 1, "total_lines": 1,
+    }, payload={"path": str(fixture_file)})
+    actual_selection = routed_response({
+        "status": "ok", "total_tokens": 1, "files": [{
+            "path": f"{fixture_root.name}/{fixture_file.name}",
+            "root_path": str(fixture_root), "path_within_root": fixture_file.name,
+            "tokens": 1, "render_mode": "full",
+        }],
+    })
+    actual_structure = routed_response({
+        "status": "success", "files": [{
+            "path": f"{fixture_root.name}/{fixture_file.name}",
+            "content": marker, "role": "seed", "tokens": 1,
+        }],
+        "summary": {"requested_seeds": 1, "resolved_seeds": 1, "returned_files": 1},
+        "issues": [],
+    }, payload={"scope": "paths", "paths": [str(fixture_file)]})
+    tree_fixture_text = (
+        f"{fixture_root.name}\n"
+        f"└── {fixture_file.name} +\n\n{CODEMAP_TREE_LEGEND}"
+    )
+    actual_tree = routed_response({
+        "tree": tree_fixture_text, "text": tree_fixture_text,
+        "uses_legend": True, "was_truncated": False,
+    }, payload={"type": "files", "mode": "full", "path": ".", "max_depth": 1})
+    checks["tree_exact_context_parent_full_path"] = codemap_tree_marker_evidence(
+        actual_tree, expected_context_id=fixture_context,
+        expected_root_path=str(fixture_root), requested_parent=".",
+        expected_file_path=fixture_file.name,
+    )["marker_present"]
+    wrong_parent_tree = json.loads(json.dumps(actual_tree))
+    wrong_parent_tree["_benchmark_payload"]["path"] = "other-parent"
+    try:
+        codemap_tree_marker_evidence(
+            wrong_parent_tree, expected_context_id=fixture_context,
+            expected_root_path=str(fixture_root), requested_parent=".",
+            expected_file_path=fixture_file.name,
+        )
+        checks["tree_same_basename_wrong_parent_rejected"] = False
+    except BenchmarkError:
+        checks["tree_same_basename_wrong_parent_rejected"] = True
+    checks["actual_file_search_shape"] = structured_success_evidence(
+        actual_search, "file_search", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="file", expected_content=marker,
+    )["ok"]
+    checks["actual_read_file_shape"] = structured_success_evidence(
+        actual_read, "read_file", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="file", expected_content=marker,
+    )["ok"]
+    checks["actual_selection_shape"] = structured_success_evidence(
+        actual_selection, "manage_selection", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="file",
+    )["ok"]
+    checks["actual_code_structure_shape"] = structured_success_evidence(
+        actual_structure, "get_code_structure", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="swift", expected_content=marker,
+    )["ok"]
+    selected_structure = dict(actual_structure)
+    selected_structure["_benchmark_payload"] = {"scope": "selected"}
+    checks["actual_selected_code_structure_shape"] = structured_success_evidence(
+        selected_structure, "get_code_structure", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="swift", expected_content=marker,
+    )["ok"]
+    wrong_binding = dict(actual_search)
+    wrong_binding["_benchmark_binding"] = dict(
+        actual_search["_benchmark_binding"], repo_paths=["/tmp/another-root"]
+    )
+    checks["actual_cross_root_binding_rejected"] = not structured_success_evidence(
+        wrong_binding, "file_search", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="file", expected_content=marker,
+    )["ok"]
+    duplicate_name_root = Path("/var/tmp") / fixture_root.name
+    ambiguous_search = json.loads(json.dumps(actual_search))
+    ambiguous_search["_benchmark_binding"]["repo_paths"] = [
+        str(fixture_root), str(duplicate_name_root),
+    ]
+    checks["ambiguous_same_basename_result_rejected"] = not structured_success_evidence(
+        ambiguous_search, "file_search", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="file", expected_content=marker,
+    )["ok"]
+    unattributed_search = json.loads(json.dumps(actual_search))
+    unattributed_search["_benchmark_binding"]["repo_paths"] = [
+        str(fixture_root), "/var/tmp/another-root",
+    ]
+    unattributed_search["_benchmark_response"]["content_match_groups"][0]["path"] = fixture_file.name
+    checks["unattributed_relative_result_rejected"] = not structured_success_evidence(
+        unattributed_search, "file_search", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="file", expected_content=marker,
+    )["ok"]
+    actual_empty = routed_response({
+        "total_matches": 0, "total_files": 0, "matched_files": 0,
+        "searched_files": 1, "content_matches": 0, "path_matches": 0,
+        "limit_hit": False, "content_match_groups": [],
+    }, payload={"pattern": "OTHER_ROOT_MARKER", "regex": False,
+                "filter": {"paths": [str(fixture_root)]}})
+    checks["actual_empty_cross_root_shape"] = structured_empty_success_evidence(
+        actual_empty, "file_search", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+    )["ok"]
 
     exact_selection = require_structured_success(
         tool_record("manage_selection"), "manage_selection",
@@ -983,6 +1845,111 @@ def self_test_command(_args: argparse.Namespace) -> int:
         {"_benchmark_cli_returncode": 1, "_benchmark_response": removed_search},
         "file_search", expected_root_id=fixture_root_id,
         expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+    )["ok"]
+    removed_search_actual = routed_response({
+        "total_matches": 0, "total_files": 0, "matched_files": 0,
+        "searched_files": 0, "content_matches": 0, "path_matches": 0,
+        "limit_hit": False, "content_match_groups": [],
+    }, roots=[], payload={
+        "pattern": marker, "regex": False, "filter": {"paths": [str(fixture_file)]},
+    })
+    checks["actual_removed_search_shape"] = structured_removed_evidence(
+        removed_search_actual, "file_search", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), require_absent_bound_root=True,
+    )["ok"]
+    removed_structure_actual = routed_response({
+        "status": "unavailable", "files": [],
+        "issues": [{"code": "path_not_found", "phase": "seed_resolution"}],
+        "summary": {"requested_seeds": 0, "resolved_seeds": 0, "returned_files": 0},
+    }, roots=[], payload={"scope": "paths", "paths": [str(fixture_file)]})
+    checks["actual_removed_structure_shape"] = structured_removed_evidence(
+        removed_structure_actual, "get_code_structure", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), require_absent_bound_root=True,
+    )["ok"]
+    removed_structure_bound = dict(removed_structure_actual)
+    removed_structure_bound["_benchmark_binding"] = dict(
+        removed_structure_actual["_benchmark_binding"], repo_paths=[str(fixture_root)]
+    )
+    checks["removed_structure_bound_root_rejected"] = not structured_removed_evidence(
+        removed_structure_bound, "get_code_structure", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), require_absent_bound_root=True,
+    )["ok"]
+    linked_active_fixture = {"ok": True, "status": "running"}
+    checks["linked_root_active_then_revoked_terminal"] = linked_root_removal_evidence(
+        linked_active_fixture, "cancelled", {"ok": True}
+    )["ok"]
+    checks["linked_root_early_completion_rejected"] = not linked_root_removal_evidence(
+        {"ok": False, "status": "completed"}, "completed", {"ok": True}
+    )["ok"]
+    checks["linked_root_cross_root_fallback_rejected"] = not linked_root_removal_evidence(
+        linked_active_fixture, "failed", {"ok": False, "reason": "fallback_files"}
+    )["ok"]
+    enriched_removed_structure = routed_response({
+        "tool": "get_code_structure", "status": "unavailable",
+        "root": fixture_root_record, "files": [],
+        "issue": {"code": "path_not_found"},
+    }, roots=[], payload={"scope": "paths", "paths": [str(fixture_file)]})
+    checks["enriched_removed_structure_absent_root"] = structured_removed_evidence(
+        enriched_removed_structure, "get_code_structure", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), require_absent_bound_root=True,
+    )["ok"]
+    enriched_removed_bound = json.loads(json.dumps(enriched_removed_structure))
+    enriched_removed_bound["_benchmark_binding"]["repo_paths"] = [str(fixture_root)]
+    checks["enriched_removed_structure_bound_root_rejected"] = not structured_removed_evidence(
+        enriched_removed_bound, "get_code_structure", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), require_absent_bound_root=True,
+    )["ok"]
+    for tool, status, issue_code, files_key, request_payload in (
+        (
+            "file_search", "removed", "root_removed", "matches",
+            {"pattern": marker, "regex": False, "filter": {"paths": [str(fixture_file)]}},
+        ),
+        (
+            "read_file", "not_found", "root_not_found", "files",
+            {"path": str(fixture_file)},
+        ),
+    ):
+        enriched_removed = routed_response({
+            "tool": tool, "status": status, "root": fixture_root_record,
+            files_key: [], "issue": {"code": issue_code},
+        }, roots=[], payload=request_payload)
+        checks[f"enriched_removed_{tool}_absent_root"] = structured_removed_evidence(
+            enriched_removed, tool, expected_root_id=fixture_root_id,
+            expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+            expected_file_path=str(fixture_file), require_absent_bound_root=True,
+        )["ok"]
+        enriched_removed["_benchmark_binding"]["repo_paths"] = [str(fixture_root)]
+        checks[f"enriched_removed_{tool}_bound_root_rejected"] = not structured_removed_evidence(
+            enriched_removed, tool, expected_root_id=fixture_root_id,
+            expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+            expected_file_path=str(fixture_file), require_absent_bound_root=True,
+        )["ok"]
+    removed_read_actual = routed_response(
+        {}, roots=[], payload={"path": str(fixture_file)}, returncode=1,
+        stderr=(
+            f"Cannot read {str(fixture_file)!r}. The requested path {str(fixture_file)!r} "
+            "is not inside any loaded folder in this window."
+        ),
+    )
+    checks["actual_removed_read_shape"] = structured_removed_evidence(
+        removed_read_actual, "read_file", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), require_absent_bound_root=True,
+    )["ok"]
+    non_git_structure_actual = routed_response({
+        "status": "unavailable", "files": [],
+        "issues": [{"code": "git_root_unavailable", "phase": "seed_demand"}],
+        "summary": {"requested_seeds": 1, "resolved_seeds": 0, "returned_files": 0},
+    }, payload={"scope": "paths", "paths": [str(fixture_file)]})
+    checks["actual_non_git_structure_shape"] = structured_removed_evidence(
+        non_git_structure_actual, "get_code_structure", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file),
     )["ok"]
 
     def export_fixture(route: str) -> dict[str, Any]:
@@ -1100,6 +2067,107 @@ def self_test_command(_args: argparse.Namespace) -> int:
     checks["stats_required_positive_zero_rejected"] = stats_rejects(0, positive=True)
     checks["stats_finite_numeric_accepted"] = stats([0, 1.5])["p95"] == 1.5
 
+    baseline_fixture_sha = "f" * 64
+    baseline_artifact_id = "accepted-codemap-artifact"
+    baseline_cold, baseline_warm = 20, 40
+    baseline_exact_counts = {
+        "cold_individual_structure": baseline_cold,
+        "warm_individual_structure": baseline_warm,
+        "cold_directory_structure": baseline_cold,
+        "warm_directory_structure": baseline_warm,
+        "tree_marker_availability": 2 * (baseline_cold + baseline_warm),
+        "first_search": 2 * (baseline_cold // 2),
+        "first_read": 2 * (baseline_cold // 2),
+        "root_readiness": 2 * (baseline_cold // 2),
+    }
+    baseline_fixture = {
+        "schema_version": SCHEMA_VERSION, "kind": "codemap-gate",
+        "artifact_id": baseline_artifact_id, "decision": "pass", "status": "completed",
+        "fixture_sha256": baseline_fixture_sha, "cleanup_complete": True,
+        "configuration": {
+            "cold_samples_per_cohort": baseline_cold,
+            "warm_samples_per_cohort": baseline_warm,
+            "wait_contract_ms": CODEMAP_GATE_WAIT_MILLISECONDS,
+            "harness_allowance_ms": CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS,
+        },
+        "sample_counts": {"attempted": 120, "valid": 120, "invalid": 0},
+        "gates": {name: True for name in CODEMAP_REQUIRED_GATES},
+        "metrics": {
+            name: {"count": baseline_exact_counts.get(name, 1), "p50": 1.0, "p95": 2.0}
+            for name in CODEMAP_REQUIRED_METRICS
+        },
+        "privacy": {
+            "ok": True, "scanned_file_count": 1, "failure_codes": [],
+            "allowlisted_root_sha256": ["a" * 64],
+            "allowlisted_prompt_sha256": ["b" * 64],
+        },
+    }
+    with tempfile.TemporaryDirectory(prefix="rpce-codemap-baseline-self-test-") as raw:
+        baseline_path = Path(raw) / "summary.json"
+        ledger_path = Path(raw) / "ledger.json"
+        save_json(baseline_path, baseline_fixture)
+        baseline_digest = sha256_bytes(baseline_path.read_bytes())
+        ledger_fixture = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": CODEMAP_BASELINE_LEDGER_KIND,
+            "accepted_summaries": [{
+                "artifact_id": baseline_artifact_id,
+                "summary_sha256": baseline_digest,
+                "fixture_sha256": baseline_fixture_sha,
+            }],
+        }
+        save_json(ledger_path, ledger_fixture)
+        accepted_ledger_digest = sha256_bytes(ledger_path.read_bytes())
+        accepted_baseline, acceptance = validate_codemap_baseline(
+            baseline_path, ledger_path, expected_ledger_sha256=accepted_ledger_digest,
+            fixture_sha256=baseline_fixture_sha,
+            cold_samples=baseline_cold, warm_samples=baseline_warm,
+        )
+        checks["baseline_exact_inventory_and_ledger_accepted"] = (
+            accepted_baseline["artifact_id"] == baseline_artifact_id
+            and acceptance["summary_sha256"] == baseline_digest
+            and len(acceptance["ledger_sha256"]) == 64
+        )
+        nonfinite_path = Path(raw) / "nonfinite.json"
+        nonfinite = json.loads(json.dumps(baseline_fixture))
+        nonfinite["metrics"]["queue_wait"]["p95"] = float("inf")
+        secure_write(nonfinite_path, json.dumps(nonfinite).encode())
+        try:
+            validate_codemap_baseline(
+                nonfinite_path, ledger_path, fixture_sha256=baseline_fixture_sha,
+                expected_ledger_sha256=accepted_ledger_digest,
+                cold_samples=baseline_cold, warm_samples=baseline_warm,
+            )
+            checks["baseline_infinity_rejected"] = False
+        except BenchmarkError:
+            checks["baseline_infinity_rejected"] = True
+        missing_metric_path = Path(raw) / "missing-metric.json"
+        missing_metric = json.loads(json.dumps(baseline_fixture))
+        del missing_metric["metrics"]["queue_wait"]
+        save_json(missing_metric_path, missing_metric)
+        try:
+            validate_codemap_baseline(
+                missing_metric_path, ledger_path, fixture_sha256=baseline_fixture_sha,
+                expected_ledger_sha256=accepted_ledger_digest,
+                cold_samples=baseline_cold, warm_samples=baseline_warm,
+            )
+            checks["baseline_missing_inventory_rejected"] = False
+        except BenchmarkError:
+            checks["baseline_missing_inventory_rejected"] = True
+        wrong_ledger_path = Path(raw) / "wrong-ledger.json"
+        wrong_ledger = json.loads(json.dumps(ledger_fixture))
+        wrong_ledger["accepted_summaries"][0]["summary_sha256"] = "0" * 64
+        save_json(wrong_ledger_path, wrong_ledger)
+        try:
+            validate_codemap_baseline(
+                baseline_path, wrong_ledger_path, fixture_sha256=baseline_fixture_sha,
+                expected_ledger_sha256=accepted_ledger_digest,
+                cold_samples=baseline_cold, warm_samples=baseline_warm,
+            )
+            checks["synthetic_passing_baseline_without_acceptance_rejected"] = False
+        except BenchmarkError:
+            checks["synthetic_passing_baseline_without_acceptance_rejected"] = True
+
     seen: set[Any] = set()
     register_unique(("warm", "projected", 1), seen, "cohort invocation")
     try:
@@ -1189,6 +2257,154 @@ def self_test_command(_args: argparse.Namespace) -> int:
     checks["memory_zero_rejected"] = absolute_memory_regression([0.0], [10.0]) is None
     checks["memory_negative_rejected"] = absolute_memory_regression([-1.0], [10.0]) is None
 
+    cleanup_artifact_name = "20260625T171028Z-warm-baseline-w1-73bd1572"
+    cleanup_branch = safe_name(f"rpce-bench-{cleanup_artifact_name}-i1-o1")[:120]
+    cleanup_commit_oid = "a" * 40
+    cleanup_session_id = str(uuid.uuid4()).upper()
+    cleanup_context_id = str(uuid.uuid4()).upper()
+    cleanup_worktree_id = "wt-owned"
+    cleanup_worktree_path = str((fixture_root / "owned-worktree").resolve(strict=False))
+    cleanup_live_worktrees = {
+        (cleanup_worktree_id, cleanup_worktree_path, cleanup_branch, cleanup_commit_oid),
+    }
+    cleanup_snapshot = {
+        "session_id": cleanup_session_id, "status": "running",
+        "session": {"context_id": cleanup_context_id},
+        "worktree_bindings": [{
+            "worktree_id": cleanup_worktree_id,
+            "worktree_root_path": cleanup_worktree_path,
+            "branch": cleanup_branch, "head": cleanup_commit_oid,
+        }],
+    }
+    cleanup_session_proof = cleanup_session_ownership_evidence(
+        cleanup_snapshot, expected_session_id=cleanup_session_id,
+        expected_context_id=cleanup_context_id, live_worktrees=cleanup_live_worktrees,
+        artifact_name=cleanup_artifact_name, plan_commit_oid=cleanup_commit_oid,
+    )
+    checks["cleanup_live_session_relationship_proven"] = cleanup_session_proof["ok"]
+    checks["cleanup_direct_poll_has_no_inventory_cap_dependency"] = (
+        cleanup_session_proof["ok"] and cleanup_session_proof["session_id"] == cleanup_session_id
+    )
+    checks["cleanup_tampered_session_rejected"] = not cleanup_session_ownership_evidence(
+        cleanup_snapshot, expected_session_id=str(uuid.uuid4()).upper(),
+        expected_context_id=cleanup_context_id, live_worktrees=cleanup_live_worktrees,
+        artifact_name=cleanup_artifact_name, plan_commit_oid=cleanup_commit_oid,
+    )["ok"]
+    wrong_branch_snapshot = json.loads(json.dumps(cleanup_snapshot))
+    wrong_branch_snapshot["worktree_bindings"][0]["branch"] = "unrelated-branch"
+    checks["cleanup_wrong_branch_rejected"] = not cleanup_session_ownership_evidence(
+        wrong_branch_snapshot, expected_session_id=cleanup_session_id,
+        expected_context_id=cleanup_context_id, live_worktrees=cleanup_live_worktrees,
+        artifact_name=cleanup_artifact_name, plan_commit_oid=cleanup_commit_oid,
+    )["ok"]
+    wrong_context_snapshot = json.loads(json.dumps(cleanup_snapshot))
+    wrong_context_snapshot["session"]["context_id"] = str(uuid.uuid4()).upper()
+    checks["cleanup_wrong_context_rejected"] = not cleanup_session_ownership_evidence(
+        wrong_context_snapshot, expected_session_id=cleanup_session_id,
+        expected_context_id=cleanup_context_id, live_worktrees=cleanup_live_worktrees,
+        artifact_name=cleanup_artifact_name, plan_commit_oid=cleanup_commit_oid,
+    )["ok"]
+    cleanup_state_worktree = {"path": cleanup_worktree_path, "branch": cleanup_branch}
+    checks["cleanup_live_worktree_relationship_proven"] = cleanup_worktree_ownership_evidence(
+        cleanup_state_worktree, live_worktrees=cleanup_live_worktrees,
+        proven_sessions=[cleanup_session_proof], artifact_name=cleanup_artifact_name,
+        plan_commit_oid=cleanup_commit_oid,
+    )["ok"]
+    checks["cleanup_worktree_requires_session_relationship"] = not cleanup_worktree_ownership_evidence(
+        cleanup_state_worktree, live_worktrees=cleanup_live_worktrees,
+        proven_sessions=[], artifact_name=cleanup_artifact_name,
+        plan_commit_oid=cleanup_commit_oid,
+    )["ok"]
+    checks["cleanup_wrong_plan_commit_rejected"] = not cleanup_worktree_ownership_evidence(
+        cleanup_state_worktree, live_worktrees=cleanup_live_worktrees,
+        proven_sessions=[cleanup_session_proof], artifact_name=cleanup_artifact_name,
+        plan_commit_oid="b" * 40,
+    )["ok"]
+
+    class MemoryRunnerFixture:
+        def __init__(self, responses: list[dict[str, Any]]) -> None:
+            self.responses = responses
+            self.payloads: list[dict[str, Any]] = []
+
+        def call(self, _label: str, _tool: str, payload: dict[str, Any], **_kwargs: Any) -> Any:
+            self.payloads.append(payload)
+            return self.responses.pop(0)
+
+    started_memory_id = str(uuid.uuid4()).upper()
+    start_memory_runner = MemoryRunnerFixture([{
+        "ok": True, "op": "large_workspace_memory", "action": "start",
+        "running": True, "session_id": started_memory_id,
+        "session": {"id": started_memory_id, "label": cleanup_artifact_name,
+                    "running": True},
+    }])
+    returned_memory_id, _ = start_owned_memory_sampler(
+        start_memory_runner, cleanup_artifact_name
+    )
+    checks["memory_start_returns_owner_without_reset_takeover"] = (
+        returned_memory_id == started_memory_id
+        and "reset" not in start_memory_runner.payloads[0]
+    )
+
+    foreign_memory_id = str(uuid.uuid4()).upper()
+    active_memory_runner = MemoryRunnerFixture([{
+        "ok": True, "op": "large_workspace_memory", "action": "current",
+        "running": True, "session_id": foreign_memory_id,
+        "session": {
+            "id": foreign_memory_id, "label": "foreign-owner",
+            "running": True,
+        },
+    }])
+    active_memory_action = verify_resumed_memory_sampler_inactive(
+        active_memory_runner, expected_session_id=str(uuid.uuid4()).upper(),
+        expected_label=cleanup_artifact_name,
+    )
+    checks["cleanup_active_global_memory_sampler_never_stopped"] = (
+        active_memory_action["ok"] is False
+        and active_memory_action["manual_cleanup"] is True
+        and active_memory_action["stop_attempted"] is False
+        and [payload["action"] for payload in active_memory_runner.payloads] == ["current"]
+    )
+    inactive_memory_runner = MemoryRunnerFixture([{
+        "ok": True, "op": "large_workspace_memory", "action": "current",
+        "running": False,
+    }])
+    inactive_memory_action = verify_resumed_memory_sampler_inactive(
+        inactive_memory_runner, expected_session_id=str(uuid.uuid4()).upper(),
+        expected_label=cleanup_artifact_name,
+    )
+    checks["cleanup_inactive_global_memory_sampler_verified"] = (
+        inactive_memory_action["ok"] is True
+        and inactive_memory_action["verified_stopped"] is True
+        and inactive_memory_action["stop_attempted"] is False
+        and [payload["action"] for payload in inactive_memory_runner.payloads] == ["current"]
+    )
+    owned_memory_id = str(uuid.uuid4()).upper()
+    owned_memory_runner = MemoryRunnerFixture([
+        {
+            "ok": True, "op": "large_workspace_memory", "action": "current",
+            "running": True, "session_id": owned_memory_id,
+            "session": {"id": owned_memory_id, "label": cleanup_artifact_name,
+                        "running": True},
+        },
+        {
+            "ok": True, "op": "large_workspace_memory", "action": "stop",
+            "running": False, "session_id": owned_memory_id,
+            "session": {"id": owned_memory_id, "label": cleanup_artifact_name,
+                        "running": False},
+        },
+    ])
+    owned_memory_action = verify_resumed_memory_sampler_inactive(
+        owned_memory_runner, expected_session_id=owned_memory_id,
+        expected_label=cleanup_artifact_name,
+    )
+    checks["cleanup_stops_only_matching_memory_owner"] = (
+        owned_memory_action["ok"] is True
+        and owned_memory_action["ownership_proven"] is True
+        and [payload["action"] for payload in owned_memory_runner.payloads]
+        == ["current", "stop"]
+        and owned_memory_runner.payloads[-1]["session_id"] == owned_memory_id
+    )
+
     run_cleanup = [
         {"action": "terminalize_agent", "terminal": True},
         {"action": "remove_worktree", "removed": True},
@@ -1214,6 +2430,11 @@ def self_test_command(_args: argparse.Namespace) -> int:
     return 0
 
 
+def scope_response_record(value: Any) -> dict[str, Any]:
+    benchmark_binding(value)
+    return find_object(benchmark_final_response(value), "root_id")
+
+
 def verify_scope(runner: CLIRunner, plan: dict[str, Any]) -> dict[str, Any]:
     scope = plan["scope"]
     payload = {
@@ -1226,7 +2447,7 @@ def verify_scope(runner: CLIRunner, plan: dict[str, Any]) -> dict[str, Any]:
         "expected_root_path": scope["root_path"],
     }
     response = runner.call("scope", DEBUG_TOOL, payload)
-    actual = find_object(response, "root_id")
+    actual = scope_response_record(response)
     expected = {
         "window_id": scope["window_id"],
         "workspace_id": scope["workspace_id"],
@@ -1241,7 +2462,8 @@ def verify_scope(runner: CLIRunner, plan: dict[str, Any]) -> dict[str, Any]:
 
 def workspace_inventory_record(value: Any, workspace_id: str) -> dict[str, Any]:
     matches: list[dict[str, Any]] = []
-    for candidate in walk_json(value):
+    benchmark_binding(value)
+    for candidate in walk_json(benchmark_final_response(value)):
         if not isinstance(candidate, dict):
             continue
         candidate_id = candidate.get("id") or candidate.get("workspace_id")
@@ -1296,7 +2518,13 @@ def require_benchmark_gate(runner: CLIRunner) -> None:
     )
     enabled: bool | None = None
     for candidate in walk_json(response):
-        if isinstance(candidate, dict) and candidate.get("key") == BENCHMARK_GATE_KEY:
+        if not isinstance(candidate, dict):
+            continue
+        values = candidate.get("values")
+        if isinstance(values, dict) and isinstance(values.get(BENCHMARK_GATE_KEY), bool):
+            enabled = values[BENCHMARK_GATE_KEY]
+            break
+        if candidate.get("key") == BENCHMARK_GATE_KEY:
             value = candidate.get("value")
             if isinstance(value, bool):
                 enabled = value
@@ -1314,8 +2542,19 @@ def preflight_command(args: argparse.Namespace) -> int:
     plan = load_plan(plan_path)
     cli = resolve_cli(args.cli)
     root = Path(plan["scope"]["root_path"])
+    dataset = plan["dataset"]
+    base_commit_oid = validate_planned_base_commit(plan, root)
+    read_blob_sha256 = validate_tracked_read_fixture(
+        root, base_ref=base_commit_oid, read_path=dataset["read_path"],
+        search_marker=dataset["search_marker"], read_marker=dataset["read_marker"],
+    )
+    planned_blob_sha256 = dataset.get("read_blob_sha256")
+    if planned_blob_sha256 is not None and planned_blob_sha256 != read_blob_sha256:
+        raise BenchmarkError("tracked read-path blob changed since plan creation")
     artifact = make_artifact(Path(args.output_root), "preflight")
-    runner = CLIRunner(cli, plan["scope"]["window_id"], root, artifact)
+    runner = CLIRunner(
+        cli, plan["scope"]["window_id"], plan["scope"]["context_id"], root, artifact
+    )
     schemas: dict[str, str] = {}
     for tool in (
         "bind_context", "manage_workspaces", "agent_run", "agent_manage", "manage_worktree",
@@ -1339,6 +2578,8 @@ def preflight_command(args: argparse.Namespace) -> int:
         "cli": str(cli),
         "cli_sha256": sha256_bytes(cli.read_bytes()),
         "schema_sha256": schemas,
+        "base_commit_oid": base_commit_oid,
+        "read_blob_sha256": read_blob_sha256,
         "scope": verified,
         "disposable_target": target,
         "artifact_directory": str(artifact),
@@ -1383,7 +2624,7 @@ def arm_sample(
         diagnostic_payload(
             plan, "arm", control_id=control_id, scenario=scenario, invocation=invocation,
             ordinal=ordinal, warmup=warmup, expires_seconds=900,
-            worktree_base_ref=plan["dataset"]["base_ref"],
+            worktree_base_ref=plan["dataset"]["base_commit_oid"],
             worktree_branch=branch,
         ),
     )
@@ -1410,7 +2651,7 @@ def start_agent(
             "message": "Reply exactly RPCE_WORKTREE_STARTUP_READY and stop. Do not edit files or invoke tools.",
             "session_name": f"RPCE startup {route} {ordinal}",
             "worktree_create": True, "worktree_branch": branch,
-            "worktree_base_ref": plan["dataset"]["base_ref"],
+            "worktree_base_ref": plan["dataset"]["base_commit_oid"],
             "worktree_label": f"RPCE startup {label} {ordinal}",
             "context_id": plan["scope"]["context_id"],
             "_worktree_startup_benchmark_token": token,
@@ -1638,20 +2879,20 @@ def validate_export(
     return failures
 
 
-def terminalize(runner: CLIRunner, session_id: str) -> str:
+def terminalize(runner: CLIRunner, session_id: str, context_id: str | None = None) -> str:
     response = runner.call(
         f"wait-{session_id[:8]}", "agent_run", {"op": "wait", "session_id": session_id, "timeout": 120},
-        timeout=150, check=False,
+        timeout=150, check=False, context_id=context_id,
     )
     status = response_status(response)
     if status not in TERMINAL_STATES:
         runner.call(
             f"cancel-{session_id[:8]}", "agent_run", {"op": "cancel", "session_id": session_id},
-            timeout=30, check=False,
+            timeout=30, check=False, context_id=context_id,
         )
         response = runner.call(
             f"settle-{session_id[:8]}", "agent_run", {"op": "wait", "session_id": session_id, "timeout": 30},
-            timeout=45, check=False,
+            timeout=45, check=False, context_id=context_id,
         )
         status = response_status(response)
     return status
@@ -1727,13 +2968,16 @@ def run_command(args: argparse.Namespace) -> int:
     plan = load_plan(plan_path)
     cli = resolve_cli(args.cli)
     root = Path(plan["scope"]["root_path"])
+    validate_planned_base_commit(plan, root)
     artifact = make_artifact(Path(args.output_root), f"{args.process_state}-{args.route}-w{args.width}")
-    runner = CLIRunner(cli, plan["scope"]["window_id"], root, artifact)
+    runner = CLIRunner(
+        cli, plan["scope"]["window_id"], plan["scope"]["context_id"], root, artifact
+    )
     save_json(artifact / "plan.json", plan, exclusive=True)
     state: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION, "plan_sha256": plan["plan_sha256"], "sessions": [],
         "worktrees": [], "control_id": None, "scope_reset": False,
-        "benchmark_gate_expected_enabled": True,
+        "benchmark_gate_expected_enabled": True, "memory_session_id": None,
     }
     save_json(artifact / "state.json", state)
     verify_scope(runner, plan)
@@ -1748,10 +2992,9 @@ def run_command(args: argparse.Namespace) -> int:
     state["control_id"] = control_id
     state["control_response"] = control_response
     save_json(artifact / "state.json", state)
-    runner.call(
-        "memory-start", DEBUG_TOOL,
-        {"op": "large_workspace_memory", "action": "start", "label": artifact.name, "interval_ms": 100, "reset": True, "benchmark_gate": True},
-    )
+    memory_session_id, _ = start_owned_memory_sampler(runner, artifact.name)
+    state["memory_session_id"] = memory_session_id
+    save_json(artifact / "state.json", state)
     invocation = args.invocation
     sample_records: list[dict[str, Any]] = []
     operational_error: str | None = None
@@ -1824,13 +3067,11 @@ def run_command(args: argparse.Namespace) -> int:
     except BaseException as error:
         operational_error = repr(error)
     finally:
-        resources = runner.call(
-            "memory-stop", DEBUG_TOOL,
-            {"op": "large_workspace_memory", "action": "stop", "settle_seconds": 2},
-            timeout=60, check=False,
+        memory_stopped, resources = stop_owned_memory_sampler(
+            runner, memory_session_id, label="memory-stop",
         )
         save_json(artifact / "resources.json", resources, exclusive=True)
-        state["memory_stopped"] = call_succeeded(resources) and find_value(resources, "running") is False
+        state["memory_stopped"] = memory_stopped
         restore_response = runner.call(
             "restore-route", DEBUG_TOOL,
             diagnostic_payload(plan, "restore_flags", control_id=control_id), check=False,
@@ -1950,6 +3191,10 @@ def call_succeeded(value: Any) -> bool:
         value = value.response
     if find_value(value, "_benchmark_cli_returncode") not in (None, 0):
         return False
+    if find_value(value, "_benchmark_binding_valid") is False:
+        return False
+    if find_value(value, "_benchmark_output_valid") is False:
+        return False
     if find_value(value, "isError") is True:
         return False
     if find_value(value, "ok") is False:
@@ -1965,6 +3210,9 @@ def transcript_xml_from_log(value: Any) -> str:
 
 
 def parse_agent_transcript_records(transcript_xml: str) -> dict[str, Any]:
+    raw_tool_event_count = len(re.findall(r"<tool_(?:call|result)\b", transcript_xml))
+    if re.search(r"<(?:function|command|shell|exec)_(?:call|result)\b", transcript_xml):
+        raise BenchmarkError("transcript contained an unsupported substitute tool-event encoding")
     event_pattern = re.compile(
         r'<tool_call name="([^"]+)"(?:>(.*?)</tool_call>|/>)'
         r'|<tool_result name="([^"]+)"([^>]*?)(?:>(.*?)</tool_result>|/>)'
@@ -1993,21 +3241,26 @@ def parse_agent_transcript_records(transcript_xml: str) -> dict[str, Any]:
             attributes = match.group(4) or ""
             status_match = re.search(r'\bstatus="([^"]+)"', attributes)
             raw_result = match.group(5)
-            if raw_result is None or not raw_result.strip():
-                raise BenchmarkError(f"structured {tool} transcript result omitted JSON payload")
-            try:
-                result = json.loads(html.unescape(raw_result))
-            except json.JSONDecodeError as error:
-                raise BenchmarkError(f"invalid structured {tool} transcript result") from error
-            if not isinstance(result, dict):
-                raise BenchmarkError(f"structured {tool} transcript result must be an object")
+            result: dict[str, Any] | None = None
+            if raw_result is not None and raw_result.strip():
+                try:
+                    parsed_result = json.loads(html.unescape(raw_result))
+                except json.JSONDecodeError as error:
+                    raise BenchmarkError(f"invalid structured {tool} transcript result") from error
+                if not isinstance(parsed_result, dict):
+                    raise BenchmarkError(f"structured {tool} transcript result must be an object")
+                result = parsed_result
             results.append({
                 "ordinal": ordinal, "tool": tool,
-                "status": status_match.group(1) if status_match else result.get("status"),
+                "status": status_match.group(1) if status_match else (
+                    result.get("status") if result is not None else None
+                ),
                 "result": result,
             })
         else:
             assistants.append(html.unescape(match.group(6) or "").strip())
+    if len(calls) + len(results) != raw_tool_event_count:
+        raise BenchmarkError("transcript contained an unrecognized or malformed tool event")
     return {"calls": calls, "results": results, "assistants": assistants}
 
 
@@ -2017,59 +3270,54 @@ def verify_agent_file_tool_transcript(
     expected_output: str,
     expected_marker: str,
     expected_file_path: str,
-    expected_root_id: str,
-    expected_root_path: str,
-    expected_root_type: str,
+    expected_pairs: int = 1,
 ) -> dict[str, Any]:
     records = parse_agent_transcript_records(transcript_xml)
-    by_tool_calls = {
-        tool: [item for item in records["calls"] if item["tool"] == tool]
-        for tool in ("file_search", "read_file")
-    }
-    by_tool_results = {
-        tool: [item for item in records["results"] if item["tool"] == tool]
-        for tool in ("file_search", "read_file")
-    }
-    if any(len(by_tool_calls[tool]) != 1 or len(by_tool_results[tool]) != 1 for tool in by_tool_calls):
-        raise BenchmarkError("child transcript requires exactly one file_search/read_file call and result")
-    ordered = (
-        by_tool_calls["file_search"][0]["ordinal"],
-        by_tool_results["file_search"][0]["ordinal"],
-        by_tool_calls["read_file"][0]["ordinal"],
-        by_tool_results["read_file"][0]["ordinal"],
-    )
-    if ordered != tuple(sorted(ordered)) or any(
-        by_tool_results[tool][0].get("status") not in {"ok", "completed", "ready", "success"}
-        for tool in by_tool_results
-    ):
-        raise BenchmarkError("child transcript tool calls/results were unordered or unsuccessful")
-    search_args = by_tool_calls["file_search"][0]["arguments"]
-    read_args = by_tool_calls["read_file"][0]["arguments"]
-    search_paths = ((search_args.get("filter") or {}).get("paths"))
-    if (
-        search_args.get("pattern") != expected_marker
-        or search_args.get("regex") is not False
-        or search_paths != [expected_file_path]
-        or read_args.get("path") != expected_file_path
-    ):
-        raise BenchmarkError("child transcript file-tool arguments did not match the inherited-root request")
-    search_result = require_structured_success(
-        by_tool_results["file_search"][0]["result"], "file_search",
-        expected_root_id=expected_root_id, expected_root_path=expected_root_path,
-        expected_root_type=expected_root_type, expected_file_path=expected_file_path,
-        expected_file_type="file", expected_content=expected_marker,
-    )
-    read_result = require_structured_success(
-        by_tool_results["read_file"][0]["result"], "read_file",
-        expected_root_id=expected_root_id, expected_root_path=expected_root_path,
-        expected_root_type=expected_root_type, expected_file_path=expected_file_path,
-        expected_file_type="file", expected_content=expected_marker,
-    )
+    if expected_pairs < 1:
+        raise BenchmarkError("transcript expected pair count must be positive")
+    allowed_tools = {"file_search", "read_file"}
+    unexpected = sorted({
+        item["tool"] for item in records["calls"] + records["results"]
+        if item["tool"] not in allowed_tools
+    })
+    if unexpected:
+        raise BenchmarkError(f"transcript used forbidden/substitute tools: {unexpected}")
+    expected_tools = [tool for _ in range(expected_pairs) for tool in ("file_search", "read_file")]
+    if [item["tool"] for item in records["calls"]] != expected_tools:
+        raise BenchmarkError("transcript did not contain the exact alternating file-tool calls")
+    if [item["tool"] for item in records["results"]] != expected_tools:
+        raise BenchmarkError("transcript did not contain one result for every exact file-tool call")
+    statuses = {"ok", "complete", "completed", "ready", "success"}
+    previous_ordinal = 0
+    reported_statuses: list[str] = []
+    for call, result in zip(records["calls"], records["results"], strict=True):
+        if not (previous_ordinal < call["ordinal"] < result["ordinal"]):
+            raise BenchmarkError("transcript tool calls/results were unordered")
+        previous_ordinal = result["ordinal"]
+        reported_status = result.get("status")
+        if reported_status is not None:
+            if reported_status not in statuses:
+                raise BenchmarkError("transcript contained an explicitly unsuccessful tool result")
+            reported_statuses.append(reported_status)
+        arguments = call["arguments"]
+        if call["tool"] == "file_search":
+            search_paths = ((arguments.get("filter") or {}).get("paths"))
+            if (
+                arguments.get("pattern") != expected_marker
+                or arguments.get("regex") is not False
+                or search_paths != [expected_file_path]
+            ):
+                raise BenchmarkError("file_search transcript arguments did not match the exact request")
+        else:
+            if arguments.get("path") != expected_file_path:
+                raise BenchmarkError("read_file transcript arguments did not match the exact request")
     if not records["assistants"] or records["assistants"][-1] != expected_output:
-        raise BenchmarkError("child transcript final assistant output mismatch")
+        raise BenchmarkError("transcript final assistant output mismatch")
     return {
-        "call_count": 2, "result_count": 2,
-        "search_status": search_result["status"], "read_status": read_result["status"],
+        "call_count": expected_pairs * 2, "result_count": expected_pairs * 2,
+        "search_call_count": expected_pairs, "read_call_count": expected_pairs,
+        "reported_result_status_count": len(reported_statuses),
+        "proof_basis": "spartan ordered invocations and paired result events",
         "final_output": records["assistants"][-1],
     }
 
@@ -2081,7 +3329,8 @@ def poll_active_agent(
     label: str,
 ) -> dict[str, Any]:
     call = runner.timed_call(
-        label, "agent_run", {"op": "poll", "session_id": session_id}, check=False
+        label, "agent_run", {"op": "poll", "session_id": session_id},
+        check=False, context_id=expected_context_id,
     )
     response = call.response
     return {
@@ -2098,6 +3347,26 @@ def poll_active_agent(
     }
 
 
+def linked_root_removal_evidence(
+    active_before_remove: dict[str, Any],
+    terminal_status: str,
+    revoked_probe: dict[str, Any],
+) -> dict[str, Any]:
+    ok = (
+        active_before_remove.get("ok") is True
+        and active_before_remove.get("status") == "running"
+        and terminal_status in TERMINAL_STATES
+        and revoked_probe.get("ok") is True
+    )
+    return {
+        "ok": ok,
+        "active_before_remove": active_before_remove.get("ok") is True,
+        "terminal_status": terminal_status,
+        "typed_revocation": revoked_probe,
+        "no_cross_root_fallback": revoked_probe.get("ok") is True,
+    }
+
+
 def wait_agent_success(
     runner: CLIRunner,
     session_id: str,
@@ -2105,18 +3374,18 @@ def wait_agent_success(
     expected_output: str,
     expected_marker: str,
     expected_file_path: str,
-    expected_root_id: str,
-    expected_root_path: str,
-    expected_root_type: str,
+    context_id: str,
+    expected_pairs: int = 1,
 ) -> dict[str, Any]:
     waited = runner.call(
         f"wait-success-{session_id[:8]}", "agent_run",
         {"op": "wait", "session_id": session_id, "timeout": 180}, timeout=210, check=False,
+        context_id=context_id,
     )
     log = runner.call(
         f"log-success-{session_id[:8]}", "agent_manage",
         {"op": "get_log", "session_id": session_id, "offset": 0, "limit": 1000},
-        timeout=90, check=False,
+        timeout=90, check=False, context_id=context_id,
     )
     status = response_status(waited)
     transcript_evidence: dict[str, Any] | None = None
@@ -2125,8 +3394,7 @@ def wait_agent_success(
         transcript_evidence = verify_agent_file_tool_transcript(
             transcript_xml_from_log(log), expected_output=expected_output,
             expected_marker=expected_marker, expected_file_path=expected_file_path,
-            expected_root_id=expected_root_id, expected_root_path=expected_root_path,
-            expected_root_type=expected_root_type,
+            expected_pairs=expected_pairs,
         )
     except BenchmarkError as error:
         transcript_error = str(error)
@@ -2143,14 +3411,905 @@ def wait_agent_success(
     }
 
 
+def fixture_relative_path(root: Path, raw: Any, label: str, *, directory: bool) -> tuple[str, Path]:
+    if not isinstance(raw, str) or not raw.strip():
+        raise BenchmarkError(f"{label} must be a non-empty root-relative path")
+    relative = Path(raw)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise BenchmarkError(f"{label} must remain root-relative")
+    resolved = (root / relative).resolve(strict=True)
+    if root != resolved and root not in resolved.parents:
+        raise BenchmarkError(f"{label} escaped the planned root")
+    if directory != resolved.is_dir():
+        kind = "directory" if directory else "file"
+        raise BenchmarkError(f"{label} must resolve to a {kind}")
+    return relative.as_posix(), resolved
+
+
+def create_codemap_temp_ownership_marker(
+    root: Path,
+    *,
+    artifact_id: str,
+    plan_sha256: str,
+) -> dict[str, str]:
+    marker_path = root / CODEMAP_TEMP_OWNERSHIP_MARKER
+    owner_token = str(uuid.uuid4()).upper()
+    marker = {
+        "schema_version": SCHEMA_VERSION,
+        "purpose": "rpce-codemap-gate-temporary-root",
+        "root_path": str(root.resolve()),
+        "artifact_id": artifact_id,
+        "plan_sha256": plan_sha256,
+        "owner_token": owner_token,
+    }
+    secure_write(marker_path, canonical_json(marker), exclusive=True)
+    return {
+        "marker_path": str(marker_path),
+        "marker_sha256": sha256_bytes(canonical_json(marker)),
+        "owner_token": owner_token,
+    }
+
+
+def validate_codemap_temp_ownership_marker(
+    item: dict[str, Any],
+    *,
+    artifact_id: str,
+    plan_sha256: str,
+) -> bool:
+    try:
+        root = Path(str(item["path"])).resolve(strict=True)
+        marker_path = Path(str(item["marker_path"])).resolve(strict=True)
+        if marker_path != root / CODEMAP_TEMP_OWNERSHIP_MARKER:
+            return False
+        raw = marker_path.read_bytes()
+        marker = json.loads(raw)
+        return (
+            sha256_bytes(raw) == item.get("marker_sha256")
+            and marker.get("schema_version") == SCHEMA_VERSION
+            and marker.get("purpose") == "rpce-codemap-gate-temporary-root"
+            and marker.get("root_path") == str(root)
+            and marker.get("artifact_id") == artifact_id
+            and marker.get("plan_sha256") == plan_sha256
+            and marker.get("owner_token") == item.get("owner_token")
+        )
+    except (KeyError, OSError, json.JSONDecodeError):
+        return False
+
+
+def load_codemap_gate_fixture(
+    path: Path,
+    *,
+    plan: dict[str, Any],
+    cold_samples: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
+        raise BenchmarkError("codemap fixture uses an unsupported schema")
+    root = Path(plan["scope"]["root_path"]).resolve(strict=True)
+    if int(plan["dataset"].get("asserted_file_count", 0)) < CODEMAP_GATE_MINIMUM_SUPPORTED_FILES:
+        raise BenchmarkError(
+            f"codemap gate requires at least {CODEMAP_GATE_MINIMUM_SUPPORTED_FILES} asserted files"
+        )
+
+    individuals: list[dict[str, str]] = []
+    for index, item in enumerate(value.get("individuals") or []):
+        if not isinstance(item, dict):
+            raise BenchmarkError("every individual fixture must be an object")
+        relative, resolved = fixture_relative_path(
+            root, item.get("path"), f"individuals[{index}].path", directory=False
+        )
+        marker = item.get("marker")
+        if not isinstance(marker, str) or not marker or marker not in resolved.read_text(
+            encoding="utf-8", errors="strict"
+        ):
+            raise BenchmarkError(f"individuals[{index}].marker is absent from the exact fixture")
+        individuals.append({"path": relative, "marker": marker})
+
+    directories: list[dict[str, str]] = []
+    for index, item in enumerate(value.get("directories") or []):
+        if not isinstance(item, dict):
+            raise BenchmarkError("every directory fixture must be an object")
+        relative, resolved = fixture_relative_path(
+            root, item.get("path"), f"directories[{index}].path", directory=True
+        )
+        expected_relative, expected = fixture_relative_path(
+            root, item.get("expected_file"), f"directories[{index}].expected_file", directory=False
+        )
+        if resolved != expected and resolved not in expected.parents:
+            raise BenchmarkError(f"directories[{index}].expected_file is outside its directory")
+        marker = item.get("marker")
+        if not isinstance(marker, str) or not marker or marker not in expected.read_text(
+            encoding="utf-8", errors="strict"
+        ):
+            raise BenchmarkError(f"directories[{index}].marker is absent from the exact fixture")
+        directories.append({
+            "path": relative,
+            "expected_file": expected_relative,
+            "marker": marker,
+        })
+
+    if len({item["path"] for item in individuals}) < cold_samples:
+        raise BenchmarkError(f"codemap fixture requires {cold_samples} unique individual files")
+    if len({item["path"] for item in directories}) < cold_samples:
+        raise BenchmarkError(f"codemap fixture requires {cold_samples} unique directories")
+
+    overflow_relative, overflow = fixture_relative_path(
+        root, value.get("overflow_directory"), "overflow_directory", directory=True
+    )
+    overflow_members = {
+        item["path"] for item in individuals
+        if overflow == (root / item["path"]).resolve()
+        or overflow in (root / item["path"]).resolve().parents
+    }
+    if len(overflow_members) < 2:
+        raise BenchmarkError("overflow_directory must contain at least two individual fixtures")
+    watcher_relative = value.get("watcher_directory", ".rpce-codemap-gate")
+    if not isinstance(watcher_relative, str):
+        raise BenchmarkError("watcher_directory must be a relative string")
+    watcher = Path(watcher_relative)
+    if watcher.is_absolute() or ".." in watcher.parts or not watcher.parts:
+        raise BenchmarkError("watcher_directory must remain root-relative")
+
+    normalized = {
+        "schema_version": SCHEMA_VERSION,
+        "individuals": individuals,
+        "directories": directories,
+        "overflow_directory": overflow_relative,
+        "watcher_directory": watcher.as_posix(),
+    }
+    sanitized = {
+        "schema_version": SCHEMA_VERSION,
+        "fixture_sha256": sha256_bytes(canonical_json(normalized)),
+        "individual_count": len(individuals),
+        "directory_count": len(directories),
+        "individual_path_sha256": [sha256_bytes(item["path"].encode()) for item in individuals],
+        "directory_path_sha256": [sha256_bytes(item["path"].encode()) for item in directories],
+        "overflow_path_sha256": sha256_bytes(overflow_relative.encode()),
+    }
+    return normalized, sanitized
+
+
+def codemap_structure_evidence(
+    value: Any,
+    *,
+    expected_root_id: str,
+    expected_root_path: str,
+    expected_root_type: str,
+    expected_file_path: str,
+    expected_marker: str,
+    expected_file_type: str,
+) -> dict[str, Any]:
+    if not call_succeeded(value):
+        raise BenchmarkError("get_code_structure transport/tool call failed")
+    record = structured_mcp_record(
+        value,
+        "get_code_structure",
+        expected_root_id=expected_root_id,
+        expected_root_path=expected_root_path,
+        expected_root_type=expected_root_type,
+    )
+    if record.get("status") != "ready":
+        raise BenchmarkError(f"get_code_structure returned {record.get('status')!r}, not ready")
+    if record.get("retry") is not None:
+        raise BenchmarkError("ready get_code_structure unexpectedly included retry metadata")
+    issues = record.get("issues")
+    if not isinstance(issues, list):
+        raise BenchmarkError("get_code_structure omitted typed issues")
+    expected = canonicalize_evidence_path(expected_file_path, expected_root_path)
+    matches = [item for item in record["files"] if item.get("path") == expected]
+    if len(matches) != 1:
+        raise BenchmarkError("get_code_structure did not return the exact expected logical file")
+    matched = matches[0]
+    content = matched.get("content")
+    if matched.get("type") != expected_file_type or not isinstance(content, str):
+        raise BenchmarkError("get_code_structure returned the wrong file type or no codemap text")
+    if expected_marker not in content:
+        raise BenchmarkError("get_code_structure codemap text omitted the expected real marker")
+    return {
+        "status": "ready",
+        "file_path_sha256": sha256_bytes(expected_file_path.encode()),
+        "codemap_content_sha256": sha256_bytes(content.encode()),
+        "codemap_content_present": True,
+        "issue_codes": sorted({
+            str(issue.get("code")) for issue in issues
+            if isinstance(issue, dict) and isinstance(issue.get("code"), str)
+        }),
+        "returned_file_count": len(record["files"]),
+    }
+
+
+def codemap_tree_marker_evidence(
+    value: Any,
+    *,
+    expected_context_id: str,
+    expected_root_path: str,
+    requested_parent: str,
+    expected_file_path: str,
+) -> dict[str, Any]:
+    if not call_succeeded(value):
+        raise BenchmarkError("get_file_tree transport/tool call failed")
+    binding = benchmark_binding(value)
+    if (
+        not isinstance(binding, dict)
+        or str(binding.get("context_id", "")).upper() != expected_context_id.upper()
+    ):
+        raise BenchmarkError("get_file_tree was not atomically bound to the expected context")
+    canonical_root = Path(expected_root_path).expanduser().resolve(strict=False)
+    roots = binding_root_paths(value)
+    if roots is None or str(canonical_root) not in roots:
+        raise BenchmarkError("get_file_tree binding omitted the exact expected root")
+    request = value.get("_benchmark_payload") if isinstance(value, dict) else None
+    if not isinstance(request, dict):
+        raise BenchmarkError("get_file_tree omitted its exact request payload")
+    if (
+        request.get("type") != "files"
+        or request.get("mode") != "full"
+        or request.get("max_depth") != 1
+        or request.get("path") != requested_parent
+    ):
+        raise BenchmarkError("get_file_tree request did not bind the exact parent contract")
+    canonical_parent = Path(
+        canonicalize_evidence_path(requested_parent, str(canonical_root))
+    )
+    canonical_file = Path(
+        canonicalize_evidence_path(expected_file_path, str(canonical_root))
+    )
+    if canonical_file.parent != canonical_parent:
+        raise BenchmarkError("get_file_tree expected file was not a direct child of its parent")
+    payload = tool_payload(value, "get_file_tree")
+    tree = payload.get("tree")
+    if not isinstance(tree, str) or payload.get("uses_legend") is not True:
+        raise BenchmarkError("get_file_tree omitted its exact codemap marker legend")
+    lines = tree.splitlines()
+    if not lines:
+        raise BenchmarkError("get_file_tree returned an empty tree")
+    relative_parent = canonical_parent.relative_to(canonical_root)
+    logical_parent = (
+        canonical_root.name
+        if str(relative_parent) == "."
+        else f"{canonical_root.name}/{relative_parent.as_posix()}"
+    )
+    if lines[0].rstrip() not in {logical_parent, str(canonical_parent)}:
+        raise BenchmarkError("get_file_tree header did not identify the exact requested parent")
+    name = canonical_file.name
+    marker_lines = [
+        line for line in lines
+        if line.rstrip() in {f"├── {name} +", f"└── {name} +"}
+    ]
+    if (
+        len(marker_lines) != 1
+        or payload.get("was_truncated") is True
+        or CODEMAP_TREE_LEGEND not in response_text(value)
+        or (canonical_parent / name).resolve(strict=False) != canonical_file
+    ):
+        raise BenchmarkError("get_file_tree omitted the exact full-path current marker or legend")
+    return {
+        "status": "ready",
+        "file_path_sha256": sha256_bytes(expected_file_path.encode()),
+        "parent_path_sha256": sha256_bytes(requested_parent.encode()),
+        "context_id_sha256": sha256_bytes(expected_context_id.upper().encode()),
+        "marker_present": True,
+        "legend_present": True,
+        "tree_sha256": sha256_bytes(tree.encode()),
+    }
+
+
+def codemap_retryable_terminal_evidence(
+    value: Any,
+    *,
+    expected_status: str,
+    expected_issue_code: str,
+) -> dict[str, Any]:
+    payload = tool_payload(value, "get_code_structure")
+    issues = payload.get("issues")
+    retry = payload.get("retry")
+    if payload.get("status") != expected_status or payload.get("files") != []:
+        raise BenchmarkError(f"expected empty typed {expected_status} code-structure result")
+    if not isinstance(issues, list) or not isinstance(retry, dict):
+        raise BenchmarkError("retryable terminal result omitted typed issues or reply retry")
+    matches = [item for item in issues if isinstance(item, dict) and item.get("code") == expected_issue_code]
+    if len(matches) != 1:
+        raise BenchmarkError(f"terminal result omitted exact issue {expected_issue_code}")
+    issue = matches[0]
+    if (
+        issue.get("retryable") is not True
+        or not positive_integer(issue.get("retry_after_ms"))
+        or not isinstance(issue.get("attempted"), int)
+        or not (
+            CODEMAP_GATE_WAIT_MILLISECONDS - CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
+            <= issue["attempted"]
+            <= CODEMAP_GATE_WAIT_MILLISECONDS + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
+        )
+        or issue.get("limit") != CODEMAP_GATE_WAIT_MILLISECONDS
+        or retry.get("retryable") is not True
+        or not positive_integer(retry.get("retry_after_ms"))
+    ):
+        raise BenchmarkError("retryable terminal result omitted non-null retry metadata")
+    return {
+        "status": expected_status,
+        "issue_codes": [expected_issue_code],
+        "empty": True,
+        "retryable": True,
+        "retry_after_ms": retry["retry_after_ms"],
+        "attempted": issue["attempted"],
+        "limit": issue["limit"],
+    }
+
+
+def codemap_budget_evidence(value: Any) -> dict[str, Any]:
+    payload = tool_payload(value, "get_code_structure")
+    issues = payload.get("issues")
+    matches = [
+        issue for issue in issues or []
+        if isinstance(issue, dict) and issue.get("code") == "hard_budget_exceeded"
+    ]
+    if (
+        payload.get("status") != "budget"
+        or payload.get("files") != []
+        or len(matches) != 1
+        or matches[0].get("attempted") != 2
+        or matches[0].get("limit") != 1
+    ):
+        raise BenchmarkError("strict directory overflow lacked exact empty limit-plus-one evidence")
+    return {
+        "status": "budget",
+        "empty": True,
+        "attempted": 2,
+        "limit": 1,
+        "issue_codes": ["hard_budget_exceeded"],
+    }
+
+
+def codemap_debug_action(
+    runner: CLIRunner,
+    plan: dict[str, Any],
+    action: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    response = runner.call(
+        f"codemap-{action}", DEBUG_TOOL, diagnostic_payload(plan, action, **extra), check=False
+    )
+    if not call_succeeded(response):
+        raise BenchmarkError(f"DEBUG codemap action {action!r} failed")
+    snapshot = find_value(response, "codemap_projection")
+    if not isinstance(snapshot, dict):
+        raise BenchmarkError(f"DEBUG codemap action {action!r} omitted codemap_projection")
+    return {"response": response, "snapshot": snapshot}
+
+
+def codemap_counter_delta(before: dict[str, Any], after: dict[str, Any], key: str) -> int:
+    left, right = before.get(key), after.get(key)
+    if not nonnegative_integer(left) or not nonnegative_integer(right) or right < left:
+        raise BenchmarkError(f"invalid monotonic codemap counter {key!r}")
+    return right - left
+
+
+def verify_agent_codemap_transcript(
+    transcript_xml: str,
+    *,
+    expected_output: str,
+    expected_calls: list[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    records = parse_agent_transcript_records(transcript_xml)
+    allowed_tools = {"get_code_structure", "get_file_tree"}
+    unexpected = sorted({
+        item["tool"] for item in records["calls"] + records["results"]
+        if item["tool"] not in allowed_tools
+    })
+    if unexpected:
+        raise BenchmarkError(f"codemap transcript used forbidden/substitute tools: {unexpected}")
+    expected_tools = [item[0] for item in expected_calls]
+    if [item["tool"] for item in records["calls"]] != expected_tools:
+        raise BenchmarkError("codemap transcript tool calls did not match the exact ordered scenario")
+    if [item["tool"] for item in records["results"]] != expected_tools:
+        raise BenchmarkError("codemap transcript omitted exact ordered paired results")
+    previous_ordinal = 0
+    successful_statuses = {"ok", "complete", "completed", "ready", "success"}
+    reported_status_count = 0
+    for (tool, expected), call, result in zip(
+        expected_calls, records["calls"], records["results"], strict=True
+    ):
+        if not (previous_ordinal < call["ordinal"] < result["ordinal"]):
+            raise BenchmarkError("codemap transcript calls/results were unordered")
+        previous_ordinal = result["ordinal"]
+        if result.get("status") is not None:
+            if result["status"] not in successful_statuses:
+                raise BenchmarkError("codemap transcript contained an unsuccessful tool result")
+            reported_status_count += 1
+        arguments = call["arguments"]
+        if tool == "get_code_structure":
+            if arguments.get("scope") != "paths" or arguments.get("paths") != expected["paths"]:
+                raise BenchmarkError("codemap transcript structure paths did not match")
+            limits = arguments.get("limits")
+            if isinstance(limits, dict) and "wait_ms" in limits:
+                raise BenchmarkError("agent supplied forbidden model-facing limits.wait_ms")
+        elif arguments.get("path") != expected.get("path"):
+            raise BenchmarkError("codemap transcript tree path did not match")
+    if not records["assistants"] or records["assistants"][-1] != expected_output:
+        raise BenchmarkError("codemap transcript final assistant output mismatch")
+    return {
+        "call_count": len(expected_calls),
+        "result_count": len(expected_calls),
+        "tool_sequence_sha256": sha256_bytes("\n".join(expected_tools).encode()),
+        "ordered_pairs": True,
+        "forbidden_tool_count": 0,
+        "reported_result_status_count": reported_status_count,
+        "structured_result_payload_count": sum(
+            result.get("result") is not None for result in records["results"]
+        ),
+        "same_context_direct_probe_required": any(
+            result.get("result") is None for result in records["results"]
+        ),
+        "final_output": expected_output,
+    }
+
+
+def wait_codemap_agent_success(
+    runner: CLIRunner,
+    session_id: str,
+    context_id: str,
+    *,
+    start_response: Any,
+    expected_output: str,
+    expected_calls: list[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    waited_call = runner.timed_call(
+        f"codemap-wait-{session_id[:8]}", "agent_run",
+        {"op": "wait", "session_id": session_id, "timeout": 300},
+        timeout=330, check=False, context_id=context_id,
+    )
+    waited = waited_call.response
+    log = runner.call(
+        f"codemap-log-{session_id[:8]}", "agent_manage",
+        {"op": "get_log", "session_id": session_id, "offset": 0, "limit": 4000},
+        timeout=120, check=False, context_id=context_id,
+    )
+    evidence: dict[str, Any] | None = None
+    error: str | None = None
+    try:
+        evidence = verify_agent_codemap_transcript(
+            transcript_xml_from_log(log),
+            expected_output=expected_output,
+            expected_calls=expected_calls,
+        )
+    except BenchmarkError as caught:
+        error = str(caught)
+    status = response_status(waited)
+    started_ns = find_value(start_response, "_benchmark_started_monotonic_ns")
+    inference_elapsed_ms = (
+        (waited_call.finished_ns - started_ns) / 1_000_000
+        if isinstance(started_ns, int) and waited_call.finished_ns >= started_ns else None
+    )
+    return {
+        "ok": call_succeeded(waited) and call_succeeded(log) and status == "completed" and evidence is not None,
+        "status": status,
+        "inference_elapsed_ms": inference_elapsed_ms,
+        "transcript_evidence": evidence,
+        "transcript_error": error,
+    }
+
+
+def agent_codemap_direct_evidence(
+    runner: CLIRunner,
+    plan: dict[str, Any],
+    *,
+    start_response: Any,
+    session_id: str,
+    context_id: str,
+    worktree_path: Path,
+    expected_calls: list[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    if response_context_id(start_response) != context_id:
+        raise BenchmarkError("agent start/session context correlation failed")
+    start_bindings = response_worktree_binding_set(start_response)
+    matching_bindings = {
+        (worktree_id, str(Path(path).resolve(strict=False)))
+        for worktree_id, path in start_bindings
+        if Path(path).resolve(strict=False) == worktree_path.resolve(strict=False)
+    }
+    if len(matching_bindings) != 1:
+        raise BenchmarkError("agent start omitted one exact worktree binding")
+    runtime = runner.call(
+        f"codemap-agent-root-{session_id[:8]}", DEBUG_TOOL,
+        {"op": "mcp_read_search_runtime_snapshot",
+         "window_id": plan["scope"]["window_id"],
+         "recent_publication_limit": 0, "root_limit": 256},
+        check=False, context_id=context_id,
+    )
+    if not call_succeeded(runtime):
+        raise BenchmarkError("agent-bound runtime root identity snapshot failed")
+    root_identity = runtime_root_identity(runtime, str(worktree_path))
+    structure_evidence: list[dict[str, Any]] = []
+    tree_evidence: list[dict[str, Any]] = []
+    for ordinal, (tool, expected) in enumerate(expected_calls, start=1):
+        if tool == "get_code_structure":
+            timed = runner.timed_call(
+                f"codemap-agent-direct-structure-{session_id[:8]}-{ordinal}",
+                tool,
+                {"scope": "paths", "paths": expected["paths"],
+                 "limits": {"max_files": 100, "max_edges": 400,
+                            "max_codemap_tokens": 12_000},
+                 "context_id": context_id},
+                check=False, context_id=context_id,
+            )
+            evidence = codemap_structure_evidence(
+                timed.response,
+                expected_root_id=root_identity["id"],
+                expected_root_path=root_identity["path"],
+                expected_root_type=root_identity["type"],
+                expected_file_path=expected["expected_file"],
+                expected_marker=expected["marker"],
+                expected_file_type=plan["dataset"]["code_file_type"],
+            )
+            evidence["duration_ms"] = (timed.finished_ns - timed.started_ns) / 1_000_000
+            structure_evidence.append(evidence)
+        elif tool == "get_file_tree":
+            timed = runner.timed_call(
+                f"codemap-agent-direct-tree-{session_id[:8]}-{ordinal}",
+                tool,
+                {"type": "files", "mode": "full", "path": expected["path"],
+                 "max_depth": 1, "context_id": context_id},
+                check=False, context_id=context_id,
+            )
+            evidence = codemap_tree_marker_evidence(
+                timed.response,
+                expected_context_id=context_id,
+                expected_root_path=root_identity["path"],
+                requested_parent=expected["path"],
+                expected_file_path=expected["expected_file"],
+            )
+            evidence["duration_ms"] = (timed.finished_ns - timed.started_ns) / 1_000_000
+            tree_evidence.append(evidence)
+        else:
+            raise BenchmarkError("agent direct evidence received an unsupported tool")
+    if not structure_evidence or not tree_evidence:
+        raise BenchmarkError("agent direct evidence requires structure and tree results")
+    return {
+        "ok": True,
+        "proof_basis": "atomic_same_agent_context_direct_probe",
+        "session_id_sha256": sha256_bytes(session_id.upper().encode()),
+        "context_id_sha256": sha256_bytes(context_id.upper().encode()),
+        "worktree_path_sha256": sha256_bytes(str(worktree_path.resolve()).encode()),
+        "worktree_id_sha256": sha256_bytes(next(iter(matching_bindings))[0].encode()),
+        "root_identity_sha256": sha256_bytes(canonical_json(root_identity)),
+        "structure": structure_evidence,
+        "trees": tree_evidence,
+    }
+
+
+def verify_agent_codemap_revoked_transcript(
+    transcript_xml: str,
+    *,
+    expected_first_path: str,
+) -> dict[str, Any]:
+    records = parse_agent_transcript_records(transcript_xml)
+    allowed = {"get_code_structure", "get_file_tree"}
+    if any(item["tool"] not in allowed for item in records["calls"] + records["results"]):
+        raise BenchmarkError("revoked linked agent used a forbidden/substitute tool")
+    if not records["calls"]:
+        raise BenchmarkError("revoked linked agent transcript omitted its held call")
+    matching = [
+        call for call in records["calls"]
+        if call["tool"] == "get_code_structure"
+        and call["arguments"].get("scope") == "paths"
+        and call["arguments"].get("paths") == [expected_first_path]
+    ]
+    if len(matching) != 1:
+        raise BenchmarkError("revoked linked agent did not issue one exact held request")
+    if len(records["results"]) > len(records["calls"]):
+        raise BenchmarkError("revoked linked agent transcript contained orphan results")
+    return {
+        "ok": True,
+        "held_call_present": True,
+        "call_count": len(records["calls"]),
+        "result_count": len(records["results"]),
+        "forbidden_tool_count": 0,
+    }
+
+
+def wait_for_exact_agent_structure_call(
+    runner: CLIRunner,
+    *,
+    session_id: str,
+    context_id: str,
+    expected_path: str,
+    timeout_seconds: float = 30,
+) -> dict[str, Any]:
+    started_ns = time.monotonic_ns()
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        log = runner.call(
+            f"codemap-held-call-{session_id[:8]}", "agent_manage",
+            {"op": "get_log", "session_id": session_id, "offset": 0, "limit": 4000},
+            timeout=60, check=False, context_id=context_id,
+        )
+        if call_succeeded(log):
+            try:
+                records = parse_agent_transcript_records(transcript_xml_from_log(log))
+            except BenchmarkError:
+                time.sleep(0.1)
+                continue
+            if any(
+                call["tool"] == "get_code_structure"
+                and call["arguments"].get("scope") == "paths"
+                and call["arguments"].get("paths") == [expected_path]
+                for call in records["calls"]
+            ):
+                finished_ns = time.monotonic_ns()
+                return {
+                    "ok": True, "observed_before_remove": True,
+                    "duration_ms": (finished_ns - started_ns) / 1_000_000,
+                    "path_sha256": sha256_bytes(expected_path.encode()),
+                }
+        time.sleep(0.1)
+    raise BenchmarkError("linked agent did not issue the exact held demand before removal")
+
+
+def codemap_agent_prompt(
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    sentinel: str,
+) -> str:
+    instructions: list[str] = [
+        "Use exactly the following RepoPrompt tools in order. Use no other tools, no delegation, "
+        "and no Bash, shell, exec, command, scripting, encoded substitutes, or filesystem APIs."
+    ]
+    for ordinal, (tool, expected) in enumerate(calls, start=1):
+        if tool == "get_code_structure":
+            instructions.append(
+                f"{ordinal}. Call get_code_structure with scope paths and paths exactly {expected['paths']!r}; "
+                "do not supply limits.wait_ms; the server owns a fixed 10-second demand wait. "
+                "Require status ready with non-empty real codemap content."
+            )
+        else:
+            instructions.append(
+                f"{ordinal}. Call get_file_tree with path exactly {expected['path']!r}; require the "
+                "exact '+ denotes code-map available' legend and a + marker for file "
+                f"{expected['expected_file']!r}."
+            )
+    instructions.append(f"After every call succeeds, reply exactly {sentinel}.")
+    return " ".join(instructions)
+
+
+def sanitize_codemap_summary_value(value: Any, key: str = "") -> Any:
+    sensitive_key = any(fragment in key.lower() for fragment in (
+        "path", "root", "session_id", "context_id", "hold_id", "worktree_id",
+    ))
+    if isinstance(value, dict):
+        return {
+            child_key: sanitize_codemap_summary_value(
+                child, f"{key}.{child_key}" if key else child_key
+            )
+            for child_key, child in value.items()
+            if child_key not in {"transcript_error", "operational_error", "message", "content"}
+        }
+    if isinstance(value, list):
+        return [sanitize_codemap_summary_value(child, key) for child in value]
+    if isinstance(value, str) and (sensitive_key or value.startswith("/")):
+        return {"sha256": sha256_bytes(value.encode()), "present": True}
+    return value
+
+
+def validate_codemap_baseline(
+    baseline_path: Path,
+    ledger_path: Path,
+    *,
+    expected_ledger_sha256: str,
+    fixture_sha256: str,
+    cold_samples: int,
+    warm_samples: int,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    baseline_value, baseline_raw = load_strict_json(baseline_path, "codemap baseline")
+    ledger_value, ledger_raw = load_strict_json(ledger_path, "codemap baseline ledger")
+    ledger_sha256 = sha256_bytes(ledger_raw)
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", expected_ledger_sha256.lower()) is None
+        or ledger_sha256 != expected_ledger_sha256.lower()
+    ):
+        raise BenchmarkError("baseline ledger does not match the independently accepted digest")
+    if not isinstance(baseline_value, dict):
+        raise BenchmarkError("codemap baseline must contain one object")
+    baseline = baseline_value
+    if (
+        baseline.get("schema_version") != SCHEMA_VERSION
+        or baseline.get("kind") != "codemap-gate"
+        or baseline.get("decision") != "pass"
+        or baseline.get("status") != "completed"
+        or baseline.get("fixture_sha256") != fixture_sha256
+        or baseline.get("cleanup_complete") is not True
+    ):
+        raise BenchmarkError("baseline is not a completed accepted-fixture codemap gate")
+    artifact_id = baseline.get("artifact_id")
+    if not isinstance(artifact_id, str) or not artifact_id:
+        raise BenchmarkError("baseline omitted its artifact identity")
+    expected_configuration = {
+        "cold_samples_per_cohort": cold_samples,
+        "warm_samples_per_cohort": warm_samples,
+        "wait_contract_ms": CODEMAP_GATE_WAIT_MILLISECONDS,
+        "harness_allowance_ms": CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS,
+    }
+    if baseline.get("configuration") != expected_configuration:
+        raise BenchmarkError("baseline configuration/sample inventory does not match this gate")
+    expected_sample_counts = {
+        "attempted": 2 * (cold_samples + warm_samples),
+        "valid": 2 * (cold_samples + warm_samples),
+        "invalid": 0,
+    }
+    if baseline.get("sample_counts") != expected_sample_counts:
+        raise BenchmarkError("baseline sample accounting was not exact")
+    gates = baseline.get("gates")
+    if not isinstance(gates, dict) or set(gates) != set(CODEMAP_REQUIRED_GATES):
+        raise BenchmarkError("baseline gate inventory was not exact")
+    if any(gates[name] is not True for name in CODEMAP_REQUIRED_GATES):
+        raise BenchmarkError("baseline contains a non-passing gate")
+    metrics = baseline.get("metrics")
+    if not isinstance(metrics, dict) or set(metrics) != set(CODEMAP_REQUIRED_METRICS):
+        raise BenchmarkError("baseline metric inventory was not exact")
+    exact_counts = {
+        "cold_individual_structure": cold_samples,
+        "warm_individual_structure": warm_samples,
+        "cold_directory_structure": cold_samples,
+        "warm_directory_structure": warm_samples,
+        "tree_marker_availability": 2 * (cold_samples + warm_samples),
+        "first_search": 2 * (cold_samples // 2),
+        "first_read": 2 * (cold_samples // 2),
+        "root_readiness": 2 * (cold_samples // 2),
+    }
+    for name in CODEMAP_REQUIRED_METRICS:
+        metric = metrics.get(name)
+        if not isinstance(metric, dict) or not positive_integer(metric.get("count")):
+            raise BenchmarkError(f"baseline metric {name!r} omitted a positive sample count")
+        if name in exact_counts and metric["count"] != exact_counts[name]:
+            raise BenchmarkError(f"baseline metric {name!r} sample count was not exact")
+        for percentile in ("p50", "p95"):
+            value = metric.get(percentile)
+            if not finite_number(value) or float(value) <= 0:
+                raise BenchmarkError(
+                    f"baseline metric {name!r} {percentile} must be finite and positive"
+                )
+    privacy = baseline.get("privacy")
+    if not isinstance(privacy, dict) or set(privacy) != CODEMAP_PRIVACY_KEYS:
+        raise BenchmarkError("baseline privacy inventory was not exact")
+    if (
+        privacy.get("ok") is not True
+        or not positive_integer(privacy.get("scanned_file_count"))
+        or privacy.get("failure_codes") != []
+        or not isinstance(privacy.get("allowlisted_root_sha256"), list)
+        or not privacy["allowlisted_root_sha256"]
+        or not isinstance(privacy.get("allowlisted_prompt_sha256"), list)
+        or not privacy["allowlisted_prompt_sha256"]
+    ):
+        raise BenchmarkError("baseline privacy evidence was incomplete or non-passing")
+    if not isinstance(ledger_value, dict) or set(ledger_value) != {
+        "schema_version", "kind", "accepted_summaries",
+    }:
+        raise BenchmarkError("baseline ledger schema/inventory was not exact")
+    accepted = ledger_value.get("accepted_summaries")
+    if (
+        ledger_value.get("schema_version") != SCHEMA_VERSION
+        or ledger_value.get("kind") != CODEMAP_BASELINE_LEDGER_KIND
+        or not isinstance(accepted, list)
+    ):
+        raise BenchmarkError("baseline ledger is unsupported")
+    baseline_sha256 = sha256_bytes(baseline_raw)
+    matches = [
+        entry for entry in accepted
+        if isinstance(entry, dict)
+        and set(entry) == {"artifact_id", "summary_sha256", "fixture_sha256"}
+        and entry.get("artifact_id") == artifact_id
+        and entry.get("summary_sha256") == baseline_sha256
+        and entry.get("fixture_sha256") == fixture_sha256
+    ]
+    if len(matches) != 1:
+        raise BenchmarkError("baseline artifact digest is not uniquely accepted by the ledger")
+    return baseline, {
+        "summary_sha256": baseline_sha256,
+        "ledger_sha256": ledger_sha256,
+        "acceptance_entry_sha256": sha256_bytes(canonical_json(matches[0])),
+        "artifact_id_sha256": sha256_bytes(artifact_id.encode()),
+    }
+
+
+def codemap_artifact_privacy_scan(
+    artifact: Path,
+    *,
+    allowlisted_roots: Iterable[Path],
+    allowlisted_prompts: Iterable[str],
+) -> dict[str, Any]:
+    failures: list[str] = []
+    scanned_files = 0
+    secret_patterns = [
+        re.compile(r"\b(?:sk|rk|sess)-[A-Za-z0-9_-]{16,}\b"),
+        re.compile(r"(?i)\b(?:authorization|api[_-]?key|access[_-]?token|client[_-]?secret|password)\b\s*[:=]\s*[^\s,}\]]+"),
+        re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    ]
+    forbidden_roots = [Path.home().resolve(), repository_root().resolve()]
+    allowlisted = sorted({str(path.resolve()) for path in allowlisted_roots}, key=len, reverse=True)
+    prompt_allowlist = set(allowlisted_prompts)
+    if not allowlisted:
+        raise BenchmarkError("privacy scan requires at least one allowlisted owned root")
+    for directory in [artifact, *[item for item in artifact.rglob("*") if item.is_dir()]]:
+        if directory.stat().st_mode & 0o777 != 0o700:
+            failures.append(f"directory_mode:{directory.relative_to(artifact) if directory != artifact else '.'}")
+    for item in artifact.rglob("*"):
+        if not item.is_file():
+            continue
+        scanned_files += 1
+        if item.stat().st_mode & 0o777 != 0o600:
+            failures.append(f"file_mode:{item.relative_to(artifact)}")
+        raw = item.read_bytes()
+        text_value = raw.decode("utf-8", errors="replace")
+        for prompt in re.findall(r"<user>(.*?)</user>", text_value, re.DOTALL):
+            if html.unescape(prompt).strip() not in prompt_allowlist:
+                failures.append(f"unallowlisted_prompt:{item.relative_to(artifact)}")
+        scrubbed = text_value
+        for owned in allowlisted:
+            scrubbed = scrubbed.replace(owned, "<ALLOWLISTED_ROOT>")
+        if any(pattern.search(scrubbed) for pattern in secret_patterns):
+            failures.append(f"credential_pattern:{item.relative_to(artifact)}")
+        for forbidden in forbidden_roots:
+            forbidden_text = str(forbidden)
+            if forbidden_text not in allowlisted and forbidden_text in scrubbed:
+                failures.append(f"private_path:{item.relative_to(artifact)}")
+
+        json_documents: list[Any] = []
+        try:
+            json_documents.append(json.loads(text_value))
+        except json.JSONDecodeError:
+            pass
+        for document in text_value.split("\n\n---\n\n"):
+            try:
+                json_documents.append(json.loads(document))
+            except json.JSONDecodeError:
+                continue
+        nested_documents: list[Any] = []
+        for document in json_documents:
+            for candidate in walk_json(document):
+                if not isinstance(candidate, str) or "\n\n---\n\n" not in candidate:
+                    continue
+                for nested in candidate.split("\n\n---\n\n"):
+                    try:
+                        nested_documents.append(json.loads(nested))
+                    except json.JSONDecodeError:
+                        continue
+        json_documents.extend(nested_documents)
+        for document in json_documents:
+            for candidate in walk_json(document):
+                if not isinstance(candidate, dict):
+                    continue
+                for candidate_key, candidate_value in candidate.items():
+                    if "path" not in str(candidate_key).lower():
+                        continue
+                    path_values = candidate_value if isinstance(candidate_value, list) else [candidate_value]
+                    for raw_path in path_values:
+                        if not isinstance(raw_path, str) or not raw_path.startswith("/"):
+                            continue
+                        resolved_path = str(Path(raw_path).resolve(strict=False))
+                        if not any(
+                            resolved_path == owned or resolved_path.startswith(owned + os.sep)
+                            for owned in allowlisted
+                        ):
+                            failures.append(f"unallowlisted_physical_path:{item.relative_to(artifact)}")
+    return {
+        "ok": not failures,
+        "scanned_file_count": scanned_files,
+        "failure_codes": sorted(set(failures)),
+        "allowlisted_root_sha256": [sha256_bytes(item.encode()) for item in allowlisted],
+        "allowlisted_prompt_sha256": sorted(sha256_bytes(item.encode()) for item in prompt_allowlist),
+    }
+
+
 def smoke_command(args: argparse.Namespace) -> int:
     if not args.confirm_live_debug_app or not args.confirm_dedicated_workspace:
         raise BenchmarkError("smoke requires both live-app and dedicated-workspace confirmations")
     plan = load_plan(Path(args.plan).expanduser().resolve(strict=True))
     cli = resolve_cli(args.cli)
     root = Path(plan["scope"]["root_path"])
+    base_commit_oid = validate_planned_base_commit(plan, root)
     artifact = make_artifact(Path(args.output_root), "correctness-smoke")
-    runner = CLIRunner(cli, plan["scope"]["window_id"], root, artifact)
+    runner = CLIRunner(
+        cli, plan["scope"]["window_id"], plan["scope"]["context_id"], root, artifact
+    )
     save_json(artifact / "plan.json", plan, exclusive=True)
     verify_scope(runner, plan)
     verify_disposable_target(runner, plan, require_only_planned_root=True)
@@ -2175,12 +4334,17 @@ def smoke_command(args: argparse.Namespace) -> int:
             {
                 "op": "start", "model_id": "explore", "detach": True,
                 "message": (
-                    "Run 200 sequential alternating file_search and read_file calls against "
-                    f"{plan['dataset']['read_path']}. Do not edit or delegate. Then reply RPCE_ACTIVE_PARENT_OK."
+                    "Make exactly 20 sequential tool calls, strictly alternating: file_search then "
+                    "read_file, repeated 10 times. Every file_search must use marker "
+                    f"{plan['dataset']['search_marker']!r} with regex false and filter.paths exactly "
+                    f"[{plan['dataset']['read_path']!r}]. Every read_file must read exactly "
+                    f"{plan['dataset']['read_path']!r}. Use no other tools; do not use Bash, shell, "
+                    "exec, delegation, or substitute calls. After all 20 calls succeed, reply exactly "
+                    "RPCE_ACTIVE_PARENT_OK."
                 ),
                 "session_name": "RPCE active-root smoke", "worktree_create": True,
                 "worktree_branch": parent_branch,
-                "worktree_base_ref": plan["dataset"]["base_ref"],
+                "worktree_base_ref": base_commit_oid,
                 "worktree_label": f"RPCE smoke {artifact.name}", "context_id": plan["scope"]["context_id"],
             }, timeout=180,
         )
@@ -2188,7 +4352,12 @@ def smoke_command(args: argparse.Namespace) -> int:
         parent_context = response_context_id(parent)
         if parent_context is None:
             raise BenchmarkError("smoke parent start omitted context_id")
-        parent_worktree = discover_owned_worktree(parent, root, parent_branch)
+        parent_worktree = discover_owned_worktree(benchmark_final_response(parent), root, parent_branch)
+        parent_worktree_bindings = response_worktree_binding_set(parent)
+        parent_started_in_worktree = any(
+            Path(path).resolve() == parent_worktree.resolve()
+            for _, path in parent_worktree_bindings
+        )
         parent_runtime = runner.call(
             "parent-root-identity", DEBUG_TOOL,
             {"op": "mcp_read_search_runtime_snapshot", "window_id": plan["scope"]["window_id"],
@@ -2212,14 +4381,14 @@ def smoke_command(args: argparse.Namespace) -> int:
                     "Require both calls to succeed and reply exactly RPCE_INHERITED_CHILD_OK."
                 ),
                 "session_name": "RPCE inherited child", "context_id": parent_context,
-            }, timeout=180, check=False,
+            }, timeout=180, check=False, context_id=parent_context,
         )
         child_session = find_value(child, "session_id")
         child_parent = find_value(child, "parent_session_id")
-        child_paths = response_worktree_paths(child)
-        same_worktree = bool(
-            parent_worktree
-            and any(Path(path).resolve() == parent_worktree.resolve() for path in child_paths)
+        child_context = response_context_id(child)
+        inheritance = child_inheritance_evidence(
+            parent, child, parent_context_id=parent_context,
+            parent_worktree_path=str(parent_worktree),
         )
         child_completion = (
             wait_agent_success(
@@ -2227,11 +4396,9 @@ def smoke_command(args: argparse.Namespace) -> int:
                 expected_output="RPCE_INHERITED_CHILD_OK",
                 expected_marker=plan["dataset"]["search_marker"],
                 expected_file_path=plan["dataset"]["read_path"],
-                expected_root_id=parent_root_identity["id"],
-                expected_root_path=parent_root_identity["path"],
-                expected_root_type=parent_root_identity["type"],
+                context_id=child_context,
             )
-            if isinstance(child_session, str)
+            if isinstance(child_session, str) and isinstance(child_context, str)
             else {"ok": False, "status": "missing"}
         )
         if isinstance(child_session, str):
@@ -2240,12 +4407,12 @@ def smoke_command(args: argparse.Namespace) -> int:
             call_succeeded(child)
             and isinstance(child_session, str)
             and child_parent == parent_session
-            and same_worktree
+            and inheritance["ok"]
             and child_completion["ok"]
         )
         results["nested-inherited-worktree-agent"] = {
+            **inheritance,
             "ok": nested_ok, "parent_session_id_matches": child_parent == parent_session,
-            "same_worktree": same_worktree,
             "terminal_success": child_completion,
         }
 
@@ -2264,7 +4431,8 @@ def smoke_command(args: argparse.Namespace) -> int:
         )
         explicit_structure = runner.call(
             "structure-explicit", "get_code_structure",
-            {"paths": [plan["dataset"]["read_path"]], "context_id": parent_context}, check=False,
+            {"scope": "paths", "paths": [plan["dataset"]["read_path"]],
+             "context_id": parent_context}, check=False,
         )
         selected_evidence = structured_success_evidence(
             selected_get, "manage_selection",
@@ -2286,6 +4454,7 @@ def smoke_command(args: argparse.Namespace) -> int:
             expected_file_path=plan["dataset"]["read_path"],
             expected_file_type=plan["dataset"]["code_file_type"],
             expected_content=plan["dataset"]["read_marker"],
+            require_only_file=False,
         )
         structure_explicit = structured_success_evidence(
             explicit_structure, "get_code_structure",
@@ -2295,6 +4464,7 @@ def smoke_command(args: argparse.Namespace) -> int:
             expected_file_path=plan["dataset"]["read_path"],
             expected_file_type=plan["dataset"]["code_file_type"],
             expected_content=plan["dataset"]["read_marker"],
+            require_only_file=False,
         )
         results["code-structure-exact-root"] = {
             "ok": structure_selected["ok"] and structure_explicit["ok"],
@@ -2334,7 +4504,9 @@ def smoke_command(args: argparse.Namespace) -> int:
              "recent_publication_limit": 0, "root_limit": 256}, check=False,
         )
         non_git_structure = runner.call(
-            "non-git-structure", "get_code_structure", {"paths": [str(non_git / "NonGit.swift")], "context_id": parent_context},
+            "non-git-structure", "get_code_structure",
+            {"scope": "paths", "paths": [str(non_git / "NonGit.swift")],
+             "context_id": parent_context},
             check=False,
         )
         main_structure_after_non_git = runner.call(
@@ -2405,6 +4577,7 @@ def smoke_command(args: argparse.Namespace) -> int:
             expected_file_path=plan["dataset"]["read_path"],
             expected_file_type=plan["dataset"]["code_file_type"],
             expected_content=plan["dataset"]["read_marker"],
+            require_only_file=False,
         )
         results["cross-root-negative"] = {
             "ok": cross_search_evidence["ok"] and cross_structure_evidence["ok"],
@@ -2419,7 +4592,7 @@ def smoke_command(args: argparse.Namespace) -> int:
         ordinary_file.write_text(f"struct {ordinary_marker} {{}}\n", encoding="utf-8")
         linked_parent = Path(tempfile.mkdtemp(prefix="rpce-startup-linked-parent-"))
         linked_secondary = linked_parent / "worktree"
-        run_local(["git", "worktree", "add", "--detach", str(linked_secondary), plan["dataset"]["base_ref"]], root)
+        run_local(["git", "worktree", "add", "--detach", str(linked_secondary), base_commit_oid], root)
         linked_marker = f"RPCE_LINKED_{uuid.uuid4().hex}"
         linked_file = linked_secondary / f"{linked_marker}.swift"
         linked_file.write_text(f"struct {linked_marker} {{}}\n", encoding="utf-8")
@@ -2534,7 +4707,7 @@ def smoke_command(args: argparse.Namespace) -> int:
                 expected_root_path=secondary_root_identity["path"],
                 expected_root_type=secondary_root_identity["type"],
                 expected_file_path=str(secondary_file), expected_file_type="file",
-                require_only_file=False,
+                require_only_file=False, allow_other_roots=True,
             )
             added_structure_evidence = structured_success_evidence(
                 added_structure, "get_code_structure",
@@ -2544,6 +4717,7 @@ def smoke_command(args: argparse.Namespace) -> int:
                 expected_file_path=str(secondary_file),
                 expected_file_type=plan["dataset"]["code_file_type"],
                 expected_content=secondary_marker,
+                require_only_file=False,
             )
             added_usable = (
                 str(secondary.resolve()) in added_inventory_paths
@@ -2625,18 +4799,24 @@ def smoke_command(args: argparse.Namespace) -> int:
                 expected_root_id=secondary_root_identity["id"],
                 expected_root_path=secondary_root_identity["path"],
                 expected_root_type=secondary_root_identity["type"],
+                expected_file_path=str(secondary_file),
+                require_absent_bound_root=True,
             )
             removed_read_evidence = structured_removed_evidence(
                 removed_read, "read_file",
                 expected_root_id=secondary_root_identity["id"],
                 expected_root_path=secondary_root_identity["path"],
                 expected_root_type=secondary_root_identity["type"],
+                expected_file_path=str(secondary_file),
+                require_absent_bound_root=True,
             )
             removed_structure_evidence = structured_removed_evidence(
                 structure_after_remove, "get_code_structure",
                 expected_root_id=secondary_root_identity["id"],
                 expected_root_path=secondary_root_identity["path"],
                 expected_root_type=secondary_root_identity["type"],
+                expected_file_path=str(secondary_file),
+                require_absent_bound_root=True,
             )
             selection_after_remove_evidence = structured_success_evidence(
                 selection_after_remove, "manage_selection",
@@ -2750,9 +4930,17 @@ def smoke_command(args: argparse.Namespace) -> int:
             expected_file_path=plan["dataset"]["read_path"], expected_file_type="file",
             expected_content=plan["dataset"]["read_marker"],
         )
+        parent_completion = wait_agent_success(
+            runner, parent_session, expected_output="RPCE_ACTIVE_PARENT_OK",
+            expected_marker=plan["dataset"]["search_marker"],
+            expected_file_path=plan["dataset"]["read_path"],
+            context_id=parent_context, expected_pairs=10,
+        )
+        relevant_agent_status[parent_session] = str(parent_completion["status"])
         results["active-agent-tab-binding"] = {
             "ok": (
                 bool(parent_activity)
+                and parent_started_in_worktree
                 and all(item["ok"] for item in parent_activity)
                 and all(
                     item.get("overlapped_mutation") is True
@@ -2761,7 +4949,10 @@ def smoke_command(args: argparse.Namespace) -> int:
                 )
                 and surviving_search_evidence["ok"]
                 and surviving_read_evidence["ok"]
+                and parent_completion["ok"]
             ),
+            "parent_started_in_worktree": parent_started_in_worktree,
+            "parent_terminal_success": parent_completion,
             "activity_checks": parent_activity,
             "context_id_unchanged": all(
                 item.get("context_id") == parent_context for item in parent_activity
@@ -2856,6 +5047,1309 @@ def smoke_command(args: argparse.Namespace) -> int:
     return 0 if summary["status"] == "completed" else 1
 
 
+def codemap_gate_command(args: argparse.Namespace) -> int:
+    if not args.confirm_live_debug_app or not args.confirm_dedicated_workspace:
+        raise BenchmarkError("codemap-gate requires live-app and dedicated-workspace confirmations")
+    if not args.confirm_synthetic_allowlisted_source:
+        raise BenchmarkError("codemap-gate requires explicit synthetic/allowlisted-source confirmation")
+    if args.cold_samples < CODEMAP_GATE_MINIMUM_COLD_SAMPLES:
+        raise BenchmarkError(
+            f"codemap-gate requires at least {CODEMAP_GATE_MINIMUM_COLD_SAMPLES} cold samples"
+        )
+    if args.warm_samples < CODEMAP_GATE_MINIMUM_WARM_SAMPLES:
+        raise BenchmarkError(
+            f"codemap-gate requires at least {CODEMAP_GATE_MINIMUM_WARM_SAMPLES} warm samples"
+        )
+
+    plan = load_plan(Path(args.plan).expanduser().resolve(strict=True))
+    cli = resolve_cli(args.cli)
+    root = Path(plan["scope"]["root_path"]).resolve(strict=True)
+    validate_planned_base_commit(plan, root)
+    fixture, sanitized_fixture = load_codemap_gate_fixture(
+        Path(args.fixture).expanduser().resolve(strict=True),
+        plan=plan,
+        cold_samples=args.cold_samples,
+    )
+    baseline, baseline_acceptance = validate_codemap_baseline(
+        Path(args.baseline).expanduser().resolve(strict=True),
+        Path(args.baseline_ledger).expanduser().resolve(strict=True),
+        expected_ledger_sha256=args.baseline_ledger_sha256,
+        fixture_sha256=sanitized_fixture["fixture_sha256"],
+        cold_samples=args.cold_samples,
+        warm_samples=args.warm_samples,
+    )
+
+    artifact = make_artifact(Path(args.output_root), "codemap-gate")
+    runner = CLIRunner(
+        cli, plan["scope"]["window_id"], plan["scope"]["context_id"], root, artifact
+    )
+    structure_schema = runner.describe("get_code_structure")
+    secure_write(
+        artifact / "get-code-structure-schema.txt", structure_schema.encode(), exclusive=True
+    )
+    if re.search(r"\bwait_ms\b", structure_schema):
+        raise BenchmarkError(
+            "get_code_structure still advertises model-facing wait_ms; "
+            "demand wait must be an internal fixed 10-second contract"
+        )
+    save_json(artifact / "plan.json", plan, exclusive=True)
+    save_json(artifact / "codemap-fixture.json", fixture, exclusive=True)
+    state: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "codemap-gate",
+        "plan_sha256": plan["plan_sha256"],
+        "sessions": [],
+        "worktrees": [],
+        "added_roots": [],
+        "codemap_holds": [],
+        "memory_stopped": False,
+        "memory_session_id": None,
+        "route_restored": True,
+        "scope_reset": True,
+        "benchmark_gate_unchanged": False,
+    }
+    save_json(artifact / "state.json", state)
+    samples: list[dict[str, Any]] = []
+    results: dict[str, dict[str, Any]] = {}
+    cleanup: list[dict[str, Any]] = []
+    owned_dirs: list[Path] = []
+    privacy_allowlist: list[Path] = [root]
+    privacy_prompt_allowlist: list[str] = []
+    active_hold: str | None = None
+    active_hold_target_root_id: str | None = None
+    watcher_paths: list[str] = []
+    memory_started = False
+    memory_session_id: str | None = None
+    operational_error: str | None = None
+    resources: Any = {}
+
+    try:
+        verify_scope(runner, plan)
+        require_benchmark_gate(runner)
+        verify_disposable_target(runner, plan, require_only_planned_root=True)
+        runtime = runner.call(
+            "codemap-root-identity", DEBUG_TOOL,
+            {"op": "mcp_read_search_runtime_snapshot", "window_id": plan["scope"]["window_id"],
+             "recent_publication_limit": 0, "root_limit": 256}, check=False,
+        )
+        if not call_succeeded(runtime):
+            raise BenchmarkError("codemap root identity snapshot failed")
+        root_identity = runtime_root_identity(runtime, str(root))
+        start_snapshot = codemap_debug_action(runner, plan, "codemap_projection_snapshot")["snapshot"]
+        memory_session_id, _ = start_owned_memory_sampler(runner, artifact.name)
+        state["memory_session_id"] = memory_session_id
+        save_json(artifact / "state.json", state)
+        memory_started = True
+
+        cold_provenance: list[dict[str, Any]] = []
+        for cohort, key in (("individual", "individuals"), ("directory", "directories")):
+            for index, item in enumerate(fixture[key][:args.cold_samples], start=1):
+                expected_path = item.get("expected_file", item["path"])
+                tree_path = (
+                    str(Path(expected_path).parent)
+                )
+                preflight_tree = runner.call(
+                    f"codemap-cold-provenance-{cohort}-{index}", "get_file_tree",
+                    {"type": "files", "mode": "full", "path": tree_path,
+                     "max_depth": 1}, check=False,
+                )
+                tree_payload = tool_payload(preflight_tree, "get_file_tree")
+                marker_was_absent = (
+                    f"{Path(expected_path).name} +" not in str(tree_payload.get("tree") or "")
+                )
+                cold_provenance.append({
+                    "scenario": cohort,
+                    "path_sha256": sha256_bytes(item["path"].encode()),
+                    "marker_was_absent": marker_was_absent,
+                })
+        results["cold-fixture-provenance"] = {
+            "ok": len(cold_provenance) == args.cold_samples * 2
+            and all(item["marker_was_absent"] for item in cold_provenance),
+            "probes": cold_provenance,
+        }
+
+        def run_structure_sample(
+            cohort: str,
+            temperature: str,
+            ordinal: int,
+            item: dict[str, str],
+        ) -> dict[str, Any]:
+            requested_path = item["path"]
+            expected_path = item.get("expected_file", requested_path)
+            limits = {"max_files": 100, "max_edges": 400, "max_codemap_tokens": 12_000}
+            call = runner.timed_call(
+                f"codemap-{cohort}-{temperature}-{ordinal}",
+                "get_code_structure",
+                {"scope": "paths", "paths": [requested_path], "limits": limits,
+                 "context_id": plan["scope"]["context_id"]},
+                timeout=CODEMAP_GATE_WAIT_MILLISECONDS / 1000
+                + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS / 1000 + 5,
+                check=False,
+            )
+            elapsed_ms = (call.finished_ns - call.started_ns) / 1_000_000
+            invalid: list[str] = []
+            evidence: dict[str, Any] | None = None
+            tree_evidence: dict[str, Any] | None = None
+            tree_elapsed_ms: float | None = None
+            try:
+                if elapsed_ms > CODEMAP_GATE_WAIT_MILLISECONDS + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS:
+                    raise BenchmarkError("structure request exceeded the 10s + 500ms contract")
+                evidence = codemap_structure_evidence(
+                    call.response,
+                    expected_root_id=root_identity["id"],
+                    expected_root_path=root_identity["path"],
+                    expected_root_type=root_identity["type"],
+                    expected_file_path=expected_path,
+                    expected_marker=item["marker"],
+                    expected_file_type=plan["dataset"]["code_file_type"],
+                )
+                tree_call = runner.timed_call(
+                    f"codemap-tree-{cohort}-{temperature}-{ordinal}",
+                    "get_file_tree",
+                    {"type": "files", "mode": "full",
+                     "path": str(Path(expected_path).parent), "max_depth": 1},
+                    timeout=60, check=False,
+                )
+                tree_elapsed_ms = (tree_call.finished_ns - tree_call.started_ns) / 1_000_000
+                tree_evidence = codemap_tree_marker_evidence(
+                    tree_call.response,
+                    expected_context_id=plan["scope"]["context_id"],
+                    expected_root_path=root_identity["path"],
+                    requested_parent=str(Path(expected_path).parent),
+                    expected_file_path=expected_path,
+                )
+            except BenchmarkError as error:
+                invalid.append(str(error))
+            record = {
+                "schema_version": SCHEMA_VERSION,
+                "scenario": f"{temperature}-{cohort}",
+                "ordinal": ordinal,
+                "path_sha256": sha256_bytes(requested_path.encode()),
+                "expected_file_sha256": sha256_bytes(expected_path.encode()),
+                "wait_ms_omitted": True,
+                "internal_wait_contract_ms": CODEMAP_GATE_WAIT_MILLISECONDS,
+                "duration_ms": elapsed_ms,
+                "tree_marker_duration_ms": tree_elapsed_ms,
+                "valid": not invalid,
+                "invalid_reasons": invalid,
+                "structure": evidence,
+                "tree_marker": tree_evidence,
+            }
+            append_ndjson(artifact / "codemap-samples.ndjson", record)
+            return record
+
+        search_durations: list[float] = []
+        read_durations: list[float] = []
+        readiness_durations: list[float] = []
+
+        def record_responsiveness_sample(label: str, item: dict[str, str]) -> None:
+            search_call = runner.timed_call(
+                f"codemap-saturated-search-{label}", "file_search",
+                {"pattern": item["marker"], "regex": False, "mode": "content",
+                 "filter": {"paths": [item["path"]]}, "max_results": 20,
+                 "context_id": plan["scope"]["context_id"]}, check=False,
+            )
+            read_call = runner.timed_call(
+                f"codemap-saturated-read-{label}", "read_file",
+                {"path": item["path"], "start_line": 1, "limit": 80,
+                 "context_id": plan["scope"]["context_id"]}, check=False,
+            )
+            readiness_call = runner.timed_call(
+                f"codemap-saturated-root-{label}", DEBUG_TOOL,
+                {"op": "mcp_read_search_runtime_snapshot", "window_id": plan["scope"]["window_id"],
+                 "recent_publication_limit": 0, "root_limit": 256}, check=False,
+            )
+            search_ok = structured_success_evidence(
+                search_call.response, "file_search",
+                expected_root_id=root_identity["id"], expected_root_path=root_identity["path"],
+                expected_root_type=root_identity["type"], expected_file_path=item["path"],
+                expected_file_type="file", expected_content=item["marker"],
+            )["ok"]
+            read_ok = structured_success_evidence(
+                read_call.response, "read_file",
+                expected_root_id=root_identity["id"], expected_root_path=root_identity["path"],
+                expected_root_type=root_identity["type"], expected_file_path=item["path"],
+                expected_file_type="file", expected_content=item["marker"],
+            )["ok"]
+            if not search_ok or not read_ok or not call_succeeded(readiness_call.response):
+                raise BenchmarkError("saturated root/search/read responsiveness sample failed")
+            if runtime_root_identity(readiness_call.response, str(root)) != root_identity:
+                raise BenchmarkError("saturated root readiness changed canonical identity")
+            search_durations.append((search_call.finished_ns - search_call.started_ns) / 1_000_000)
+            read_durations.append((read_call.finished_ns - read_call.started_ns) / 1_000_000)
+            readiness_durations.append(
+                (readiness_call.finished_ns - readiness_call.started_ns) / 1_000_000
+            )
+
+        for cohort, key in (("individual", "individuals"), ("directory", "directories")):
+            cold_items = fixture[key][:args.cold_samples]
+            with ThreadPoolExecutor(max_workers=min(4, args.cold_samples)) as pool:
+                futures = {
+                    pool.submit(run_structure_sample, cohort, "cold", index, item): index
+                    for index, item in enumerate(cold_items, start=1)
+                }
+                for index, item in enumerate(
+                    fixture["individuals"][:args.cold_samples // 2], start=1
+                ):
+                    record_responsiveness_sample(f"{cohort}-{index}", item)
+                cold_records = [future.result() for future in as_completed(futures)]
+            samples.extend(sorted(cold_records, key=lambda item: item["ordinal"]))
+            warm_items = [cold_items[index % len(cold_items)] for index in range(args.warm_samples)]
+            with ThreadPoolExecutor(max_workers=min(4, args.warm_samples)) as pool:
+                futures = {
+                    pool.submit(run_structure_sample, cohort, "warm", index, item): index
+                    for index, item in enumerate(warm_items, start=1)
+                }
+                warm_records = [future.result() for future in as_completed(futures)]
+            samples.extend(sorted(warm_records, key=lambda item: item["ordinal"]))
+
+        # Directory overflow must fail before any codemap admission or build.
+        before_overflow = codemap_debug_action(
+            runner, plan, "codemap_projection_snapshot"
+        )["snapshot"]
+        overflow = runner.call(
+            "codemap-directory-overflow", "get_code_structure",
+            {"scope": "paths", "paths": [fixture["overflow_directory"]],
+             "limits": {"max_files": 1, "max_edges": 1, "max_codemap_tokens": 256},
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        overflow_evidence = codemap_budget_evidence(overflow)
+        after_overflow = codemap_debug_action(
+            runner, plan, "codemap_projection_snapshot"
+        )["snapshot"]
+        overflow_deltas = {
+            key: codemap_counter_delta(before_overflow, after_overflow, key)
+            for key in (
+                "builds", "materializations", "manifest_writes",
+                "projection_demands_acquired", "projection_batches_queued",
+                "projection_batches_started", "projection_catalog_pages",
+                "projection_catalog_candidates", "projection_builds_started",
+                "projection_segments_published",
+            )
+        }
+        results["directory-overflow"] = {
+            "ok": all(value == 0 for value in overflow_deltas.values()),
+            "evidence": overflow_evidence,
+            "downstream_counter_deltas": overflow_deltas,
+        }
+
+        # Non-Git roots must serve search/read while producing no codemap engine work.
+        non_git = Path(tempfile.mkdtemp(prefix="rpce-codemap-gate-nongit-"))
+        owned_dirs.append(non_git)
+        privacy_allowlist.append(non_git)
+        non_git_ownership = create_codemap_temp_ownership_marker(
+            non_git, artifact_id=artifact.name, plan_sha256=plan["plan_sha256"]
+        )
+        non_git_marker = f"RPCE_CODEMAP_NON_GIT_{uuid.uuid4().hex}"
+        non_git_file = non_git / "NonGit.swift"
+        non_git_file.write_text(f"struct {non_git_marker} {{}}\n", encoding="utf-8")
+        added_non_git = runner.call(
+            "codemap-add-non-git", "manage_workspaces",
+            {"action": "add_folder", "workspace": plan["scope"]["workspace_id"],
+             "folder_path": str(non_git), "window_id": plan["scope"]["window_id"]}, check=False,
+        )
+        if not call_succeeded(added_non_git):
+            raise BenchmarkError("failed to add owned non-Git root")
+        state["added_roots"].append({
+            "path": str(non_git), "kind": "non-git", "owned": True,
+            **non_git_ownership,
+        })
+        save_json(artifact / "state.json", state)
+        non_git_runtime = runner.call(
+            "codemap-non-git-root", DEBUG_TOOL,
+            {"op": "mcp_read_search_runtime_snapshot", "window_id": plan["scope"]["window_id"],
+             "recent_publication_limit": 0, "root_limit": 256}, check=False,
+        )
+        non_git_identity = runtime_root_identity(non_git_runtime, str(non_git))
+        before_non_git = codemap_debug_action(
+            runner, plan, "codemap_root_snapshot", target_root_id=non_git_identity["id"]
+        )
+        non_git_search = runner.call(
+            "codemap-non-git-search", "file_search",
+            {"pattern": non_git_marker, "regex": False,
+             "filter": {"paths": [str(non_git_file)]},
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        non_git_read = runner.call(
+            "codemap-non-git-read", "read_file",
+            {"path": str(non_git_file), "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        non_git_structure = runner.call(
+            "codemap-non-git-structure", "get_code_structure",
+            {"scope": "paths", "paths": [str(non_git_file)],
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        after_non_git = codemap_debug_action(
+            runner, plan, "codemap_root_snapshot", target_root_id=non_git_identity["id"]
+        )
+        non_git_search_ok = structured_success_evidence(
+            non_git_search, "file_search", expected_root_id=non_git_identity["id"],
+            expected_root_path=non_git_identity["path"], expected_root_type=non_git_identity["type"],
+            expected_file_path=str(non_git_file), expected_file_type="file",
+            expected_content=non_git_marker,
+        )["ok"]
+        non_git_read_ok = structured_success_evidence(
+            non_git_read, "read_file", expected_root_id=non_git_identity["id"],
+            expected_root_path=non_git_identity["path"], expected_root_type=non_git_identity["type"],
+            expected_file_path=str(non_git_file), expected_file_type="file",
+            expected_content=non_git_marker,
+        )["ok"]
+        non_git_terminal = structured_removed_evidence(
+            non_git_structure, "get_code_structure", expected_root_id=non_git_identity["id"],
+            expected_root_path=non_git_identity["path"], expected_root_type=non_git_identity["type"],
+        )
+        non_git_deltas = {
+            key: codemap_counter_delta(before_non_git["snapshot"], after_non_git["snapshot"], key)
+            for key in ("builds", "projection_batches_started", "projection_catalog_candidates")
+        }
+        non_git_engine_absent = (
+            find_value(before_non_git["response"], "engine_present") is False
+            and find_value(after_non_git["response"], "engine_present") is False
+        )
+        results["non-git-zero-codemap-work"] = {
+            "ok": non_git_search_ok and non_git_read_ok and non_git_terminal["ok"]
+            and non_git_engine_absent and all(value == 0 for value in non_git_deltas.values()),
+            "typed_terminal": non_git_terminal,
+            "engine_present": not non_git_engine_absent,
+            "counter_deltas": non_git_deltas,
+        }
+
+        # Watcher lifecycle requires current structure and marker publication at each live state.
+        watcher_dir = fixture["watcher_directory"]
+        watcher_old = f"{watcher_dir}/{artifact.name}.swift"
+        watcher_new = f"{watcher_dir}/{artifact.name}-renamed.swift"
+        watcher_paths.extend([watcher_old, watcher_new])
+        watcher_v1 = f"RPCE_CODEMAP_WATCHER_{uuid.uuid4().hex}_V1"
+        watcher_v2 = watcher_v1.replace("_V1", "_V2")
+        created = runner.call(
+            "codemap-watcher-create", "file_actions",
+            {"action": "create", "path": str(root / watcher_old),
+             "content": f"struct {watcher_v1} {{}}\n",
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        created_structure = runner.call(
+            "codemap-watcher-create-structure", "get_code_structure",
+            {"scope": "paths", "paths": [watcher_old],
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        create_evidence = codemap_structure_evidence(
+            created_structure, expected_root_id=root_identity["id"],
+            expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
+            expected_file_path=watcher_old, expected_marker=watcher_v1,
+            expected_file_type=plan["dataset"]["code_file_type"],
+        )
+        create_tree = runner.call(
+            "codemap-watcher-create-tree", "get_file_tree",
+            {"type": "files", "mode": "full", "path": watcher_dir, "max_depth": 1}, check=False,
+        )
+        create_marker = codemap_tree_marker_evidence(
+            create_tree, expected_context_id=plan["scope"]["context_id"],
+            expected_root_path=root_identity["path"], requested_parent=watcher_dir,
+            expected_file_path=watcher_old,
+        )
+        edited = runner.call(
+            "codemap-watcher-edit", "apply_edits",
+            {"path": watcher_old, "search": watcher_v1, "replace": watcher_v2,
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        edited_structure = runner.call(
+            "codemap-watcher-edit-structure", "get_code_structure",
+            {"scope": "paths", "paths": [watcher_old],
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        edit_evidence = codemap_structure_evidence(
+            edited_structure, expected_root_id=root_identity["id"],
+            expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
+            expected_file_path=watcher_old, expected_marker=watcher_v2,
+            expected_file_type=plan["dataset"]["code_file_type"],
+        )
+        edit_tree = runner.call(
+            "codemap-watcher-edit-tree", "get_file_tree",
+            {"type": "files", "mode": "full", "path": watcher_dir, "max_depth": 1}, check=False,
+        )
+        edit_marker = codemap_tree_marker_evidence(
+            edit_tree, expected_context_id=plan["scope"]["context_id"],
+            expected_root_path=root_identity["path"], requested_parent=watcher_dir,
+            expected_file_path=watcher_old,
+        )
+        moved = runner.call(
+            "codemap-watcher-rename", "file_actions",
+            {"action": "move", "path": str(root / watcher_old),
+             "new_path": str(root / watcher_new),
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        moved_structure = runner.call(
+            "codemap-watcher-rename-structure", "get_code_structure",
+            {"scope": "paths", "paths": [watcher_new],
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        rename_evidence = codemap_structure_evidence(
+            moved_structure, expected_root_id=root_identity["id"],
+            expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
+            expected_file_path=watcher_new, expected_marker=watcher_v2,
+            expected_file_type=plan["dataset"]["code_file_type"],
+        )
+        watcher_tree = runner.call(
+            "codemap-watcher-tree", "get_file_tree",
+            {"type": "files", "mode": "full", "path": watcher_dir, "max_depth": 1}, check=False,
+        )
+        watcher_marker = codemap_tree_marker_evidence(
+            watcher_tree, expected_context_id=plan["scope"]["context_id"],
+            expected_root_path=root_identity["path"], requested_parent=watcher_dir,
+            expected_file_path=watcher_new,
+        )
+        deleted = runner.call(
+            "codemap-watcher-delete", "file_actions",
+            {"action": "delete", "path": str(root / watcher_new),
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        deleted_structure = runner.call(
+            "codemap-watcher-delete-structure", "get_code_structure",
+            {"scope": "paths", "paths": [watcher_new],
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        deleted_payload = tool_payload(deleted_structure, "get_code_structure")
+        deleted_issues = deleted_payload.get("issues")
+        deleted_issue_codes = sorted({
+            str(issue.get("code")) for issue in deleted_issues or []
+            if isinstance(issue, dict) and isinstance(issue.get("code"), str)
+        })
+        deleted_tree = runner.call(
+            "codemap-watcher-delete-tree", "get_file_tree",
+            {"type": "files", "mode": "full", "path": watcher_dir, "max_depth": 1}, check=False,
+        )
+        deleted_tree_payload = tool_payload(deleted_tree, "get_file_tree")
+        delete_absent = (
+            deleted_payload.get("status") == "unavailable"
+            and deleted_payload.get("files") == []
+            and "path_not_found" in deleted_issue_codes
+            and f"{Path(watcher_new).name} +" not in str(deleted_tree_payload.get("tree") or "")
+        )
+        results["watcher-create-edit-rename-delete"] = {
+            "ok": all(call_succeeded(item) for item in (created, edited, moved, deleted))
+            and delete_absent,
+            "create": create_evidence, "edit": edit_evidence,
+            "rename": rename_evidence,
+            "markers": {"create": create_marker, "edit": edit_marker, "rename": watcher_marker},
+            "delete": {"status": deleted_payload.get("status"),
+                       "issue_codes": deleted_issue_codes, "marker_absent": delete_absent},
+        }
+
+        # The DEBUG hold pauses only future projection-batch admission; timeout must be real.
+        hold_result = codemap_debug_action(
+            runner, plan, "codemap_projection_hold_acquire", expires_ms=30_000
+        )
+        hold_id = find_value(hold_result["response"], "hold_id")
+        if not isinstance(hold_id, str):
+            raise BenchmarkError("DEBUG codemap hold acquire omitted hold_id")
+        active_hold = hold_id
+        active_hold_target_root_id = root_identity["id"]
+        state["codemap_holds"].append({
+            "hold_id": hold_id, "target_root_id": root_identity["id"], "released": False,
+        })
+        save_json(artifact / "state.json", state)
+        timeout_path = f"{watcher_dir}/{artifact.name}-timeout.swift"
+        watcher_paths.append(timeout_path)
+        timeout_marker = f"RPCE_CODEMAP_TIMEOUT_{uuid.uuid4().hex}"
+        timeout_create = runner.call(
+            "codemap-timeout-create", "file_actions",
+            {"action": "create", "path": str(root / timeout_path),
+             "content": f"struct {timeout_marker} {{}}\n",
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        timeout_call = runner.timed_call(
+            "codemap-held-timeout", "get_code_structure",
+            {"scope": "paths", "paths": [timeout_path],
+             "expand": {"direction": "referrers", "max_depth": 1},
+             "context_id": plan["scope"]["context_id"]},
+            timeout=CODEMAP_GATE_WAIT_MILLISECONDS / 1000
+            + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS / 1000 + 5,
+            check=False,
+        )
+        timeout_elapsed_ms = (timeout_call.finished_ns - timeout_call.started_ns) / 1_000_000
+        timeout_evidence = codemap_retryable_terminal_evidence(
+            timeout_call.response, expected_status="timeout", expected_issue_code="readiness_timeout"
+        )
+        if not (
+            CODEMAP_GATE_WAIT_MILLISECONDS - CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
+            <= timeout_elapsed_ms
+            <= CODEMAP_GATE_WAIT_MILLISECONDS + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
+        ):
+            raise BenchmarkError("held timeout did not honor the 10s ± 500ms monotonic contract")
+        released = codemap_debug_action(
+            runner, plan, "codemap_projection_hold_release", hold_id=hold_id
+        )
+        if find_value(released["response"], "released") is not True:
+            raise BenchmarkError("DEBUG codemap hold was not owned/released")
+        active_hold = None
+        active_hold_target_root_id = None
+        state["codemap_holds"][-1]["released"] = True
+        save_json(artifact / "state.json", state)
+        timeout_retry = runner.call(
+            "codemap-timeout-retry", "get_code_structure",
+            {"scope": "paths", "paths": [timeout_path],
+             "expand": {"direction": "referrers", "max_depth": 1},
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        retry_evidence = codemap_structure_evidence(
+            timeout_retry, expected_root_id=root_identity["id"],
+            expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
+            expected_file_path=timeout_path, expected_marker=timeout_marker,
+            expected_file_type=plan["dataset"]["code_file_type"],
+        )
+        results["explicit-10s-timeout-contract"] = {
+            "ok": call_succeeded(timeout_create),
+            "elapsed_ms": timeout_elapsed_ms,
+            "timeout": timeout_evidence,
+            "retry": retry_evidence,
+            "future_admission_hold_released": True,
+        }
+
+        # Real agent_run transcript: multiple file/directory calls, marker trees, inherited child.
+        parent_calls: list[tuple[str, dict[str, Any]]] = []
+        for item in fixture["individuals"][:2]:
+            parent_calls.extend([
+                ("get_code_structure", {"paths": [item["path"]], "omit_wait_ms": True,
+                                        "expected_file": item["path"], "marker": item["marker"]}),
+                ("get_file_tree", {"path": str(Path(item["path"]).parent),
+                                   "expected_file": item["path"]}),
+            ])
+        for item in fixture["directories"][:2]:
+            parent_calls.extend([
+                ("get_code_structure", {"paths": [item["path"]], "omit_wait_ms": True,
+                                        "expected_file": item["expected_file"],
+                                        "marker": item["marker"]}),
+                ("get_file_tree", {"path": str(Path(item["expected_file"]).parent),
+                                   "expected_file": item["expected_file"]}),
+            ])
+        parent_branch = safe_name(f"rpce-bench-{artifact.name}-i1-o1")[:120]
+        parent_prompt = codemap_agent_prompt(parent_calls, sentinel=CODEMAP_GATE_SENTINEL)
+        privacy_prompt_allowlist.append(parent_prompt)
+        parent = runner.call(
+            "codemap-agent-parent", "agent_run",
+            {"op": "start", "model_id": "explore", "detach": True,
+             "message": parent_prompt,
+             "session_name": "RPCE codemap gate parent", "worktree_create": True,
+             "worktree_branch": parent_branch,
+             "worktree_base_ref": plan["dataset"]["base_commit_oid"],
+             "worktree_label": f"RPCE codemap {artifact.name}",
+             "context_id": plan["scope"]["context_id"]}, timeout=180,
+        )
+        parent_session = response_session_id(parent)
+        parent_context = response_context_id(parent)
+        if parent_context is None:
+            raise BenchmarkError("codemap parent omitted context_id")
+        parent_worktree = discover_owned_worktree(parent, root, parent_branch)
+        privacy_allowlist.append(parent_worktree)
+        state["sessions"].append({
+            "session_id": parent_session, "context_id": parent_context,
+            "terminal": False, "scenario": "multiple-files-directories",
+        })
+        state["worktrees"].append({
+            "path": str(parent_worktree), "owned": True, "branch": parent_branch,
+        })
+        save_json(artifact / "state.json", state)
+        child_calls = [
+            ("get_code_structure", {"paths": [fixture["individuals"][5]["path"]],
+                                    "omit_wait_ms": True,
+                                    "expected_file": fixture["individuals"][5]["path"],
+                                    "marker": fixture["individuals"][5]["marker"]}),
+            ("get_file_tree", {"path": str(Path(fixture["individuals"][5]["path"]).parent),
+                               "expected_file": fixture["individuals"][5]["path"]}),
+        ]
+        child_prompt = codemap_agent_prompt(child_calls, sentinel=CODEMAP_GATE_SENTINEL)
+        privacy_prompt_allowlist.append(child_prompt)
+        child = runner.call(
+            "codemap-agent-child", "agent_run",
+            {"op": "start", "model_id": "explore", "detach": True,
+             "inherit_worktree": True,
+             "message": child_prompt,
+             "session_name": "RPCE codemap inherited child", "context_id": parent_context},
+            timeout=180, check=False, context_id=parent_context,
+        )
+        child_session = response_session_id(child)
+        child_context = response_context_id(child)
+        if child_context is None:
+            raise BenchmarkError("codemap inherited child omitted context_id")
+        state["sessions"].append({
+            "session_id": child_session, "context_id": child_context,
+            "terminal": False, "scenario": "inherited-worktree-child",
+        })
+        save_json(artifact / "state.json", state)
+        child_result = wait_codemap_agent_success(
+            runner, child_session, child_context,
+            start_response=child,
+            expected_output=CODEMAP_GATE_SENTINEL, expected_calls=child_calls,
+        )
+        if not child_result["ok"]:
+            raise BenchmarkError("fail-fast inherited child inference probe failed")
+        state["sessions"][-1]["terminal"] = child_result["status"] in TERMINAL_STATES
+        state["sessions"][-1]["status"] = child_result["status"]
+        parent_result = wait_codemap_agent_success(
+            runner, parent_session, parent_context,
+            start_response=parent,
+            expected_output=CODEMAP_GATE_SENTINEL, expected_calls=parent_calls,
+        )
+        if not parent_result["ok"]:
+            raise BenchmarkError("fail-fast multi-path parent inference probe failed")
+        state["sessions"][-2]["terminal"] = parent_result["status"] in TERMINAL_STATES
+        state["sessions"][-2]["status"] = parent_result["status"]
+        child_direct = agent_codemap_direct_evidence(
+            runner, plan, start_response=child, session_id=child_session,
+            context_id=child_context, worktree_path=parent_worktree,
+            expected_calls=child_calls,
+        )
+        parent_direct = agent_codemap_direct_evidence(
+            runner, plan, start_response=parent, session_id=parent_session,
+            context_id=parent_context, worktree_path=parent_worktree,
+            expected_calls=parent_calls,
+        )
+        inheritance = child_inheritance_evidence(
+            parent, child, parent_context_id=parent_context,
+            parent_worktree_path=str(parent_worktree),
+        )
+        results["agent-multiple-files-directories"] = {
+            "ok": parent_result["ok"] and parent_direct["ok"],
+            "transcript": parent_result, "structured": parent_direct,
+        }
+        results["inherited-worktree-child"] = {
+            "ok": child_result["ok"] and inheritance["ok"] and child_direct["ok"],
+            "transcript": child_result,
+            "inheritance": inheritance,
+            "structured": child_direct,
+        }
+        save_json(artifact / "state.json", state)
+
+        # Concurrent ordinary/linked-worktree agents plus active add/remove root churn.
+        linked_parent = Path(tempfile.mkdtemp(prefix="rpce-codemap-gate-linked-"))
+        owned_dirs.append(linked_parent)
+        linked_root = linked_parent / "worktree"
+        linked_branch = safe_name(f"rpce-bench-{artifact.name}-i3-o1")[:120]
+        run_local(
+            ["git", "worktree", "add", "-b", linked_branch, str(linked_root),
+             plan["dataset"]["base_commit_oid"]], root
+        )
+        privacy_allowlist.append(linked_root)
+        state["worktrees"].append({
+            "path": str(linked_root), "owned": True, "branch": linked_branch,
+        })
+        primary_probe_calls = [
+            ("get_code_structure", {"paths": [fixture["individuals"][6]["path"]],
+                                    "omit_wait_ms": True,
+                                    "expected_file": fixture["individuals"][6]["path"],
+                                    "marker": fixture["individuals"][6]["marker"]}),
+            ("get_file_tree", {"path": str(Path(fixture["individuals"][6]["path"]).parent),
+                               "expected_file": fixture["individuals"][6]["path"]}),
+        ]
+
+        def primary_structure_pressure(label: str) -> TimedCall:
+            return runner.timed_call(
+                label, "get_code_structure",
+                {"scope": "paths", "paths": [fixture["directories"][6]["path"]],
+                 "limits": {"max_files": 100, "max_edges": 400,
+                            "max_codemap_tokens": 12_000},
+                 "context_id": plan["scope"]["context_id"]}, check=False,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pressure_future = pool.submit(primary_structure_pressure, "codemap-primary-during-add")
+            add_future = pool.submit(
+                runner.timed_call, "codemap-add-linked-root", "manage_workspaces",
+                {"action": "add_folder", "workspace": plan["scope"]["workspace_id"],
+                 "folder_path": str(linked_root), "window_id": plan["scope"]["window_id"]},
+                check=False,
+            )
+            pressure_add, add_linked = pressure_future.result(), add_future.result()
+        if not call_succeeded(add_linked) or not call_succeeded(pressure_add):
+            raise BenchmarkError("linked-root add or concurrent primary structure failed")
+        state["added_roots"].append({"path": str(linked_root), "kind": "git-worktree", "owned": True})
+        save_json(artifact / "state.json", state)
+        secondary_calls = [
+            ("get_code_structure", {"paths": [fixture["individuals"][7]["path"]],
+                                    "omit_wait_ms": True,
+                                    "expected_file": fixture["individuals"][7]["path"],
+                                    "marker": fixture["individuals"][7]["marker"]}),
+            ("get_file_tree", {"path": str(Path(fixture["individuals"][7]["path"]).parent),
+                               "expected_file": fixture["individuals"][7]["path"]}),
+        ]
+        linked_runtime = runner.call(
+            "codemap-linked-root-identity", DEBUG_TOOL,
+            {"op": "mcp_read_search_runtime_snapshot",
+             "window_id": plan["scope"]["window_id"],
+             "recent_publication_limit": 0, "root_limit": 256}, check=False,
+        )
+        linked_identity = runtime_root_identity(linked_runtime, str(linked_root))
+        linked_prewarm_path = str(linked_root / fixture["individuals"][7]["path"])
+        linked_prewarm_parent = str(Path(linked_prewarm_path).parent)
+        linked_prewarm = runner.call(
+            "codemap-linked-prewarm", "get_code_structure",
+            {"scope": "paths", "paths": [linked_prewarm_path],
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        linked_prewarm_evidence = codemap_structure_evidence(
+            linked_prewarm, expected_root_id=linked_identity["id"],
+            expected_root_path=linked_identity["path"],
+            expected_root_type=linked_identity["type"],
+            expected_file_path=linked_prewarm_path,
+            expected_marker=fixture["individuals"][7]["marker"],
+            expected_file_type=plan["dataset"]["code_file_type"],
+        )
+        linked_prewarm_tree = runner.call(
+            "codemap-linked-prewarm-tree", "get_file_tree",
+            {"type": "files", "mode": "full", "path": linked_prewarm_parent,
+             "max_depth": 1, "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        linked_prewarm_tree_evidence = codemap_tree_marker_evidence(
+            linked_prewarm_tree,
+            expected_context_id=plan["scope"]["context_id"],
+            expected_root_path=linked_identity["path"],
+            requested_parent=linked_prewarm_parent,
+            expected_file_path=linked_prewarm_path,
+        )
+        linked_hold = codemap_debug_action(
+            runner, plan, "codemap_projection_hold_acquire",
+            target_root_id=linked_identity["id"], expires_ms=60_000,
+        )
+        linked_hold_id = find_value(linked_hold["response"], "hold_id")
+        if not isinstance(linked_hold_id, str):
+            raise BenchmarkError("linked-root DEBUG hold acquire omitted hold_id")
+        active_hold = linked_hold_id
+        active_hold_target_root_id = linked_identity["id"]
+        state["codemap_holds"].append({
+            "hold_id": linked_hold_id,
+            "target_root_id": linked_identity["id"],
+            "released": False,
+        })
+        blocked_item = fixture["individuals"][8]
+        linked_blocked_path = str(linked_root / blocked_item["path"])
+        linked_blocked_calls = [*secondary_calls,
+            ("get_code_structure", {
+                "paths": [linked_blocked_path], "omit_wait_ms": True,
+                "expected_file": linked_blocked_path, "marker": blocked_item["marker"],
+            }),
+            ("get_file_tree", {
+                "path": str(Path(linked_blocked_path).parent),
+                "expected_file": linked_blocked_path,
+            }),
+        ]
+        save_json(artifact / "state.json", state)
+        ordinary_branch = safe_name(f"rpce-bench-{artifact.name}-i2-o1")[:120]
+        ordinary_prompt = codemap_agent_prompt(
+            primary_probe_calls, sentinel=CODEMAP_GATE_SENTINEL
+        )
+        linked_prompt = codemap_agent_prompt(
+            linked_blocked_calls, sentinel=CODEMAP_GATE_SENTINEL
+        )
+        privacy_prompt_allowlist.extend([ordinary_prompt, linked_prompt])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ordinary_future = pool.submit(
+                runner.call, "codemap-agent-ordinary", "agent_run",
+                {"op": "start", "model_id": "explore", "detach": True,
+                 "message": ordinary_prompt,
+                 "session_name": "RPCE codemap primary agent", "worktree_create": True,
+                 "worktree_branch": ordinary_branch,
+                 "worktree_base_ref": plan["dataset"]["base_commit_oid"],
+                 "worktree_label": f"RPCE codemap {artifact.name} primary",
+                 "context_id": plan["scope"]["context_id"]},
+                timeout=180,
+            )
+            linked_future = pool.submit(
+                runner.call, "codemap-agent-linked", "agent_run",
+                {"op": "start", "model_id": "explore", "detach": True,
+                 "message": linked_prompt,
+                 "session_name": "RPCE codemap linked root", "worktree": str(linked_root),
+                 "context_id": plan["scope"]["context_id"]},
+                timeout=180,
+            )
+            ordinary, linked = ordinary_future.result(), linked_future.result()
+        ordinary_session, linked_session = response_session_id(ordinary), response_session_id(linked)
+        ordinary_context, linked_context = response_context_id(ordinary), response_context_id(linked)
+        if ordinary_context is None or linked_context is None:
+            raise BenchmarkError("concurrent codemap agents omitted contexts")
+        ordinary_worktree = discover_owned_worktree(ordinary, root, ordinary_branch)
+        privacy_allowlist.append(ordinary_worktree)
+        state["worktrees"].append({
+            "path": str(ordinary_worktree), "owned": True, "branch": ordinary_branch,
+        })
+        linked_binding_ok = any(
+            Path(path).resolve() == linked_root.resolve()
+            for _, path in response_worktree_binding_set(linked)
+        )
+        ordinary_binding_ok = any(
+            Path(path).resolve() == ordinary_worktree.resolve()
+            for _, path in response_worktree_binding_set(ordinary)
+        )
+        state["sessions"].extend([
+            {"session_id": ordinary_session, "context_id": ordinary_context,
+             "terminal": False, "scenario": "concurrent-ordinary-root"},
+            {"session_id": linked_session, "context_id": linked_context,
+             "terminal": False, "scenario": "concurrent-linked-root"},
+        ])
+        save_json(artifact / "state.json", state)
+        linked_direct = agent_codemap_direct_evidence(
+            runner, plan, start_response=linked, session_id=linked_session,
+            context_id=linked_context, worktree_path=linked_root,
+            expected_calls=secondary_calls,
+        )
+        held_call_observed = wait_for_exact_agent_structure_call(
+            runner, session_id=linked_session, context_id=linked_context,
+            expected_path=linked_blocked_path,
+        )
+        linked_active_before_remove = poll_active_agent(
+            runner, linked_session, linked_context, "codemap-linked-before-remove"
+        )
+        ordinary_active_before_remove = poll_active_agent(
+            runner, ordinary_session, ordinary_context, "codemap-ordinary-before-remove"
+        )
+        if not linked_active_before_remove["ok"]:
+            raise BenchmarkError("linked-root agent terminalized before root removal")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pressure_future = pool.submit(primary_structure_pressure, "codemap-primary-during-remove")
+            remove_future = pool.submit(
+                runner.timed_call, "codemap-remove-linked-root", "manage_workspaces",
+                {"action": "remove_folder", "workspace": plan["scope"]["workspace_id"],
+                 "folder_path": str(linked_root), "window_id": plan["scope"]["window_id"]},
+                check=False,
+            )
+            pressure_remove, remove_linked = pressure_future.result(), remove_future.result()
+        if call_succeeded(remove_linked):
+            state["added_roots"] = [
+                item for item in state["added_roots"] if item.get("path") != str(linked_root)
+            ]
+        ordinary_active_after_remove = poll_active_agent(
+            runner, ordinary_session, ordinary_context, "codemap-ordinary-after-remove"
+        )
+        revoked_call = runner.call(
+            "codemap-linked-revoked-probe", "get_code_structure",
+            {"scope": "paths", "paths": [linked_blocked_path],
+             "context_id": linked_context}, check=False, context_id=linked_context,
+        )
+        linked_revoked = structured_removed_evidence(
+            revoked_call, "get_code_structure",
+            expected_root_id=linked_identity["id"],
+            expected_root_path=linked_identity["path"],
+            expected_root_type=linked_identity["type"],
+            expected_file_path=linked_blocked_path,
+            require_absent_bound_root=True,
+        )
+        linked_status = terminalize(runner, linked_session, linked_context)
+        linked_started_ns = find_value(linked, "_benchmark_started_monotonic_ns")
+        linked_inference_elapsed_ms = (
+            (time.monotonic_ns() - linked_started_ns) / 1_000_000
+            if isinstance(linked_started_ns, int) else None
+        )
+        state["sessions"][-1]["terminal"] = linked_status in TERMINAL_STATES
+        state["sessions"][-1]["status"] = linked_status
+        linked_log = runner.call(
+            "codemap-linked-revoked-log", "agent_manage",
+            {"op": "get_log", "session_id": linked_session, "offset": 0, "limit": 4000},
+            timeout=120, check=False, context_id=linked_context,
+        )
+        linked_transcript = verify_agent_codemap_revoked_transcript(
+            transcript_xml_from_log(linked_log), expected_first_path=linked_blocked_path,
+        )
+        linked_released = codemap_debug_action(
+            runner, plan, "codemap_projection_hold_release",
+            target_root_id=linked_identity["id"], hold_id=linked_hold_id,
+        )
+        if find_value(linked_released["response"], "released") is not True:
+            raise BenchmarkError("linked-root DEBUG hold was not released by its owner")
+        active_hold = None
+        active_hold_target_root_id = None
+        state["codemap_holds"][-1]["released"] = True
+        ordinary_result = wait_codemap_agent_success(
+            runner, ordinary_session, ordinary_context,
+            start_response=ordinary,
+            expected_output=CODEMAP_GATE_SENTINEL, expected_calls=primary_probe_calls,
+        )
+        if not ordinary_result["ok"]:
+            raise BenchmarkError("fail-fast concurrent ordinary inference probe failed")
+        state["sessions"][-2]["terminal"] = ordinary_result["status"] in TERMINAL_STATES
+        state["sessions"][-2]["status"] = ordinary_result["status"]
+        ordinary_direct = agent_codemap_direct_evidence(
+            runner, plan, start_response=ordinary, session_id=ordinary_session,
+            context_id=ordinary_context, worktree_path=ordinary_worktree,
+            expected_calls=primary_probe_calls,
+        )
+        linked_lifecycle = linked_root_removal_evidence(
+            linked_active_before_remove, linked_status, linked_revoked
+        )
+        save_json(artifact / "state.json", state)
+        results["concurrent-roots-agents"] = {
+            "ok": linked_direct["ok"] and ordinary_result["ok"]
+            and ordinary_direct["ok"] and linked_binding_ok and ordinary_binding_ok,
+            "ordinary": {"transcript": ordinary_result, "structured": ordinary_direct},
+            "linked": {"structured": linked_direct, "transcript": linked_transcript},
+            "linked_binding_exact": linked_binding_ok,
+            "ordinary_binding_exact": ordinary_binding_ok,
+            "linked_prewarm": linked_prewarm_evidence,
+            "linked_prewarm_tree": linked_prewarm_tree_evidence,
+            "held_call_observed_before_remove": held_call_observed,
+            "linked_inference_elapsed_ms": linked_inference_elapsed_ms,
+        }
+        results["active-secondary-root-add-remove"] = {
+            "ok": (
+                call_succeeded(add_linked) and call_succeeded(remove_linked)
+                and call_succeeded(pressure_add) and call_succeeded(pressure_remove)
+                and linked_lifecycle["ok"]
+                and overlap(pressure_add, add_linked)
+                and overlap(pressure_remove, remove_linked)
+            ),
+            "primary_status_before_remove": ordinary_active_before_remove["status"],
+            "primary_status_after_remove": ordinary_active_after_remove["status"],
+            "linked_lifecycle": linked_lifecycle,
+            "add_overlap": overlap(pressure_add, add_linked),
+            "remove_overlap": overlap(pressure_remove, remove_linked),
+        }
+
+        final_snapshot = codemap_debug_action(
+            runner, plan, "codemap_projection_snapshot"
+        )["snapshot"]
+        raw_queue_wait_values = final_snapshot.get("queue_wait_ms")
+        start_queue_ordinal = start_snapshot.get("queue_wait_sample_ordinal")
+        final_queue_ordinal = final_snapshot.get("queue_wait_sample_ordinal")
+        if (
+            not isinstance(raw_queue_wait_values, list)
+            or not nonnegative_integer(start_queue_ordinal)
+            or not nonnegative_integer(final_queue_ordinal)
+            or final_queue_ordinal < start_queue_ordinal
+        ):
+            raise BenchmarkError("DEBUG codemap snapshot omitted scoped queue sample ordinals")
+        queue_sample_delta = final_queue_ordinal - start_queue_ordinal
+        if queue_sample_delta > len(raw_queue_wait_values) or not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+            for value in raw_queue_wait_values
+        ):
+            raise BenchmarkError("DEBUG codemap snapshot omitted queue_wait_ms samples")
+        queue_wait_values = (
+            raw_queue_wait_values[-queue_sample_delta:] if queue_sample_delta else []
+        )
+        resource_keys = (
+            "retained_path_bytes", "retained_source_bytes", "retained_projection_bytes",
+            "staged_graph_bytes", "resident_graph_bytes", "queued_manifest_mutation_bytes",
+        )
+        resources_bounded = all(
+            nonnegative_integer(final_snapshot.get(key))
+            and positive_integer(final_snapshot.get(f"limit_{key}"))
+            and final_snapshot[key] <= final_snapshot[f"limit_{key}"]
+            for key in resource_keys
+        )
+        rejection_keys = (
+            "projection_budget_rejections", "projection_demand_busy_rejections",
+            "busy_rejections", "failures", "manifest_failures",
+        )
+        rejection_deltas = {
+            key: codemap_counter_delta(start_snapshot, final_snapshot, key)
+            for key in rejection_keys
+        }
+        no_policy_rejection = all(value == 0 for value in rejection_deltas.values())
+        results["resource-policy"] = {
+            "ok": resources_bounded and no_policy_rejection,
+            "resource_bytes": {
+                key: {"used": final_snapshot.get(key),
+                      "limit": final_snapshot.get(f"limit_{key}")}
+                for key in resource_keys
+            },
+            "rejection_deltas": rejection_deltas,
+        }
+
+        if memory_session_id is None:
+            raise BenchmarkError("codemap memory session ownership was lost")
+        memory_stopped, resources = stop_owned_memory_sampler(
+            runner, memory_session_id, label="codemap-memory-stop",
+        )
+        memory_started = False
+        state["memory_stopped"] = memory_stopped
+    except BaseException as error:
+        operational_error = repr(error)
+    finally:
+        if active_hold:
+            released = runner.call(
+                "codemap-finally-release-hold", DEBUG_TOOL,
+                diagnostic_payload(
+                    plan, "codemap_projection_hold_release", hold_id=active_hold,
+                    **({"target_root_id": active_hold_target_root_id}
+                       if active_hold_target_root_id else {}),
+                ),
+                check=False,
+            )
+            released_ok = (
+                call_succeeded(released)
+                and (find_value(released, "released") is True or find_value(released, "hold_count") == 0)
+            )
+            cleanup.append({
+                "action": "release_codemap_hold", "hold_id_sha256": sha256_bytes(active_hold.encode()),
+                "ok": released_ok,
+            })
+            for item in state["codemap_holds"]:
+                if item.get("hold_id") == active_hold:
+                    item["released"] = released_ok
+        for raw in watcher_paths:
+            candidate = root / raw
+            if candidate.exists():
+                response = runner.call(
+                    f"codemap-cleanup-file-{safe_name(candidate.name)}", "file_actions",
+                    {"action": "delete", "path": str(candidate),
+                     "context_id": plan["scope"]["context_id"]}, check=False,
+                )
+                cleanup.append({
+                    "action": "remove_owned_fixture", "path_sha256": sha256_bytes(raw.encode()),
+                    "ok": call_succeeded(response),
+                })
+        for session in state["sessions"]:
+            if not session.get("terminal"):
+                status = terminalize(runner, session["session_id"])
+                session["status"] = status
+                session["terminal"] = status in TERMINAL_STATES
+            cleanup.append({
+                "action": "terminalize_agent",
+                "session_id_sha256": sha256_bytes(session["session_id"].encode()),
+                "status": session.get("status"), "terminal": session.get("terminal") is True,
+            })
+        all_terminal = all(session.get("terminal") is True for session in state["sessions"])
+        remaining_added_roots: list[dict[str, Any]] = []
+        for item in reversed(state["added_roots"]):
+            path = item.get("path")
+            ownership_proven = (
+                item.get("kind") == "non-git"
+                and validate_codemap_temp_ownership_marker(
+                    item, artifact_id=artifact.name, plan_sha256=plan["plan_sha256"]
+                )
+            )
+            if not all_terminal or not ownership_proven:
+                cleanup.append({
+                    "action": "remove_workspace_root",
+                    "path_sha256": sha256_bytes(str(path).encode()),
+                    "ok": False, "manual_cleanup": True,
+                    "reason": (
+                        "agents_not_terminal" if not all_terminal else
+                        "live_cleanup_ownership_proof_required"
+                    ),
+                })
+                remaining_added_roots.append(item)
+                continue
+            response = runner.call(
+                f"codemap-cleanup-root-{safe_name(str(path))}", "manage_workspaces",
+                {"action": "remove_folder", "workspace": plan["scope"]["workspace_id"],
+                 "folder_path": path, "window_id": plan["scope"]["window_id"]}, check=False,
+            )
+            ok = call_succeeded(response)
+            cleanup.append({
+                "action": "remove_workspace_root",
+                "path_sha256": sha256_bytes(str(path).encode()), "ok": ok,
+            })
+            if not ok:
+                remaining_added_roots.append(item)
+        state["added_roots"] = list(reversed(remaining_added_roots))
+        for worktree in {item["path"]: item for item in state["worktrees"]}.values():
+            cleaned = clean_owned_worktree(
+                root, worktree["path"], all_terminal,
+                expected_branch=worktree.get("branch"), expected_path=worktree["path"],
+            )
+            if isinstance(cleaned.get("path"), str):
+                cleaned["path_sha256"] = sha256_bytes(cleaned.pop("path").encode())
+            cleanup.append(cleaned)
+        if memory_started and memory_session_id is not None:
+            memory_stopped, resources = stop_owned_memory_sampler(
+                runner, memory_session_id, label="codemap-finally-memory-stop",
+            )
+            state["memory_stopped"] = memory_stopped
+        cleanup.append({
+            "action": "stop_memory_sampler", "ok": state["memory_stopped"],
+            "verified_stopped": state["memory_stopped"],
+        })
+        try:
+            require_benchmark_gate(runner)
+            state["benchmark_gate_unchanged"] = True
+        except BenchmarkError:
+            state["benchmark_gate_unchanged"] = False
+        cleanup.append({
+            "action": "preserve_benchmark_setting", "ok": state["benchmark_gate_unchanged"],
+        })
+        final_target_ok = False
+        try:
+            verify_disposable_target(runner, plan, require_only_planned_root=True)
+            final_target_ok = True
+        except BenchmarkError:
+            pass
+        cleanup.append({"action": "restore_workspace_roots", "ok": final_target_ok})
+        remaining_paths = {
+            str(Path(item["path"]).resolve())
+            for item in state["added_roots"] if isinstance(item.get("path"), str)
+        }
+        for path in reversed(owned_dirs):
+            if not path.exists() or str(path.resolve()) in remaining_paths:
+                continue
+            if path.name.startswith("rpce-codemap-gate-nongit-"):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        save_json(artifact / "cleanup.json", cleanup)
+        save_json(artifact / "state.json", state)
+        save_json(artifact / "resources.json", resources)
+
+    retained = [sample for sample in samples if sample.get("valid")]
+    direct_structure_durations: list[float] = []
+    raw_cli_file = artifact / "raw-cli-calls.ndjson"
+    if raw_cli_file.exists():
+        for line in raw_cli_file.read_text(encoding="utf-8").splitlines():
+            raw_call = json.loads(line)
+            if raw_call.get("tool") != "get_code_structure":
+                continue
+            started = raw_call.get("started_monotonic_ns")
+            finished = raw_call.get("finished_monotonic_ns")
+            if not isinstance(started, int) or not isinstance(finished, int) or finished < started:
+                raise BenchmarkError("raw get_code_structure timing evidence was malformed")
+            direct_structure_durations.append((finished - started) / 1_000_000)
+    metric_values = {
+        "cold_individual_structure": [
+            sample["duration_ms"] for sample in retained
+            if sample["scenario"] == "cold-individual"
+        ],
+        "warm_individual_structure": [
+            sample["duration_ms"] for sample in retained
+            if sample["scenario"] == "warm-individual"
+        ],
+        "cold_directory_structure": [
+            sample["duration_ms"] for sample in retained
+            if sample["scenario"] == "cold-directory"
+        ],
+        "warm_directory_structure": [
+            sample["duration_ms"] for sample in retained
+            if sample["scenario"] == "warm-directory"
+        ],
+        "tree_marker_availability": [
+            sample["tree_marker_duration_ms"] for sample in retained
+            if sample.get("tree_marker_duration_ms") is not None
+        ],
+        "first_search": locals().get("search_durations", []),
+        "first_read": locals().get("read_durations", []),
+        "root_readiness": locals().get("readiness_durations", []),
+        "queue_wait": (
+            locals().get("queue_wait_values", [])
+            if isinstance(locals().get("queue_wait_values", []), list) else []
+        ),
+        "operation_duration": direct_structure_durations,
+    }
+    resource_metrics = find_value(resources, "metrics")
+    memory_metric_names = (
+        "peak_resident_delta_mb", "retained_resident_delta_mb",
+        "peak_physical_footprint_delta_mb", "retained_physical_footprint_delta_mb",
+    )
+    for key in memory_metric_names:
+        metric_values[f"memory_{key}"] = []
+    if isinstance(resource_metrics, dict):
+        for key in memory_metric_names:
+            value = resource_metrics.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                metric_values[f"memory_{key}"] = [max(0.0, float(value))]
+            else:
+                metric_values[f"memory_{key}"] = []
+    metrics = {name: stats(values, label=f"codemap {name}") for name, values in metric_values.items()}
+
+    def metric_within_baseline(name: str, percentile: str) -> bool:
+        current = (metrics.get(name) or {}).get(percentile)
+        baseline_value = ((baseline.get("metrics") or {}).get(name) or {}).get(percentile)
+        return (
+            isinstance(current, (int, float)) and not isinstance(current, bool)
+            and isinstance(baseline_value, (int, float)) and not isinstance(baseline_value, bool)
+            and baseline_value > 0 and current <= baseline_value * 1.10
+        )
+
+    scenario_ok = operational_error is None and all(item.get("ok") is True for item in results.values())
+    exact_counts = all((
+        metrics["cold_individual_structure"]["count"] == args.cold_samples,
+        metrics["warm_individual_structure"]["count"] == args.warm_samples,
+        metrics["cold_directory_structure"]["count"] == args.cold_samples,
+        metrics["warm_directory_structure"]["count"] == args.warm_samples,
+    ))
+    required_metric_inventory = all(
+        metrics[name]["count"] > 0
+        and finite_number(metrics[name]["p50"])
+        and finite_number(metrics[name]["p95"])
+        and metrics[name]["p50"] > 0
+        and metrics[name]["p95"] > 0
+        for name in CODEMAP_REQUIRED_METRICS
+    )
+    cleanup_ok = bool(cleanup) and all(
+        item.get("ok") is True or item.get("terminal") is True
+        or item.get("removed") is True or item.get("reason") == "already_absent"
+        for item in cleanup
+    )
+    gates = {
+        "exact cold/warm sample counts": exact_counts,
+        "complete p50/p95 metric inventory": required_metric_inventory,
+        "all codemap content/path/tree scenarios": scenario_ok,
+        "every request within 10s + 500ms": all(
+            duration
+            <= CODEMAP_GATE_WAIT_MILLISECONDS + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
+            for duration in direct_structure_durations
+        ) and bool(direct_structure_durations),
+        "root/search/read p95 regression <= 10%": all(
+            metric_within_baseline(name, "p95")
+            for name in ("root_readiness", "first_search", "first_read")
+        ),
+        "warm structure p50/p95 regression <= 10%": all(
+            metric_within_baseline(name, percentile)
+            for name in ("warm_individual_structure", "warm_directory_structure")
+            for percentile in ("p50", "p95")
+        ),
+        "memory delta p95 regression <= 10%": all(
+            metric_within_baseline(f"memory_{name}", "p95")
+            for name in memory_metric_names
+        ),
+        "owned cleanup complete": cleanup_ok,
+    }
+    sanitized_results = sanitize_codemap_summary_value(results)
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "codemap-gate",
+        "artifact_id": artifact.name,
+        "plan_sha256": plan["plan_sha256"],
+        "fixture_sha256": sanitized_fixture["fixture_sha256"],
+        "status": "failed",
+        "decision": "fail",
+        "gates": gates,
+        "metrics": metrics,
+        "sample_counts": {
+            "attempted": len(samples), "valid": len(retained),
+            "invalid": len(samples) - len(retained),
+        },
+        "configuration": {
+            "cold_samples_per_cohort": args.cold_samples,
+            "warm_samples_per_cohort": args.warm_samples,
+            "wait_contract_ms": CODEMAP_GATE_WAIT_MILLISECONDS,
+            "harness_allowance_ms": CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS,
+        },
+        "scenarios": sanitized_results,
+        "cleanup_complete": cleanup_ok,
+        "operational_error_code": "operational_error" if operational_error else None,
+        "baseline_sha256": baseline_acceptance["summary_sha256"],
+        "baseline_acceptance": baseline_acceptance,
+        "fixture": sanitized_fixture,
+    }
+    save_json(artifact / "summary.json", summary)
+    privacy = codemap_artifact_privacy_scan(
+        artifact,
+        allowlisted_roots=privacy_allowlist,
+        allowlisted_prompts=privacy_prompt_allowlist,
+    )
+    gates["owner-only raw artifacts and privacy scan"] = privacy["ok"]
+    summary["privacy"] = privacy
+    decision = "pass" if gates and all(gates.values()) else "fail"
+    summary["decision"] = decision
+    summary["status"] = "completed" if decision == "pass" else "failed"
+    save_json(artifact / "summary.json", summary)
+    print(json.dumps({
+        "status": summary["status"], "decision": decision,
+        "artifact_directory": str(artifact), "gates": gates,
+    }, indent=2, sort_keys=True))
+    return 0 if decision == "pass" else 1
+
+
 def gate_ratio(control: float | None, candidate: float | None) -> float | None:
     if control in (None, 0) or candidate is None:
         return None
@@ -2944,26 +6438,125 @@ def validate_cleanup_evidence(
     return required <= set(by_action)
 
 
-def stop_and_verify_memory_sampler(runner: CLIRunner) -> dict[str, Any]:
-    stopped = runner.call(
-        "cleanup-memory-stop", DEBUG_TOOL,
-        {"op": "large_workspace_memory", "action": "stop", "settle_seconds": 2},
+def memory_sampler_record(value: Any, action: str) -> dict[str, Any]:
+    if not call_succeeded(value):
+        raise BenchmarkError(f"memory sampler {action} query failed")
+    matches: dict[str, dict[str, Any]] = {}
+    for candidate in structured_json_objects(benchmark_final_response(value)):
+        if (
+            candidate.get("op") == "large_workspace_memory"
+            and candidate.get("action") == action
+            and isinstance(candidate.get("running"), bool)
+        ):
+            matches[json.dumps(candidate, sort_keys=True, separators=(",", ":"))] = candidate
+    if len(matches) != 1:
+        raise BenchmarkError(f"memory sampler {action} response was missing or ambiguous")
+    record = next(iter(matches.values()))
+    if action in {"start", "stop"} or record.get("running") is True:
+        session = record.get("session")
+        top_level_id = record.get("session_id")
+        nested_id = session.get("id") if isinstance(session, dict) else None
+        if (
+            not isinstance(top_level_id, str)
+            or not isinstance(nested_id, str)
+            or validate_uuid(top_level_id, "memory session-id")
+            != validate_uuid(nested_id, "memory nested session-id")
+        ):
+            raise BenchmarkError(f"memory sampler {action} omitted one exact session owner")
+    return record
+
+
+def start_owned_memory_sampler(runner: CLIRunner, label: str) -> tuple[str, Any]:
+    response = runner.call(
+        f"{safe_name(label)}-memory-start", DEBUG_TOOL,
+        {"op": "large_workspace_memory", "action": "start", "label": label,
+         "interval_ms": 100, "benchmark_gate": True},
+    )
+    record = memory_sampler_record(response, "start")
+    session_id = validate_uuid(str(record["session_id"]), "memory session-id")
+    if record.get("running") is not True:
+        raise BenchmarkError("owned memory sampler did not start")
+    return session_id, response
+
+
+def stop_owned_memory_sampler(
+    runner: CLIRunner,
+    session_id: str,
+    *,
+    label: str,
+    settle_seconds: float = 2,
+) -> tuple[bool, Any]:
+    owned_id = validate_uuid(session_id, "memory session-id")
+    response = runner.call(
+        label, DEBUG_TOOL,
+        {"op": "large_workspace_memory", "action": "stop",
+         "session_id": owned_id, "settle_seconds": settle_seconds},
         timeout=60, check=False,
     )
-    verified = runner.call(
-        "cleanup-memory-verify", DEBUG_TOOL,
+    try:
+        record = memory_sampler_record(response, "stop")
+        stopped_id = validate_uuid(str(record["session_id"]), "stopped memory session-id")
+        ok = stopped_id == owned_id and record.get("running") is False
+    except BenchmarkError:
+        ok = False
+    return ok, response
+
+
+def verify_resumed_memory_sampler_inactive(
+    runner: CLIRunner,
+    *,
+    expected_session_id: str | None,
+    expected_label: str,
+) -> dict[str, Any]:
+    current = runner.call(
+        "cleanup-memory-current", DEBUG_TOOL,
         {"op": "large_workspace_memory", "action": "current"},
         timeout=60, check=False,
     )
-    stop_running = find_value(stopped, "running")
-    verify_running = find_value(verified, "running")
-    ok = (
-        call_succeeded(stopped) and stop_running is False
-        and call_succeeded(verified) and verify_running is False
-    )
+    try:
+        record = memory_sampler_record(current, "current")
+        running = record["running"]
+    except BenchmarkError as error:
+        return {
+            "action": "stop_memory_sampler", "ok": False, "verified_stopped": False,
+            "stop_attempted": False, "manual_cleanup": True,
+            "reason": f"resumed cleanup could not prove the global sampler inactive: {error}",
+        }
+    if running:
+        session = record.get("session")
+        current_id = record.get("session_id")
+        current_label = session.get("label") if isinstance(session, dict) else None
+        try:
+            matches_owner = (
+                isinstance(expected_session_id, str)
+                and validate_uuid(str(current_id), "current memory session-id")
+                == validate_uuid(expected_session_id, "expected memory session-id")
+                and current_label == expected_label
+            )
+        except BenchmarkError:
+            matches_owner = False
+        if matches_owner:
+            stopped, _ = stop_owned_memory_sampler(
+                runner, expected_session_id,
+                label="cleanup-memory-stop-owned", settle_seconds=0,
+            )
+            return {
+                "action": "stop_memory_sampler", "ok": stopped,
+                "verified_stopped": stopped, "stop_attempted": True,
+                "ownership_proven": True,
+                "session_id_sha256": sha256_bytes(expected_session_id.encode()),
+            }
+        return {
+            "action": "stop_memory_sampler", "ok": False, "verified_stopped": False,
+            "stop_attempted": False, "manual_cleanup": True,
+            "reason": (
+                "process-global memory sampler is owned by another or unproven session; "
+                "resumed cleanup refuses takeover"
+            ),
+        }
     return {
-        "action": "stop_memory_sampler", "ok": ok, "verified_stopped": ok,
-        "stop_running": stop_running, "verify_running": verify_running,
+        "action": "stop_memory_sampler", "ok": True, "verified_stopped": True,
+        "stop_attempted": False, "observed_running": False,
     }
 
 
@@ -3433,6 +7026,106 @@ def aggregate_command(args: argparse.Namespace) -> int:
     return 0 if decision == "pass" else 2 if decision == "incomplete" else 1
 
 
+def cleanup_live_worktree_records(value: Any) -> set[tuple[str, str, str, str]]:
+    final = benchmark_final_response(value)
+    worktrees = final.get("worktrees") if isinstance(final, dict) else None
+    if not isinstance(worktrees, list):
+        return set()
+    records: set[tuple[str, str, str, str]] = set()
+    for worktree in worktrees:
+        if not isinstance(worktree, dict):
+            continue
+        worktree_id = worktree.get("worktree_id")
+        path, branch, head = worktree.get("path"), worktree.get("branch"), worktree.get("head")
+        if all(isinstance(item, str) and item for item in (worktree_id, path, branch, head)):
+            records.add((
+                worktree_id, str(Path(path).resolve(strict=False)), branch, head.lower(),
+            ))
+    return records
+
+
+def cleanup_session_ownership_evidence(
+    snapshot: Any,
+    *,
+    expected_session_id: str,
+    expected_context_id: str,
+    live_worktrees: set[tuple[str, str, str, str]],
+    artifact_name: str,
+    plan_commit_oid: str,
+) -> dict[str, Any]:
+    branch_prefix = safe_name(f"rpce-bench-{artifact_name}") + "-i"
+    if not call_succeeded(snapshot):
+        return {"ok": False, "reason": "session_poll_failed"}
+    try:
+        actual_session_id = response_session_id(snapshot).upper()
+    except BenchmarkError:
+        return {"ok": False, "reason": "session_identity_missing"}
+    if actual_session_id != expected_session_id.upper():
+        return {"ok": False, "reason": "session_identity_mismatch"}
+    actual_context_id = response_context_id(snapshot)
+    if (
+        not isinstance(actual_context_id, str)
+        or actual_context_id.upper() != expected_context_id.upper()
+    ):
+        return {"ok": False, "reason": "session_context_mismatch"}
+    bindings: set[tuple[str, str, str, str]] = set()
+    for candidate in structured_json_objects(benchmark_final_response(snapshot)):
+        worktree_id = candidate.get("worktree_id")
+        path = candidate.get("worktree_root_path")
+        branch, head = candidate.get("branch"), candidate.get("head")
+        if all(isinstance(item, str) and item for item in (worktree_id, path, branch, head)):
+            bindings.add((
+                worktree_id, str(Path(path).resolve(strict=False)), branch, head.lower(),
+            ))
+    if len(bindings) != 1:
+        return {"ok": False, "reason": "session_worktree_binding_ambiguous"}
+    binding = next(iter(bindings))
+    if (
+        not binding[2].startswith(branch_prefix)
+        or binding[3] != plan_commit_oid.lower()
+        or binding not in live_worktrees
+    ):
+        return {"ok": False, "reason": "session_worktree_not_benchmark_owned"}
+    return {
+        "ok": True, "session_id": actual_session_id, "worktree_id": binding[0],
+        "path": binding[1], "branch": binding[2], "head": binding[3],
+        "status": response_status(snapshot), "context_id": actual_context_id,
+    }
+
+
+def cleanup_worktree_ownership_evidence(
+    state_item: Any,
+    *,
+    live_worktrees: set[tuple[str, str, str, str]],
+    proven_sessions: list[dict[str, Any]],
+    artifact_name: str,
+    plan_commit_oid: str,
+) -> dict[str, Any]:
+    if not isinstance(state_item, dict):
+        return {"ok": False, "reason": "invalid_state_worktree"}
+    raw_path, raw_branch = state_item.get("path"), state_item.get("branch")
+    if not isinstance(raw_path, str) or not isinstance(raw_branch, str):
+        return {"ok": False, "reason": "state_worktree_identity_missing"}
+    path = str(Path(raw_path).resolve(strict=False))
+    branch_prefix = safe_name(f"rpce-bench-{artifact_name}") + "-i"
+    live_matches = [
+        record for record in live_worktrees
+        if record[1] == path and record[2] == raw_branch
+        and record[2].startswith(branch_prefix) and record[3] == plan_commit_oid.lower()
+    ]
+    relationships = {
+        (proof.get("worktree_id"), proof.get("path"), proof.get("branch"), proof.get("head"))
+        for proof in proven_sessions if proof.get("ok") is True
+    }
+    if len(live_matches) != 1 or live_matches[0] not in relationships:
+        return {"ok": False, "reason": "live_session_worktree_relationship_unproven"}
+    match = live_matches[0]
+    return {
+        "ok": True, "worktree_id": match[0], "path": match[1],
+        "branch": match[2], "head": match[3],
+    }
+
+
 def cleanup_command(args: argparse.Namespace) -> int:
     if not args.confirm_live_debug_app or not args.confirm_owned_resources:
         raise BenchmarkError("cleanup requires live-app and owned-resource confirmations")
@@ -3441,17 +7134,185 @@ def cleanup_command(args: argparse.Namespace) -> int:
     plan = load_plan(artifact / "plan.json")
     cli = resolve_cli(args.cli)
     root = Path(plan["scope"]["root_path"])
-    runner = CLIRunner(cli, plan["scope"]["window_id"], root, artifact)
+    runner = CLIRunner(
+        cli, plan["scope"]["window_id"], plan["scope"]["context_id"], root, artifact
+    )
     verify_disposable_target(runner, plan, require_only_planned_root=False)
+    plan_commit_oid = plan["dataset"].get("base_commit_oid")
+    if not isinstance(plan_commit_oid, str) or re.fullmatch(r"[0-9a-f]{40,64}", plan_commit_oid) is None:
+        raise BenchmarkError("cleanup plan omitted a valid immutable base commit OID")
+    worktree_inventory = runner.call(
+        "cleanup-live-worktrees", "manage_worktree",
+        {"op": "list", "repo_root": str(root), "include_status": True}, check=False,
+    )
+    live_worktrees = (
+        cleanup_live_worktree_records(worktree_inventory) if call_succeeded(worktree_inventory) else set()
+    )
     actions: list[dict[str, Any]] = []
+    if state.get("kind") == "codemap-gate":
+        for hold in state.get("codemap_holds", []):
+            if not isinstance(hold, dict) or hold.get("released") is True:
+                continue
+            hold_id = hold.get("hold_id")
+            response = runner.call(
+                f"cleanup-release-codemap-hold-{str(hold_id)[:8]}", DEBUG_TOOL,
+                diagnostic_payload(
+                    plan, "codemap_projection_hold_release", hold_id=hold_id,
+                    **({"target_root_id": hold.get("target_root_id")}
+                       if isinstance(hold.get("target_root_id"), str) else {}),
+                ),
+                check=False,
+            ) if isinstance(hold_id, str) else {}
+            released_or_expired = (
+                call_succeeded(response)
+                and (find_value(response, "released") is True or find_value(response, "hold_count") == 0)
+            )
+            hold["released"] = released_or_expired
+            actions.append({
+                "action": "release_codemap_hold",
+                "hold_id_sha256": sha256_bytes(str(hold_id).encode()),
+                "ok": released_or_expired,
+            })
+
+    session_proofs: list[dict[str, Any]] = []
     for session in state.get("sessions", []):
-        status = session.get("status") if session.get("terminal") else terminalize(runner, session["session_id"])
+        session_id = session.get("session_id") if isinstance(session, dict) else None
+        context_id = session.get("context_id") if isinstance(session, dict) else None
+        try:
+            routed_context_id = (
+                validate_uuid(context_id, "cleanup session context-id")
+                if isinstance(context_id, str) else None
+            )
+        except BenchmarkError:
+            routed_context_id = None
+        snapshot = (
+            runner.call(
+                f"cleanup-prove-session-{str(session_id)[:8]}", "agent_run",
+                {"op": "poll", "session_id": session_id}, check=False,
+                context_id=routed_context_id,
+            )
+            if isinstance(session_id, str) and routed_context_id is not None else {}
+        )
+        proof = cleanup_session_ownership_evidence(
+            snapshot, expected_session_id=str(session_id or ""),
+            expected_context_id=str(context_id or ""), live_worktrees=live_worktrees,
+            artifact_name=artifact.name, plan_commit_oid=plan_commit_oid,
+        )
+        session_proofs.append(proof)
+        if not proof["ok"]:
+            if isinstance(session, dict):
+                session["terminal"] = False
+            actions.append({
+                "action": "terminalize_agent", "session_id": session_id,
+                "terminal": False, "ownership_proven": False,
+                "manual_cleanup": True, "reason": proof["reason"],
+            })
+            continue
+        live_status = str(proof["status"])
+        status = (
+            live_status if live_status in TERMINAL_STATES
+            else terminalize(runner, session_id, context_id)
+        )
         session["status"], session["terminal"] = status, status in TERMINAL_STATES
         actions.append({
             "action": "terminalize_agent", "session_id": session["session_id"],
-            "status": status, "terminal": session["terminal"],
+            "status": status, "terminal": session["terminal"], "ownership_proven": True,
         })
-    memory_action = stop_and_verify_memory_sampler(runner)
+    if state.get("kind") == "codemap-gate":
+        inventory = runner.call(
+            "cleanup-codemap-workspace-inventory", "manage_workspaces",
+            {"action": "list", "include_hidden": True}, check=False,
+        )
+        current_roots = set()
+        if call_succeeded(inventory):
+            current_roots = set(workspace_root_paths(
+                workspace_inventory_record(inventory, plan["scope"]["workspace_id"])
+            ))
+        all_recorded_agents_terminal = all(
+            isinstance(item, dict) and item.get("terminal") is True
+            for item in state.get("sessions", [])
+        )
+        remaining_added_roots: list[dict[str, Any]] = []
+        for item in state.get("added_roots", []):
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                actions.append({
+                    "action": "remove_workspace_root", "ok": False,
+                    "manual_cleanup": True, "reason": "invalid_owned_root_record",
+                })
+                continue
+            candidate = Path(item["path"]).resolve()
+            root_proof: dict[str, Any]
+            if item.get("kind") == "non-git":
+                ownership_proven = validate_codemap_temp_ownership_marker(
+                    item,
+                    artifact_id=artifact.name,
+                    plan_sha256=plan["plan_sha256"],
+                )
+                root_proof = {
+                    "ok": ownership_proven,
+                    "basis": "live_exclusive_non_git_marker",
+                }
+            elif item.get("kind") == "git-worktree":
+                state_matches = [
+                    worktree for worktree in state.get("worktrees", [])
+                    if isinstance(worktree, dict)
+                    and isinstance(worktree.get("path"), str)
+                    and Path(worktree["path"]).resolve() == candidate
+                ]
+                root_proof = (
+                    cleanup_worktree_ownership_evidence(
+                        state_matches[0], live_worktrees=live_worktrees,
+                        proven_sessions=session_proofs, artifact_name=artifact.name,
+                        plan_commit_oid=plan_commit_oid,
+                    )
+                    if len(state_matches) == 1
+                    else {"ok": False, "reason": "state_worktree_identity_ambiguous"}
+                )
+                ownership_proven = root_proof.get("ok") is True
+            else:
+                ownership_proven = False
+                root_proof = {"ok": False, "reason": "unsupported_owned_root_kind"}
+            if not ownership_proven or not all_recorded_agents_terminal:
+                reason = "ownership_not_proven" if not ownership_proven else "agents_not_terminal"
+                actions.append({
+                    "action": "remove_workspace_root", "path": str(candidate), "ok": False,
+                    "manual_cleanup": True, "reason": reason,
+                })
+                remaining_added_roots.append(item)
+                continue
+            if str(candidate) not in current_roots:
+                actions.append({
+                    "action": "remove_workspace_root", "path": str(candidate),
+                    "ok": True, "reason": "already_absent",
+                })
+                continue
+            response = runner.call(
+                f"cleanup-codemap-root-{safe_name(candidate.name)}", "manage_workspaces",
+                {"action": "remove_folder", "workspace": plan["scope"]["workspace_id"],
+                 "folder_path": str(candidate), "window_id": plan["scope"]["window_id"]},
+                check=False,
+            )
+            ok = call_succeeded(response)
+            actions.append({
+                "action": "remove_workspace_root", "path": str(candidate), "ok": ok,
+                "ownership_proven": True,
+                "ownership_basis": (
+                    "live_cleanup_worktree_ownership_evidence"
+                    if item.get("kind") == "git-worktree"
+                    else "live_exclusive_non_git_marker"
+                ),
+                "ownership_proof_sha256": sha256_bytes(canonical_json(root_proof)),
+            })
+            if ok and item.get("kind") == "non-git":
+                shutil.rmtree(candidate, ignore_errors=True)
+            if not ok:
+                remaining_added_roots.append(item)
+        state["added_roots"] = remaining_added_roots
+    memory_action = verify_resumed_memory_sampler_inactive(
+        runner,
+        expected_session_id=state.get("memory_session_id"),
+        expected_label=artifact.name,
+    )
     state["memory_stopped"] = memory_action["verified_stopped"]
     actions.append(memory_action)
     control = state.get("control_id")
@@ -3477,9 +7338,20 @@ def cleanup_command(args: argparse.Namespace) -> int:
         "action": "preserve_benchmark_setting", "ok": state["benchmark_gate_unchanged"],
     })
     for item in state.get("worktrees", []):
+        proof = cleanup_worktree_ownership_evidence(
+            item, live_worktrees=live_worktrees, proven_sessions=session_proofs,
+            artifact_name=artifact.name, plan_commit_oid=plan_commit_oid,
+        )
+        if not proof["ok"]:
+            actions.append({
+                "action": "remove_worktree", "path": item.get("path") if isinstance(item, dict) else None,
+                "removed": False, "ownership_proven": False, "manual_cleanup": True,
+                "reason": proof["reason"],
+            })
+            continue
         actions.append(clean_owned_worktree(
-            root, item["path"], all(session.get("terminal") for session in state.get("sessions", [])),
-            expected_branch=item.get("branch"), expected_path=item.get("expected_path"),
+            root, proof["path"], all(session.get("terminal") for session in state.get("sessions", [])),
+            expected_branch=proof["branch"], expected_path=proof["path"],
         ))
     final_roots_restored = False
     try:
@@ -3571,6 +7443,21 @@ def build_parser() -> argparse.ArgumentParser:
     add_live_common(smoke)
     smoke.add_argument("--confirm-dedicated-workspace", action="store_true")
     smoke.set_defaults(func=smoke_command)
+
+    codemap_gate = sub.add_parser(
+        "codemap-gate",
+        help="run the mandatory live codemap projection-demand release gate",
+    )
+    add_live_common(codemap_gate)
+    codemap_gate.add_argument("--fixture", required=True)
+    codemap_gate.add_argument("--baseline", required=True)
+    codemap_gate.add_argument("--baseline-ledger", required=True)
+    codemap_gate.add_argument("--baseline-ledger-sha256", required=True)
+    codemap_gate.add_argument("--cold-samples", type=int, default=20)
+    codemap_gate.add_argument("--warm-samples", type=int, default=40)
+    codemap_gate.add_argument("--confirm-dedicated-workspace", action="store_true")
+    codemap_gate.add_argument("--confirm-synthetic-allowlisted-source", action="store_true")
+    codemap_gate.set_defaults(func=codemap_gate_command)
 
     aggregate = sub.add_parser("aggregate", help="aggregate existing artifacts offline")
     aggregate.add_argument("--plan", required=True)

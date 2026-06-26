@@ -591,7 +591,11 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
             for: peerQuery,
             resolvedTargets: [resolution],
             sourceCoverage: [peerSourceCoverage, peerTargetCoverage],
-            definitionUniverseCoverage: .partial(indexedNodes: 2, candidateCount: .known(1))
+            definitionUniverseCoverage: .incomplete(
+                progress: .notStarted,
+                remainingCount: nil,
+                retry: nil
+            )
         ))
 
         let unresolved = try XCTUnwrap(store.makeReferenceFailure(
@@ -601,16 +605,13 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
             failure: .unresolvedDefinitionUniverse
         ))
 
-        let matchingComplete = WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage.complete(
-            catalogGeneration: store.key.catalogGeneration,
-            repositoryAuthority: store.key.repositoryAuthority
+        let matchingComplete = try completeCoverage(for: store)
+        let staleComplete = try completeCoverage(
+            for: store,
+            catalogGeneration: store.key.catalogGeneration + 1
         )
-        let staleComplete = WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage.complete(
-            catalogGeneration: store.key.catalogGeneration + 1,
-            repositoryAuthority: store.key.repositoryAuthority
-        )
-        let foreignAuthorityComplete = WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage.complete(
-            catalogGeneration: store.key.catalogGeneration,
+        let foreignAuthorityComplete = try completeCoverage(
+            for: store,
             repositoryAuthority: repositoryAuthority(
                 like: store.key.repositoryAuthority,
                 authorityGeneration: store.key.repositoryAuthority.authorityGeneration + 1
@@ -624,8 +625,9 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
             definitionUniverseCoverage: matchingComplete
         ))
         for invalidCoverage: WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage in [
-            .unknown,
-            .partial(indexedNodes: 2, candidateCount: .known(0)),
+            .incomplete(progress: .notStarted, remainingCount: nil, retry: nil),
+            .busy(progress: .notStarted, retryAfterMilliseconds: 10),
+            .budget(dimension: .stagedGraphBytes, attempted: 2, limit: 1),
             .unavailable(.notBuilt),
             staleComplete,
             foreignAuthorityComplete
@@ -651,14 +653,16 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
             referenceFailures: [provenMissing]
         ))
 
-        let partial = try XCTUnwrap(store.immediateResult(
+        XCTAssertNil(store.immediateResult(
             for: query,
             resolvedTargets: [resolution],
             sourceCoverage: [covered],
-            definitionUniverseCoverage: .partial(indexedNodes: 2, candidateCount: .known(1))
+            definitionUniverseCoverage: .incomplete(
+                progress: .notStarted,
+                remainingCount: 1,
+                retry: nil
+            )
         ))
-        XCTAssertEqual(partial.targets, [target.identity])
-        XCTAssertEqual(partial.resolvedTargets, [resolution])
 
         let unavailable = try XCTUnwrap(store.immediateResult(
             for: query,
@@ -680,53 +684,48 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
             for: query,
             resolvedTargets: [resolution],
             sourceCoverage: [missing],
-            definitionUniverseCoverage: .partial(indexedNodes: 1, candidateCount: .unknown)
+            definitionUniverseCoverage: .incomplete(
+                progress: .notStarted,
+                remainingCount: nil,
+                retry: nil
+            )
         ))
         XCTAssertNil(store.immediateResult(
             for: query,
             sourceCoverage: [],
-            definitionUniverseCoverage: .unknown
+            definitionUniverseCoverage: .busy(
+                progress: .notStarted,
+                retryAfterMilliseconds: nil
+            )
         ))
         XCTAssertNil(store.immediateResult(
             for: query,
             sourceCoverage: [covered, covered],
-            definitionUniverseCoverage: .unknown
+            definitionUniverseCoverage: .unavailable(.notBuilt)
         ))
         XCTAssertNil(store.immediateResult(
             for: query,
             resolvedTargets: [resolution, resolution],
             sourceCoverage: [covered],
-            definitionUniverseCoverage: .partial(indexedNodes: 2, candidateCount: .known(1))
+            definitionUniverseCoverage: matchingComplete
         ))
 
         let complete = try XCTUnwrap(store.immediateResult(
             for: query,
             resolvedTargets: [resolution],
             sourceCoverage: [covered],
-            definitionUniverseCoverage: .complete(
-                catalogGeneration: store.key.catalogGeneration,
-                repositoryAuthority: store.key.repositoryAuthority
-            )
+            definitionUniverseCoverage: matchingComplete
         ))
         XCTAssertEqual(complete.targets, [target.identity])
         XCTAssertNil(store.immediateResult(
             for: query,
             sourceCoverage: [covered],
-            definitionUniverseCoverage: .complete(
-                catalogGeneration: store.key.catalogGeneration + 1,
-                repositoryAuthority: store.key.repositoryAuthority
-            )
+            definitionUniverseCoverage: staleComplete
         ))
         XCTAssertNil(store.immediateResult(
             for: query,
             sourceCoverage: [covered],
-            definitionUniverseCoverage: .complete(
-                catalogGeneration: store.key.catalogGeneration,
-                repositoryAuthority: repositoryAuthority(
-                    like: store.key.repositoryAuthority,
-                    authorityGeneration: store.key.repositoryAuthority.authorityGeneration + 1
-                )
-            )
+            definitionUniverseCoverage: foreignAuthorityComplete
         ))
 
         let foreignAuthority = try await makeAuthority(
@@ -760,7 +759,7 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
             for: query,
             resolvedTargets: [resolution],
             sourceCoverage: [covered],
-            definitionUniverseCoverage: .partial(indexedNodes: 2, candidateCount: .known(1))
+            definitionUniverseCoverage: matchingComplete
         ))
 
         let replacementSourceBinding = try await makeResolvedBinding(
@@ -774,7 +773,7 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
         XCTAssertNil(store.immediateResult(
             for: query,
             sourceCoverage: [covered],
-            definitionUniverseCoverage: .unknown
+            definitionUniverseCoverage: matchingComplete
         ))
     }
 
@@ -1063,6 +1062,60 @@ final class WorkspaceCodemapSelectionGraphModelTests: XCTestCase {
             policyVersion: policyVersion,
             sizePolicy: sizePolicy
         ))
+    }
+
+    private func completeCoverage(
+        for store: WorkspaceCodemapSelectionGraphModelStore,
+        catalogGeneration: UInt64? = nil,
+        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken? = nil
+    ) throws -> WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage {
+        let token = WorkspaceCodemapProjectionCatalogToken(
+            rootEpoch: store.key.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: catalogGeneration ?? store.key.catalogGeneration,
+            ingressGeneration: 1,
+            projectionInvalidationGeneration: 1
+        )
+        let generation = WorkspaceCodemapProjectionGeneration(
+            catalogToken: token,
+            repositoryAuthority: repositoryAuthority ?? store.key.repositoryAuthority,
+            contributionGeneration: store.key.contributionGeneration,
+            schemaVersion: store.key.schemaVersion,
+            policyVersion: store.key.policyVersion
+        )
+        let counts = WorkspaceCodemapProjectionCounts(
+            supportedCandidateCount: 2,
+            processedCandidateCount: 2,
+            contributedCount: 2,
+            emptyCount: 0,
+            terminalArtifactCount: 0,
+            terminalExcludedCount: 0,
+            transientCount: 0
+        )
+        let completion = WorkspaceCodemapProjectionCatalogCompletion(
+            token: token,
+            finalCursor: nil,
+            supportedCandidateCount: 2
+        )
+        let proof: WorkspaceCodemapProjectionCoverageProof
+        switch WorkspaceCodemapProjectionCoverageProof.validated(
+            generation: generation,
+            catalogCompletion: completion,
+            counts: counts,
+            lastSegmentSequence: 0
+        ) {
+        case let .success(value):
+            proof = value
+        case let .failure(error):
+            throw error
+        }
+        return .complete(
+            proof: proof,
+            candidateCount: proof.candidateCount,
+            contributedCount: proof.contributedCount,
+            terminalCount: proof.terminalCount
+        )
     }
 
     private func acceptedNode(

@@ -109,8 +109,16 @@ struct WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy: Hashable {
 
 enum WorkspaceCodemapStoreSelectionGraphPartialReason: Hashable {
     case sourceCoverageIncomplete
-    case definitionUniverseIncomplete
     case referenceFailuresPresent
+}
+
+enum WorkspaceCodemapStoreSelectionGraphQueryIncompleteReason: Hashable {
+    case definitionUniverse(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        progress: WorkspaceCodemapProjectionProgress,
+        remainingCount: UInt64?,
+        retry: WorkspaceCodemapProjectionRetry?
+    )
 }
 
 struct WorkspaceCodemapStoreSelectionGraphRootResult: Hashable {
@@ -130,6 +138,10 @@ enum WorkspaceCodemapStoreSelectionGraphQueryUnavailableReason: Hashable {
     case sourceNotReady(UUID)
     case notActivated(WorkspaceCodemapRootEpoch)
     case invalidGraphResult(WorkspaceCodemapRootEpoch)
+    case definitionUniverse(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        reason: WorkspaceCodemapSelectionGraphUnavailableReason
+    )
     case runtime(
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason
@@ -145,6 +157,11 @@ enum WorkspaceCodemapStoreSelectionGraphQueryStaleReason: Hashable {
 }
 
 enum WorkspaceCodemapStoreSelectionGraphQueryBusyReason: Hashable {
+    case definitionUniverse(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        progress: WorkspaceCodemapProjectionProgress,
+        retryAfterMilliseconds: UInt64?
+    )
     case runtime(
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason
@@ -161,6 +178,12 @@ enum WorkspaceCodemapStoreSelectionGraphQueryBudgetReason: Hashable {
     case referenceFailureLimit(attempted: Int, limit: Int)
     case byteLimit(attempted: Int, limit: Int)
     case accountingOverflow
+    case definitionUniverse(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        dimension: WorkspaceCodemapProjectionBudgetDimension,
+        attempted: UInt64,
+        limit: UInt64
+    )
     case runtime(
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason
@@ -169,6 +192,7 @@ enum WorkspaceCodemapStoreSelectionGraphQueryBudgetReason: Hashable {
 
 enum WorkspaceCodemapStoreSelectionGraphQueryDisposition: Hashable {
     case readyPartial(WorkspaceCodemapStoreSelectionGraphQueryResult)
+    case incomplete(WorkspaceCodemapStoreSelectionGraphQueryIncompleteReason)
     case unavailable(WorkspaceCodemapStoreSelectionGraphQueryUnavailableReason)
     case stale(WorkspaceCodemapStoreSelectionGraphQueryStaleReason)
     case busy(WorkspaceCodemapStoreSelectionGraphQueryBusyReason)

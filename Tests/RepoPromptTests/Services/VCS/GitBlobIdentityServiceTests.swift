@@ -88,6 +88,96 @@ final class GitBlobIdentityServiceTests: XCTestCase {
         XCTAssertEqual(eligibleOID(retargeted), expectedOID)
     }
 
+    func testNestedRepositoryMarkersBlockOuterBlobIdentityWhileNestedRootRemainsEligible() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let contents = "struct BoundaryOwned {}\n"
+        let repository = try fixture.makeRepository(
+            named: "outer",
+            files: [
+                "Nested/Sources/Feature.swift": contents,
+                "GitFileBoundary/Sources/Feature.swift": contents
+            ]
+        )
+        let nested = repository.appendingPathComponent("Nested", isDirectory: true)
+        _ = try fixture.runGit(["init"], at: nested)
+        _ = try fixture.runGit(["config", "user.name", "RepoPrompt Test"], at: nested)
+        _ = try fixture.runGit(["config", "user.email", "repoprompt@example.test"], at: nested)
+        _ = try fixture.runGit(["config", "commit.gpgSign", "false"], at: nested)
+        _ = try fixture.runGit(["checkout", "-b", "nested-main"], at: nested)
+        _ = try fixture.runGit(["add", "."], at: nested)
+        _ = try fixture.runGit(["commit", "-m", "Nested repository"], at: nested)
+        try "gitdir: /untrusted/external/repository\n".write(
+            to: repository.appendingPathComponent("GitFileBoundary/.git"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let service = GitBlobIdentityService()
+        let outer = await service.classify(
+            workspaceRoot: repository,
+            relativePaths: [
+                "Nested/Sources/Feature.swift",
+                "GitFileBoundary/Sources/Feature.swift"
+            ]
+        )
+        XCTAssertNil(outer.failure)
+        XCTAssertEqual(
+            outer.classifications.map(\.outcome),
+            [.unavailable(.repositoryUnavailable), .unavailable(.repositoryUnavailable)]
+        )
+        XCTAssertTrue(outer.classifications.allSatisfy { classification in
+            classification.indexEntries.contains { entry in
+                entry.stage == 0 && entry.oid == (try? fixture.headBlobOID(
+                    for: classification.repositoryRelativePath ?? "",
+                    at: repository
+                ))
+            }
+        })
+
+        let nestedBatch = await service.classify(
+            workspaceRoot: nested,
+            relativePaths: ["Sources/Feature.swift"]
+        )
+        XCTAssertEqual(
+            eligibleOID(nestedBatch),
+            try fixture.headBlobOID(for: "Sources/Feature.swift", at: nested)
+        )
+    }
+
+    func testConeSparseCheckoutClassifiesPresentBlobAndReportsSparseAbsent() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let repository = try fixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Included.swift": "struct Included {}\n",
+                "Excluded/Absent.swift": "struct Absent {}\n"
+            ]
+        )
+        _ = try fixture.runGit(["sparse-checkout", "init", "--cone"], at: repository)
+        _ = try fixture.runGit(["sparse-checkout", "set", "Sources"], at: repository)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: repository.appendingPathComponent("Excluded/Absent.swift").path
+            )
+        )
+
+        let batch = await GitBlobIdentityService().classify(
+            workspaceRoot: repository,
+            relativePaths: ["Sources/Included.swift", "Excluded/Absent.swift"]
+        )
+        XCTAssertNil(batch.failure)
+        XCTAssertEqual(batch.classifications.count, 2)
+        XCTAssertEqual(
+            batch.classifications[0].outcome,
+            try .oidEligible(GitBlobOID(
+                objectFormat: .sha1,
+                lowercaseHex: fixture.headBlobOID(for: "Sources/Included.swift", at: repository)
+            ))
+        )
+        XCTAssertTrue(batch.classifications[1].skipWorktree)
+        XCTAssertEqual(batch.classifications[1].outcome, .unavailable(.sparseAbsent))
+    }
+
     func testSHA256RepositoryUsesExplicitObjectFormatAndOIDLength() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
         let repository: URL

@@ -52,7 +52,6 @@ struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
     let initialBackoffMilliseconds: Int
     let maximumBackoffMilliseconds: Int
     let maximumTotalWait: Duration
-    let maximumCandidateCountPerRoot: Int
     let maximumCandidateDemandCount: Int
 
     init(
@@ -60,19 +59,16 @@ struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
         initialBackoffMilliseconds: Int = 50,
         maximumBackoffMilliseconds: Int = 400,
         maximumTotalWait: Duration = .seconds(2),
-        maximumCandidateCountPerRoot: Int = 8192,
         maximumCandidateDemandCount: Int = 1024
     ) {
         precondition(maximumReadinessRounds > 0)
         precondition(initialBackoffMilliseconds > 0)
         precondition(maximumBackoffMilliseconds >= initialBackoffMilliseconds)
-        precondition(maximumCandidateCountPerRoot > 0)
         precondition(maximumCandidateDemandCount > 0)
         self.maximumReadinessRounds = maximumReadinessRounds
         self.initialBackoffMilliseconds = initialBackoffMilliseconds
         self.maximumBackoffMilliseconds = maximumBackoffMilliseconds
         self.maximumTotalWait = maximumTotalWait
-        self.maximumCandidateCountPerRoot = maximumCandidateCountPerRoot
         self.maximumCandidateDemandCount = maximumCandidateDemandCount
     }
 }
@@ -87,6 +83,7 @@ struct WorkspaceCodemapAutomaticSelectionWaiter {
 
 private actor WorkspaceCodemapAutomaticSelectionDemandOwnership {
     private var retainedTickets = Set<WorkspaceCodemapArtifactDemandTicket>()
+    private var retainedProjectionTickets = Set<WorkspaceCodemapProjectionDemandTicket>()
 
     func record(_ ownedResult: WorkspaceCodemapArtifactDemandOwnedResult) {
         switch ownedResult.ownership {
@@ -112,9 +109,46 @@ private actor WorkspaceCodemapAutomaticSelectionDemandOwnership {
         retainedTickets.contains(ticket)
     }
 
+    func tickets() -> [WorkspaceCodemapArtifactDemandTicket] {
+        Array(retainedTickets)
+    }
+
+    func record(_ ticket: WorkspaceCodemapProjectionDemandTicket) {
+        retainedProjectionTickets.insert(ticket)
+    }
+
+    func drainRetainedProjectionTickets() -> [WorkspaceCodemapProjectionDemandTicket] {
+        defer { retainedProjectionTickets.removeAll() }
+        return Array(retainedProjectionTickets)
+    }
+
     func drainRetainedTickets() -> [WorkspaceCodemapArtifactDemandTicket] {
         defer { retainedTickets.removeAll() }
         return Array(retainedTickets)
+    }
+
+    func transferSourceTickets(
+        matching sourceTickets: [WorkspaceCodemapArtifactDemandTicket]
+    ) -> (sources: [WorkspaceCodemapArtifactDemandTicket], remainder: [WorkspaceCodemapArtifactDemandTicket])? {
+        var available = retainedTickets
+        var transferred: [WorkspaceCodemapArtifactDemandTicket] = []
+        transferred.reserveCapacity(sourceTickets.count)
+        for source in sourceTickets {
+            let matches = available.filter { candidate in
+                candidate.requestID == source.requestID &&
+                    candidate.rootEpoch == source.rootEpoch &&
+                    candidate.fileID == source.fileID &&
+                    candidate.requestGeneration == source.requestGeneration &&
+                    candidate.catalogGeneration == source.catalogGeneration &&
+                    candidate.pathGeneration == source.pathGeneration &&
+                    candidate.ingressGeneration == source.ingressGeneration
+            }.sorted { $0.retainID.uuidString < $1.retainID.uuidString }
+            guard let match = matches.first else { return nil }
+            available.remove(match)
+            transferred.append(match)
+        }
+        retainedTickets.removeAll()
+        return (transferred, Array(available))
     }
 }
 
@@ -811,15 +845,47 @@ struct WorkspaceSelectionMutationService {
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> WorkspaceCodemapAutomaticSelectionResult {
         let ownership = WorkspaceCodemapAutomaticSelectionDemandOwnership()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: automaticSelectionPolicy.maximumTotalWait)
         do {
-            return try await resolveAutomaticCodemapSelectionRetainingOwnership(
+            let result = try await resolveAutomaticCodemapSelectionRetainingOwnership(
                 sourceFileIDs: sourceFileIDs,
                 rootScope: rootScope,
-                ownership: ownership
+                ownership: ownership,
+                clock: clock,
+                deadline: deadline
+            )
+            let projectionTickets = await ownership.drainRetainedProjectionTickets()
+            var projectionCleanupCompletedBeforeDeadline = automaticSelectionDeadlineIsCurrent(
+                clock: clock,
+                deadline: deadline
+            )
+            for ticket in projectionTickets {
+                _ = await store.releaseCodemapProjectionDemand(ticket, deadline: deadline)
+                if !automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) {
+                    projectionCleanupCompletedBeforeDeadline = false
+                }
+            }
+            guard projectionCleanupCompletedBeforeDeadline else {
+                let artifactTickets = await ownership.drainRetainedTickets()
+                return await failClosedAutomaticSelection(
+                    permits: [result.publicationReceipt?.publicationPermit].compactMap(\.self),
+                    tickets: artifactTickets,
+                    deadline: deadline
+                )
+            }
+            return await finalizeAutomaticSelectionOwnership(
+                result,
+                ownership: ownership,
+                clock: clock,
+                deadline: deadline
             )
         } catch {
+            for ticket in await ownership.drainRetainedProjectionTickets() {
+                _ = await store.releaseCodemapProjectionDemand(ticket, deadline: deadline)
+            }
             for ticket in await ownership.drainRetainedTickets() {
-                _ = await store.cancelCodemapArtifactDemand(ticket)
+                _ = await store.cancelCodemapArtifactDemand(ticket, deadline: deadline)
             }
             if Task.isCancelled || error is CancellationError {
                 throw CancellationError()
@@ -828,10 +894,152 @@ struct WorkspaceSelectionMutationService {
         }
     }
 
+    private func finalizeAutomaticSelectionOwnership(
+        _ result: WorkspaceCodemapAutomaticSelectionResult,
+        ownership: WorkspaceCodemapAutomaticSelectionDemandOwnership,
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) async -> WorkspaceCodemapAutomaticSelectionResult {
+        guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) else {
+            let tickets = await ownership.drainRetainedTickets()
+            return await failClosedAutomaticSelection(
+                permits: [result.publicationReceipt?.publicationPermit].compactMap(\.self),
+                tickets: tickets,
+                deadline: deadline
+            )
+        }
+        guard let receipt = result.publicationReceipt else {
+            let tickets = await ownership.drainRetainedTickets()
+            guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) else {
+                return await failClosedAutomaticSelection(tickets: tickets, deadline: deadline)
+            }
+            for ticket in tickets {
+                _ = await store.cancelCodemapArtifactDemand(ticket, deadline: deadline)
+                guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) else {
+                    return await failClosedAutomaticSelection(tickets: tickets, deadline: deadline)
+                }
+            }
+            return result
+        }
+        let transfer = await ownership.transferSourceTickets(matching: receipt.sourceTickets)
+        guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) else {
+            let tickets: [WorkspaceCodemapArtifactDemandTicket] = if let transfer {
+                transfer.sources + transfer.remainder
+            } else {
+                await ownership.drainRetainedTickets()
+            }
+            return await failClosedAutomaticSelection(
+                permits: [receipt.publicationPermit],
+                tickets: tickets,
+                deadline: deadline
+            )
+        }
+        guard let transfer,
+              transfer.sources.count == receipt.sourceTickets.count
+        else {
+            let tickets = await ownership.drainRetainedTickets()
+            return await failClosedAutomaticSelection(
+                permits: [receipt.publicationPermit],
+                tickets: tickets,
+                deadline: deadline
+            )
+        }
+        for ticket in transfer.remainder {
+            _ = await store.cancelCodemapArtifactDemand(ticket, deadline: deadline)
+            guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) else {
+                return await failClosedAutomaticSelection(
+                    permits: [receipt.publicationPermit],
+                    tickets: transfer.sources + transfer.remainder,
+                    deadline: deadline
+                )
+            }
+        }
+        for rootEpoch in Set(transfer.remainder.map(\.rootEpoch)) {
+            let publicationCurrent = await store.waitForCodemapGraphPublication(
+                rootEpoch: rootEpoch,
+                deadline: deadline
+            )
+            guard publicationCurrent,
+                  automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline)
+            else {
+                return await failClosedAutomaticSelection(
+                    permits: [receipt.publicationPermit],
+                    tickets: transfer.sources,
+                    deadline: deadline
+                )
+            }
+        }
+        let refreshedResult = await store.refreshAutomaticCodemapSelectionResultForCurrentProjection(
+            result,
+            sourceTickets: transfer.sources,
+            rootScope: receipt.rootScope,
+            deadline: deadline
+        )
+        guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline),
+              let refreshedResult,
+              let refreshedReceipt = refreshedResult.publicationReceipt
+        else {
+            return await failClosedAutomaticSelection(
+                permits: [receipt.publicationPermit, refreshedResult?.publicationReceipt?.publicationPermit]
+                    .compactMap(\.self),
+                tickets: transfer.sources,
+                deadline: deadline
+            )
+        }
+        let store = store
+        let lease = WorkspaceCodemapAutomaticSelectionPublicationLease {
+            for ticket in transfer.sources {
+                _ = await store.releaseReadyCodemapArtifactDemandRetain(ticket)
+            }
+        }
+        let leasedReceipt = WorkspaceCodemapAutomaticSelectionPublicationReceipt(
+            requestID: refreshedReceipt.requestID,
+            rootScope: refreshedReceipt.rootScope,
+            rootScopeEpochs: refreshedReceipt.rootScopeEpochs,
+            sourceTickets: transfer.sources,
+            graphKeys: refreshedReceipt.graphKeys,
+            coverageProofs: refreshedReceipt.coverageProofs,
+            targets: refreshedReceipt.targets,
+            publicationPermit: refreshedReceipt.publicationPermit,
+            publicationLease: lease
+        )
+        return WorkspaceCodemapAutomaticSelectionResult(
+            roots: refreshedResult.roots,
+            aggregateCoverage: refreshedResult.aggregateCoverage,
+            publicationReceipt: leasedReceipt
+        )
+    }
+
+    private func automaticSelectionDeadlineIsCurrent(
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) -> Bool {
+        !Task.isCancelled && clock.now < deadline
+    }
+
+    private func failClosedAutomaticSelection(
+        permits: [WorkspaceCodemapAutomaticSelectionPublicationPermit] = [],
+        tickets: [WorkspaceCodemapArtifactDemandTicket],
+        deadline: ContinuousClock.Instant
+    ) async -> WorkspaceCodemapAutomaticSelectionResult {
+        for permit in permits {
+            permit.revoke()
+        }
+        for ticket in tickets {
+            _ = await store.cancelCodemapArtifactDemand(ticket, deadline: deadline)
+        }
+        return WorkspaceCodemapAutomaticSelectionResult(
+            roots: [],
+            aggregateCoverage: .stale(.publicationReceipt)
+        )
+    }
+
     private func resolveAutomaticCodemapSelectionRetainingOwnership(
         sourceFileIDs: [UUID],
         rootScope: WorkspaceLookupRootScope,
-        ownership: WorkspaceCodemapAutomaticSelectionDemandOwnership
+        ownership: WorkspaceCodemapAutomaticSelectionDemandOwnership,
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
     ) async throws -> WorkspaceCodemapAutomaticSelectionResult {
         try Task.checkCancellation()
         let identities = await store.codemapAutomaticSelectionSourceIdentities(
@@ -854,8 +1062,6 @@ struct WorkspaceSelectionMutationService {
             )
         }
 
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: automaticSelectionPolicy.maximumTotalWait)
         var sourceResults: [WorkspaceCodemapAutomaticSelectionSourceIdentity: WorkspaceCodemapArtifactDemandResult] = [:]
         var sourceTickets: [WorkspaceCodemapAutomaticSelectionSourceIdentity: WorkspaceCodemapArtifactDemandTicket] = [:]
         do {
@@ -903,12 +1109,12 @@ struct WorkspaceSelectionMutationService {
             if !hasPending || round + 1 == automaticSelectionPolicy.maximumReadinessRounds || clock.now >= deadline {
                 break
             }
-            try await waitForAutomaticSelectionRound(
+            guard try await waitForAutomaticSelectionRound(
                 round: round,
                 retryAfterMilliseconds: busySources.compactMap(\.2),
                 clock: clock,
                 deadline: deadline
-            )
+            ) else { break }
             for (source, existingTicket, _) in busySources {
                 sourceAttempts[source, default: 0] += 1
                 let result: WorkspaceCodemapArtifactDemandResult
@@ -965,36 +1171,104 @@ struct WorkspaceSelectionMutationService {
                 aggregateCoverage: coverage
             )
         }
+        let allSourceRootEpochs = Set(identities.map(\.rootEpoch))
+        let readySourceRootEpochs = Set(readySources.map(\.rootEpoch))
+        guard readySourceRootEpochs == allSourceRootEpochs else {
+            let coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage =
+                sourcePendingReasons.isEmpty
+                    ? .unavailable(.noReadySources)
+                    : .pending(sourcePendingReasons)
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: coverage
+            )
+        }
+
+        let retainedSourceTickets = await ownership.tickets()
+        let readySourceIDs = Set(readySources.map(\.fileID))
+        let sourceTicketsByRoot = Dictionary(
+            grouping: retainedSourceTickets.filter { readySourceIDs.contains($0.fileID) },
+            by: \.rootEpoch
+        )
+        let projectionDeadline = projectionDeadlineUptimeNanoseconds(clock: clock, deadline: deadline)
+        for rootEpoch in sourceTicketsByRoot.keys.sorted(by: codemapRootEpochPrecedes) {
+            let acquisition = await store.acquireCodemapProjectionDemand(
+                sourceTickets: sourceTicketsByRoot[rootEpoch] ?? [],
+                deadlineUptimeNanoseconds: projectionDeadline
+            )
+            if case let .acquired(ticket, _) = acquisition {
+                await ownership.record(ticket)
+            }
+        }
 
         var candidatePlanDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition =
             .pending([])
+        var provisionallyDemandedFileIDs = Set<UUID>()
         for round in 0 ..< automaticSelectionPolicy.maximumReadinessRounds {
             try Task.checkCancellation()
             candidatePlanDisposition = await store.planAutomaticCodemapSelectionCandidates(
                 sources: readySources,
                 rootScope: rootScope,
-                maximumCandidateCountPerRoot: automaticSelectionPolicy.maximumCandidateCountPerRoot,
                 maximumCandidateDemandCount: automaticSelectionPolicy.maximumCandidateDemandCount
             )
-            guard case .pending = candidatePlanDisposition,
+            if case let .provisional(provisional) = candidatePlanDisposition {
+                for candidate in provisional.candidates
+                    where !provisionallyDemandedFileIDs.contains(candidate.identity.fileID)
+                {
+                    guard let owned = await store.requestProvisionalAutomaticCodemapArtifactWithOwnership(
+                        candidate: candidate,
+                        rootScope: rootScope,
+                        rootScopeEpochs: provisional.rootScopeEpochs
+                    ) else { continue }
+                    await ownership.record(owned)
+                    switch owned.result {
+                    case .ready, .pending:
+                        provisionallyDemandedFileIDs.insert(candidate.identity.fileID)
+                    case .unavailable(.busy):
+                        break
+                    case .unavailable:
+                        provisionallyDemandedFileIDs.insert(candidate.identity.fileID)
+                    }
+                }
+            }
+            let shouldRetry = switch candidatePlanDisposition {
+            case .provisional, .incomplete, .pending, .busy: true
+            case .ready, .unavailable, .stale, .budget: false
+            }
+            guard shouldRetry,
                   round + 1 < automaticSelectionPolicy.maximumReadinessRounds,
                   clock.now < deadline
             else { break }
-            try await waitForAutomaticSelectionRound(
+            guard try await waitForAutomaticSelectionRound(
                 round: round,
                 retryAfterMilliseconds: [],
                 clock: clock,
                 deadline: deadline
-            )
+            ) else { break }
         }
         let candidatePlan: WorkspaceCodemapAutomaticSelectionCandidatePlan
         switch candidatePlanDisposition {
         case let .ready(plan):
             candidatePlan = plan
+        case let .provisional(plan):
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .incomplete(plan.incompleteReasons)
+            )
+        case let .incomplete(reasons):
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .incomplete(reasons)
+            )
         case let .pending(reasons):
             return WorkspaceCodemapAutomaticSelectionResult(
                 roots: [],
                 aggregateCoverage: .pending(reasons)
+            )
+        case let .busy(reason):
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .busy(reason)
             )
         case let .unavailable(reason):
             return WorkspaceCodemapAutomaticSelectionResult(
@@ -1017,10 +1291,21 @@ struct WorkspaceSelectionMutationService {
         var candidateTickets: [UUID: WorkspaceCodemapArtifactDemandTicket] = [:]
         for candidate in candidatePlan.candidates {
             let fileID = candidate.identity.fileID
-            let ownedResult = await store.requestCodemapArtifactWithOwnership(
-                forFileID: fileID,
-                priority: .background
-            )
+            guard let ownedResult = await store.requestAutomaticCodemapArtifactWithOwnership(
+                candidate: candidate,
+                rootScope: rootScope,
+                rootScopeEpochs: candidatePlan.rootScopeEpochs,
+                coverageProofs: candidatePlan.coverageProofs
+            ) else {
+                let rootEpoch = WorkspaceCodemapRootEpoch(
+                    rootID: candidate.identity.rootID,
+                    rootLifetimeID: candidate.identity.rootLifetimeID
+                )
+                return WorkspaceCodemapAutomaticSelectionResult(
+                    roots: [],
+                    aggregateCoverage: .stale(.coverageProof(rootEpoch))
+                )
+            }
             await ownership.record(ownedResult)
             let result = ownedResult.result
             candidateResults[fileID] = result
@@ -1052,30 +1337,62 @@ struct WorkspaceSelectionMutationService {
             if !hasPending || round + 1 == automaticSelectionPolicy.maximumReadinessRounds || clock.now >= deadline {
                 break
             }
-            try await waitForAutomaticSelectionRound(
+            guard try await waitForAutomaticSelectionRound(
                 round: round,
                 retryAfterMilliseconds: busyCandidates.compactMap(\.2),
                 clock: clock,
                 deadline: deadline
-            )
+            ) else { break }
             for (fileID, existingTicket, _) in busyCandidates {
                 candidateAttempts[fileID, default: 0] += 1
                 let result: WorkspaceCodemapArtifactDemandResult
+                guard let candidate = candidatePlan.candidates.first(where: {
+                    $0.identity.fileID == fileID
+                }) else {
+                    return WorkspaceCodemapAutomaticSelectionResult(
+                        roots: [],
+                        aggregateCoverage: .stale(.publicationReceipt)
+                    )
+                }
                 if let existingTicket {
                     if await ownership.owns(existingTicket) {
-                        result = await store.retryBusyCodemapArtifactDemand(
+                        guard let ownedResult = await store.retryBusyAutomaticCodemapArtifactDemand(
                             existingTicket,
-                            priority: .background
-                        )
-                        await ownership.recordCreatedResult(result)
+                            candidate: candidate,
+                            rootScope: rootScope,
+                            rootScopeEpochs: candidatePlan.rootScopeEpochs,
+                            coverageProofs: candidatePlan.coverageProofs
+                        ) else {
+                            let rootEpoch = WorkspaceCodemapRootEpoch(
+                                rootID: candidate.identity.rootID,
+                                rootLifetimeID: candidate.identity.rootLifetimeID
+                            )
+                            return WorkspaceCodemapAutomaticSelectionResult(
+                                roots: [],
+                                aggregateCoverage: .stale(.coverageProof(rootEpoch))
+                            )
+                        }
+                        await ownership.record(ownedResult)
+                        result = ownedResult.result
                     } else {
                         result = candidateResults[fileID] ?? .unavailable(.busy(retryAfterMilliseconds: nil))
                     }
                 } else {
-                    let ownedResult = await store.requestCodemapArtifactWithOwnership(
-                        forFileID: fileID,
-                        priority: .background
-                    )
+                    guard let ownedResult = await store.requestAutomaticCodemapArtifactWithOwnership(
+                        candidate: candidate,
+                        rootScope: rootScope,
+                        rootScopeEpochs: candidatePlan.rootScopeEpochs,
+                        coverageProofs: candidatePlan.coverageProofs
+                    ) else {
+                        let rootEpoch = WorkspaceCodemapRootEpoch(
+                            rootID: candidate.identity.rootID,
+                            rootLifetimeID: candidate.identity.rootLifetimeID
+                        )
+                        return WorkspaceCodemapAutomaticSelectionResult(
+                            roots: [],
+                            aggregateCoverage: .stale(.coverageProof(rootEpoch))
+                        )
+                    }
                     await ownership.record(ownedResult)
                     result = ownedResult.result
                 }
@@ -1084,7 +1401,6 @@ struct WorkspaceSelectionMutationService {
             }
         }
 
-        var candidatePartialReasons = candidatePlan.partialReasons
         var candidatePendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason] = []
         for candidate in candidatePlan.candidates {
             let fileID = candidate.identity.fileID
@@ -1108,14 +1424,17 @@ struct WorkspaceSelectionMutationService {
                     attempts: candidateAttempts[fileID, default: 0]
                 ))
             case let .unavailable(reason):
-                candidatePartialReasons.append(.candidateTerminal(
-                    rootEpoch: WorkspaceCodemapRootEpoch(
-                        rootID: candidate.identity.rootID,
-                        rootLifetimeID: candidate.identity.rootLifetimeID
-                    ),
-                    fileID: fileID,
-                    reason: reason
-                ))
+                return WorkspaceCodemapAutomaticSelectionResult(
+                    roots: [],
+                    aggregateCoverage: .unavailable(.candidate(
+                        rootEpoch: WorkspaceCodemapRootEpoch(
+                            rootID: candidate.identity.rootID,
+                            rootLifetimeID: candidate.identity.rootLifetimeID
+                        ),
+                        fileID: fileID,
+                        reason: reason
+                    ))
+                )
             }
         }
         if !candidatePendingReasons.isEmpty {
@@ -1131,38 +1450,34 @@ struct WorkspaceSelectionMutationService {
         )
         for round in 1 ..< automaticSelectionPolicy.maximumReadinessRounds {
             let shouldRetry = switch result.aggregateCoverage {
-            case .busy, .pending: true
+            case .incomplete, .busy, .pending: true
             case .complete, .partial, .unavailable, .stale, .budget: false
             }
             guard shouldRetry, clock.now < deadline else { break }
-            try await waitForAutomaticSelectionRound(
+            guard try await waitForAutomaticSelectionRound(
                 round: round,
                 retryAfterMilliseconds: [],
                 clock: clock,
                 deadline: deadline
-            )
+            ) else { break }
             result = try await store.resolveAutomaticCodemapSelection(
                 sources: readySources,
                 rootScope: rootScope
             )
         }
-        let partialReasons = sourcePartialReasons + candidatePartialReasons
-        guard !partialReasons.isEmpty else { return result }
         switch result.aggregateCoverage {
-        case .complete:
+        case let .complete(proofs):
+            guard !sourcePartialReasons.isEmpty else { return result }
             return WorkspaceCodemapAutomaticSelectionResult(
-                roots: result.roots,
-                aggregateCoverage: .partial(partialReasons),
-                publicationReceipt: result.publicationReceipt
+                roots: [],
+                aggregateCoverage: .partial(proofs: proofs, reasons: sourcePartialReasons)
             )
-        case let .partial(existing):
+        case .partial, .incomplete, .pending, .unavailable, .stale, .busy, .budget:
+            // Automatic selection is atomic: incomplete coverage never exposes targets or a receipt.
             return WorkspaceCodemapAutomaticSelectionResult(
-                roots: result.roots,
-                aggregateCoverage: .partial(existing + partialReasons),
-                publicationReceipt: result.publicationReceipt
+                roots: [],
+                aggregateCoverage: result.aggregateCoverage
             )
-        case .pending, .unavailable, .stale, .busy, .budget:
-            return result
         }
     }
 
@@ -1181,7 +1496,7 @@ struct WorkspaceSelectionMutationService {
         retryAfterMilliseconds: [Int],
         clock: ContinuousClock,
         deadline: ContinuousClock.Instant
-    ) async throws {
+    ) async throws -> Bool {
         try Task.checkCancellation()
         let exponential = automaticSelectionPolicy.initialBackoffMilliseconds << min(round, 3)
         let suggested = retryAfterMilliseconds.max() ?? exponential
@@ -1190,9 +1505,40 @@ struct WorkspaceSelectionMutationService {
             max(automaticSelectionPolicy.initialBackoffMilliseconds, suggested)
         )
         let remaining = clock.now.duration(to: deadline)
-        guard remaining > .zero else { return }
+        guard remaining > .zero else { return false }
         try await automaticSelectionWaiter.sleep(min(.milliseconds(milliseconds), remaining))
         try Task.checkCancellation()
+        return clock.now < deadline
+    }
+
+    private func projectionDeadlineUptimeNanoseconds(
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) -> UInt64 {
+        let remaining = clock.now.duration(to: deadline)
+        guard remaining > .zero else { return DispatchTime.now().uptimeNanoseconds }
+        let components = remaining.components
+        guard components.seconds >= 0, components.attoseconds >= 0 else {
+            return DispatchTime.now().uptimeNanoseconds
+        }
+        let seconds = UInt64(components.seconds)
+        let attoseconds = UInt64(components.attoseconds)
+        let (secondNanoseconds, secondsOverflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        let (combinedNanoseconds, combinedOverflow) = secondNanoseconds.addingReportingOverflow(
+            attoseconds / 1_000_000_000
+        )
+        let remainingNanoseconds = secondsOverflow || combinedOverflow ? UInt64.max : combinedNanoseconds
+        let now = DispatchTime.now().uptimeNanoseconds
+        let (value, overflow) = now.addingReportingOverflow(remainingNanoseconds)
+        return overflow ? UInt64.max : value
+    }
+
+    private func codemapRootEpochPrecedes(
+        _ lhs: WorkspaceCodemapRootEpoch,
+        _ rhs: WorkspaceCodemapRootEpoch
+    ) -> Bool {
+        if lhs.rootID != rhs.rootID { return lhs.rootID.uuidString < rhs.rootID.uuidString }
+        return lhs.rootLifetimeID.uuidString < rhs.rootLifetimeID.uuidString
     }
 
     private func orderedInputs(_ paths: [String]) -> [String] {

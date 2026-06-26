@@ -876,6 +876,22 @@ actor WorkspaceCodemapLiveOverlay {
         return cancellationCount
     }
 
+    @discardableResult
+    func revokeReadyArtifact(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        fileID: UUID,
+        requestGeneration: UInt64
+    ) -> Bool {
+        guard var root = roots[rootEpoch],
+              case let .ready(ready)? = root.liveByFileID[fileID],
+              ready.completion.token.requestGeneration == requestGeneration
+        else { return false }
+        removeLiveEntry(fileID: fileID, from: &root)
+        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
+        roots[rootEpoch] = root
+        return true
+    }
+
     func acceptCompletion(
         ticket: WorkspaceCodemapLiveDemandTicket,
         completion: WorkspaceCodemapArtifactCompletion,
@@ -1175,6 +1191,41 @@ actor WorkspaceCodemapLiveOverlay {
         )
     }
 
+    func freezeReadyArtifact(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        fileID: UUID,
+        requestGeneration: UInt64
+    ) -> WorkspaceCodemapLiveOverlayBundle? {
+        guard requestGeneration > 0 else { return nil }
+        ensureAccessOrdinalCapacity(requiredCount: 1)
+        guard var root = roots[rootEpoch],
+              root.authorityIsCurrent
+        else { return nil }
+
+        let matches = visibleReadyEntries(root).filter {
+            $0.binding.identity.fileID == fileID &&
+                $0.completion.token.requestGeneration == requestGeneration
+        }
+        guard matches.count == 1, let matchedReady = matches.first else { return nil }
+
+        touchVisibleReadyEntry(&root, matching: matchedReady)
+        let refreshedMatches = visibleReadyEntries(root).filter {
+            $0.binding.identity.fileID == fileID &&
+                $0.completion.token.requestGeneration == requestGeneration
+        }
+        guard refreshedMatches.count == 1, let ready = refreshedMatches.first else { return nil }
+        roots[rootEpoch] = root
+        return WorkspaceCodemapLiveOverlayBundle(
+            rootEpoch: rootEpoch,
+            catalogGeneration: root.registration.catalogGeneration,
+            repositoryAuthority: root.registration.capability.repositoryAuthority,
+            contributionGeneration: root.contributionGeneration,
+            entries: [readySnapshot(rootEpoch: rootEpoch, ready: ready)],
+            bindings: [ready.binding],
+            leaseOwners: [ready.leaseOwner]
+        )
+    }
+
     func graphContributions(rootEpoch: WorkspaceCodemapRootEpoch) -> WorkspaceCodemapLiveGraphSnapshot? {
         ensureAccessOrdinalCapacity(requiredCount: roots[rootEpoch].map { visibleReadyEntries($0).count } ?? 0)
         guard var root = roots[rootEpoch], root.authorityIsCurrent else { return nil }
@@ -1314,6 +1365,36 @@ actor WorkspaceCodemapLiveOverlay {
         guard var root = roots[rootEpoch], root.authorityIsCurrent else { return }
         touchVisibleReadyEntries(&root)
         roots[rootEpoch] = root
+    }
+
+    private func touchVisibleReadyEntry(
+        _ root: inout RootState,
+        matching selected: StoredReady
+    ) {
+        let identity = selected.binding.identity
+        let requestGeneration = selected.completion.token.requestGeneration
+        if case var .ready(ready)? = root.liveByFileID[identity.fileID],
+           ready.binding.identity == identity,
+           ready.completion.token.requestGeneration == requestGeneration
+        {
+            ready.accessOrdinal = takeAccessOrdinal()
+            root.liveByFileID[identity.fileID] = .ready(ready)
+            return
+        }
+
+        let relativePath = identity.standardizedRelativePath
+        guard root.liveFileIDByRelativePath[relativePath] == nil,
+              let pipelineIdentity = root.cleanPipelineByRelativePath[relativePath],
+              root.shadows[ShadowKey(
+                  pipelineIdentity: pipelineIdentity,
+                  relativePath: relativePath
+              )] == nil,
+              var ready = root.cleanByRelativePath[relativePath],
+              ready.binding.identity == identity,
+              ready.completion.token.requestGeneration == requestGeneration
+        else { return }
+        ready.accessOrdinal = takeAccessOrdinal()
+        root.cleanByRelativePath[relativePath] = ready
     }
 
     private func touchVisibleReadyEntries(_ root: inout RootState) {

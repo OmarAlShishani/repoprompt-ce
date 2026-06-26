@@ -1,5 +1,66 @@
 import Foundation
 
+final class WorkspaceCodemapAutomaticSelectionPublicationPermit: @unchecked Sendable, Equatable {
+    private let lock = NSLock()
+    private var current = true
+
+    static func == (
+        lhs: WorkspaceCodemapAutomaticSelectionPublicationPermit,
+        rhs: WorkspaceCodemapAutomaticSelectionPublicationPermit
+    ) -> Bool {
+        lhs === rhs
+    }
+
+    func withCurrent<T>(_ body: () -> T) -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard current else { return nil }
+        return body()
+    }
+
+    func revoke() {
+        lock.lock()
+        current = false
+        lock.unlock()
+    }
+}
+
+final class WorkspaceCodemapAutomaticSelectionPublicationLease: @unchecked Sendable, Equatable {
+    private let lock = NSLock()
+    private var releaseAction: (@Sendable () async -> Void)?
+
+    init(release: @escaping @Sendable () async -> Void) {
+        releaseAction = release
+    }
+
+    static func == (
+        lhs: WorkspaceCodemapAutomaticSelectionPublicationLease,
+        rhs: WorkspaceCodemapAutomaticSelectionPublicationLease
+    ) -> Bool {
+        lhs === rhs
+    }
+
+    func release() async {
+        let action = lock.withLock {
+            let action = releaseAction
+            releaseAction = nil
+            return action
+        }
+        await action?()
+    }
+
+    deinit {
+        let action = lock.withLock {
+            let action = releaseAction
+            releaseAction = nil
+            return action
+        }
+        if let action {
+            Task { await action() }
+        }
+    }
+}
+
 struct WorkspaceCodemapAutomaticSelectionSourceIdentity: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let fileID: UUID
@@ -45,18 +106,11 @@ enum WorkspaceCodemapAutomaticSelectionTargetIssue: Equatable {
 enum WorkspaceCodemapAutomaticSelectionPartialReason: Equatable {
     case graph(WorkspaceCodemapStoreSelectionGraphPartialReason)
     case source(WorkspaceCodemapAutomaticSelectionSourceIssue)
-    case target(WorkspaceCodemapAutomaticSelectionTargetIssue)
-    case candidateUniverseIncomplete(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        missingContributionCount: Int
-    )
-    case candidateTerminal(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        fileID: UUID,
-        reason: WorkspaceCodemapArtifactDemandUnavailableReason
-    )
     case sourceDemandTimedOut(WorkspaceCodemapAutomaticSelectionSourceIdentity)
-    case candidateDemandTimedOut(rootEpoch: WorkspaceCodemapRootEpoch, fileID: UUID)
+}
+
+enum WorkspaceCodemapAutomaticSelectionIncompleteReason: Equatable {
+    case graph(WorkspaceCodemapStoreSelectionGraphQueryIncompleteReason)
 }
 
 enum WorkspaceCodemapAutomaticSelectionPendingReason: Equatable {
@@ -77,6 +131,11 @@ enum WorkspaceCodemapAutomaticSelectionPendingReason: Equatable {
 
 enum WorkspaceCodemapAutomaticSelectionUnavailableReason: Equatable {
     case noReadySources
+    case candidate(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        fileID: UUID,
+        reason: WorkspaceCodemapArtifactDemandUnavailableReason
+    )
     case graph(WorkspaceCodemapStoreSelectionGraphQueryUnavailableReason)
 }
 
@@ -88,6 +147,8 @@ enum WorkspaceCodemapAutomaticSelectionStaleReason: Equatable {
         WorkspaceCodemapAutomaticSelectionSourceIdentity,
         currentCatalogGeneration: UInt64?
     )
+    case targetStateChanged(WorkspaceCodemapAutomaticSelectionTargetIssue)
+    case coverageProof(WorkspaceCodemapRootEpoch)
     case graph(WorkspaceCodemapStoreSelectionGraphQueryStaleReason)
     case publicationReceipt
 }
@@ -97,7 +158,6 @@ enum WorkspaceCodemapAutomaticSelectionBudgetReason: Equatable {
     case uniqueSourceLimit(attempted: Int, limit: Int)
     case sourceIssueLimit(attempted: Int, limit: Int)
     case rootLimit(attempted: Int, limit: Int)
-    case candidateUniverseLimit(attempted: Int, limit: Int)
     case candidateDemandLimit(attempted: Int, limit: Int)
     case targetLimit(attempted: Int, limit: Int)
     case resolutionLimit(attempted: Int, limit: Int)
@@ -111,8 +171,12 @@ enum WorkspaceCodemapAutomaticSelectionBudgetReason: Equatable {
 }
 
 enum WorkspaceCodemapAutomaticSelectionCoverage: Equatable {
-    case complete
-    case partial([WorkspaceCodemapAutomaticSelectionPartialReason])
+    case complete(WorkspaceCodemapProjectionCoverageProof)
+    case partial(
+        proof: WorkspaceCodemapProjectionCoverageProof,
+        reasons: [WorkspaceCodemapAutomaticSelectionPartialReason]
+    )
+    case incomplete([WorkspaceCodemapAutomaticSelectionIncompleteReason])
     case pending([WorkspaceCodemapAutomaticSelectionPendingReason])
     case unavailable(WorkspaceCodemapAutomaticSelectionUnavailableReason)
     case stale(WorkspaceCodemapAutomaticSelectionStaleReason)
@@ -121,8 +185,12 @@ enum WorkspaceCodemapAutomaticSelectionCoverage: Equatable {
 }
 
 enum WorkspaceCodemapAutomaticSelectionAggregateCoverage: Equatable {
-    case complete
-    case partial([WorkspaceCodemapAutomaticSelectionPartialReason])
+    case complete([WorkspaceCodemapProjectionCoverageProof])
+    case partial(
+        proofs: [WorkspaceCodemapProjectionCoverageProof],
+        reasons: [WorkspaceCodemapAutomaticSelectionPartialReason]
+    )
+    case incomplete([WorkspaceCodemapAutomaticSelectionIncompleteReason])
     case pending([WorkspaceCodemapAutomaticSelectionPendingReason])
     case unavailable(WorkspaceCodemapAutomaticSelectionUnavailableReason)
     case stale(WorkspaceCodemapAutomaticSelectionStaleReason)
@@ -170,9 +238,35 @@ struct WorkspaceCodemapAutomaticSelectionRootResult: Equatable {
 struct WorkspaceCodemapAutomaticSelectionPublicationReceipt: Equatable {
     let requestID: UUID
     let rootScope: WorkspaceLookupRootScope
+    let rootScopeEpochs: [WorkspaceCodemapRootEpoch]
     let sourceTickets: [WorkspaceCodemapArtifactDemandTicket]
     let graphKeys: [WorkspaceCodemapSelectionGraphRuntimeKey]
+    let coverageProofs: [WorkspaceCodemapProjectionCoverageProof]
     let targets: [WorkspaceCodemapAutomaticSelectionTarget]
+    let publicationPermit: WorkspaceCodemapAutomaticSelectionPublicationPermit
+    let publicationLease: WorkspaceCodemapAutomaticSelectionPublicationLease?
+
+    init(
+        requestID: UUID,
+        rootScope: WorkspaceLookupRootScope,
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch],
+        sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        graphKeys: [WorkspaceCodemapSelectionGraphRuntimeKey],
+        coverageProofs: [WorkspaceCodemapProjectionCoverageProof],
+        targets: [WorkspaceCodemapAutomaticSelectionTarget],
+        publicationPermit: WorkspaceCodemapAutomaticSelectionPublicationPermit,
+        publicationLease: WorkspaceCodemapAutomaticSelectionPublicationLease? = nil
+    ) {
+        self.requestID = requestID
+        self.rootScope = rootScope
+        self.rootScopeEpochs = rootScopeEpochs
+        self.sourceTickets = sourceTickets
+        self.graphKeys = graphKeys
+        self.coverageProofs = coverageProofs
+        self.targets = targets
+        self.publicationPermit = publicationPermit
+        self.publicationLease = publicationLease
+    }
 }
 
 enum WorkspaceCodemapAutomaticSelectionPublicationDisposition: Equatable {
@@ -182,12 +276,22 @@ enum WorkspaceCodemapAutomaticSelectionPublicationDisposition: Equatable {
 
 struct WorkspaceCodemapAutomaticSelectionCandidatePlan: Equatable {
     let candidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate]
-    let partialReasons: [WorkspaceCodemapAutomaticSelectionPartialReason]
+    let rootScopeEpochs: [WorkspaceCodemapRootEpoch]
+    let coverageProofs: [WorkspaceCodemapProjectionCoverageProof]
+}
+
+struct WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan: Equatable {
+    let candidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate]
+    let rootScopeEpochs: [WorkspaceCodemapRootEpoch]
+    let incompleteReasons: [WorkspaceCodemapAutomaticSelectionIncompleteReason]
 }
 
 enum WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition: Equatable {
     case ready(WorkspaceCodemapAutomaticSelectionCandidatePlan)
+    case provisional(WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan)
+    case incomplete([WorkspaceCodemapAutomaticSelectionIncompleteReason])
     case pending([WorkspaceCodemapAutomaticSelectionPendingReason])
+    case busy(WorkspaceCodemapStoreSelectionGraphQueryBusyReason)
     case unavailable(WorkspaceCodemapAutomaticSelectionUnavailableReason)
     case stale(WorkspaceCodemapAutomaticSelectionStaleReason)
     case budget(WorkspaceCodemapAutomaticSelectionBudgetReason)
@@ -204,15 +308,22 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
         publicationReceipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt? = nil
     ) {
         self.roots = roots
-        self.aggregateCoverage = aggregateCoverage ?? Self.aggregateCoverage(for: roots)
-        self.publicationReceipt = publicationReceipt
+        self.aggregateCoverage = if roots.isEmpty, let aggregateCoverage {
+            aggregateCoverage
+        } else {
+            Self.aggregateCoverage(for: roots)
+        }
+        self.publicationReceipt = Self.validatedPublicationReceipt(
+            publicationReceipt,
+            coverage: self.aggregateCoverage
+        )
     }
 
     var targets: [WorkspaceCodemapAutomaticSelectionTarget] {
         switch aggregateCoverage {
         case .complete, .partial:
             roots.flatMap(\.targets)
-        case .pending, .unavailable, .stale, .busy, .budget:
+        case .incomplete, .pending, .unavailable, .stale, .busy, .budget:
             []
         }
     }
@@ -220,13 +331,17 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
     private static func aggregateCoverage(
         for roots: [WorkspaceCodemapAutomaticSelectionRootResult]
     ) -> WorkspaceCodemapAutomaticSelectionAggregateCoverage {
+        var proofs: [WorkspaceCodemapProjectionCoverageProof] = []
         var partial: [WorkspaceCodemapAutomaticSelectionPartialReason] = []
         for root in roots {
             switch root.coverage {
-            case .complete:
-                continue
-            case let .partial(reasons):
+            case let .complete(proof):
+                proofs.append(proof)
+            case let .partial(proof, reasons):
+                proofs.append(proof)
                 partial.append(contentsOf: reasons)
+            case let .incomplete(reasons):
+                return .incomplete(reasons)
             case let .pending(reasons):
                 return .pending(reasons)
             case let .unavailable(reason):
@@ -239,6 +354,25 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
                 return .budget(.graph(rootEpoch: root.rootEpoch, reason: reason))
             }
         }
-        return partial.isEmpty ? .complete : .partial(partial)
+        return partial.isEmpty ? .complete(proofs) : .partial(proofs: proofs, reasons: partial)
+    }
+
+    private static func validatedPublicationReceipt(
+        _ receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt?,
+        coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
+    ) -> WorkspaceCodemapAutomaticSelectionPublicationReceipt? {
+        guard let receipt,
+              receipt.publicationPermit.withCurrent({ true }) == true
+        else { return nil }
+        let proofs: [WorkspaceCodemapProjectionCoverageProof]
+        switch coverage {
+        case let .complete(coverageProofs):
+            proofs = coverageProofs
+        case let .partial(coverageProofs, _):
+            proofs = coverageProofs
+        case .incomplete, .pending, .unavailable, .stale, .busy, .budget:
+            return nil
+        }
+        return receipt.coverageProofs == proofs ? receipt : nil
     }
 }

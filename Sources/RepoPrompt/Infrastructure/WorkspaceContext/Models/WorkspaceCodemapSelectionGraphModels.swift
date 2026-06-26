@@ -287,27 +287,39 @@ struct WorkspaceCodemapSelectionGraphResolvedTarget: Hashable {
     }
 }
 
-enum WorkspaceCodemapSelectionGraphCandidateCount: Hashable {
-    case unknown
-    case known(UInt64)
-}
-
 enum WorkspaceCodemapSelectionGraphUnavailableReason: Hashable {
     case notBuilt
     case gitDisabled
-    case transientGit
+    case rootUnloaded
+    case authorityRevoked
+    case catalogUnavailable
     case corrupt
     case schemaMismatch
-    case budgetExceeded
-    case queueOverflow
+    case policyMismatch
+    case invalidCompletenessProof
+    case accountingOverflow
 }
 
 enum WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage: Hashable {
-    case unknown
-    case partial(indexedNodes: UInt64, candidateCount: WorkspaceCodemapSelectionGraphCandidateCount)
     case complete(
-        catalogGeneration: UInt64,
-        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+        proof: WorkspaceCodemapProjectionCoverageProof,
+        candidateCount: UInt64,
+        contributedCount: UInt64,
+        terminalCount: UInt64
+    )
+    case incomplete(
+        progress: WorkspaceCodemapProjectionProgress,
+        remainingCount: UInt64?,
+        retry: WorkspaceCodemapProjectionRetry?
+    )
+    case busy(
+        progress: WorkspaceCodemapProjectionProgress,
+        retryAfterMilliseconds: UInt64?
+    )
+    case budget(
+        dimension: WorkspaceCodemapProjectionBudgetDimension,
+        attempted: UInt64,
+        limit: UInt64
     )
     case unavailable(WorkspaceCodemapSelectionGraphUnavailableReason)
 }
@@ -734,7 +746,11 @@ final class WorkspaceCodemapSelectionGraphModelStore {
         source: WorkspaceCodemapSelectionGraphNodeIdentity,
         referencedName: String,
         failure: WorkspaceCodemapSelectionGraphReferenceFailure,
-        definitionUniverseCoverage: WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage = .unknown
+        definitionUniverseCoverage: WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage = .incomplete(
+            progress: .notStarted,
+            remainingCount: nil,
+            retry: nil
+        )
     ) -> WorkspaceCodemapSelectionGraphReferenceFailureRecord? {
         guard queryIsCurrent(query), query.selectedSources.contains(source), isCurrent(source) else {
             return nil
@@ -792,16 +808,12 @@ final class WorkspaceCodemapSelectionGraphModelStore {
         }
 
         switch definitionUniverseCoverage {
-        case .unknown:
-            guard resolvedTargets.isEmpty else { return nil }
-        case .partial:
-            break
-        case let .complete(catalogGeneration, repositoryAuthority):
-            guard catalogGeneration == query.key.catalogGeneration,
-                  repositoryAuthority == query.key.repositoryAuthority,
-                  query.key == key
-            else { return nil }
-        case .unavailable:
+        case .complete:
+            guard definitionUniverseIsCurrentComplete(
+                definitionUniverseCoverage,
+                for: query
+            ) else { return nil }
+        case .incomplete, .busy, .budget, .unavailable:
             guard resolvedTargets.isEmpty else { return nil }
         }
 
@@ -847,12 +859,25 @@ final class WorkspaceCodemapSelectionGraphModelStore {
         _ coverage: WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage,
         for query: WorkspaceCodemapSelectionGraphQuery
     ) -> Bool {
-        guard case let .complete(catalogGeneration, repositoryAuthority) = coverage else {
+        guard case let .complete(
+            proof,
+            candidateCount,
+            contributedCount,
+            terminalCount
+        ) = coverage else {
             return false
         }
+        let generation = proof.generation
         return queryIsCurrent(query) &&
-            catalogGeneration == key.catalogGeneration &&
-            repositoryAuthority == key.repositoryAuthority
+            generation.rootEpoch == key.rootEpoch &&
+            generation.catalogGeneration == key.catalogGeneration &&
+            generation.repositoryAuthority == key.repositoryAuthority &&
+            generation.contributionGeneration == key.contributionGeneration &&
+            generation.schemaVersion == key.schemaVersion &&
+            generation.policyVersion == key.policyVersion &&
+            candidateCount == proof.candidateCount &&
+            contributedCount == proof.contributedCount &&
+            terminalCount == proof.terminalCount
     }
 
     private func queryIsCurrent(_ query: WorkspaceCodemapSelectionGraphQuery) -> Bool {

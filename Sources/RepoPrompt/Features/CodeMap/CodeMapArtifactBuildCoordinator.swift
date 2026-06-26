@@ -206,6 +206,8 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
     let maximumPendingHookEventCount: Int
     let maximumConsecutiveDemandAdmissions: Int
     let agePromotionNanoseconds: UInt64
+    let backgroundAgePromotionNanoseconds: UInt64
+    let maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged: Int
     let retryAfterMilliseconds: Int
 
     init(
@@ -219,6 +221,8 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
         maximumPendingHookEventCount: Int = 256,
         maximumConsecutiveDemandAdmissions: Int = 4,
         agePromotionNanoseconds: UInt64 = 1_000_000_000,
+        backgroundAgePromotionNanoseconds: UInt64 = 1_000_000_000,
+        maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged: Int = 4,
         retryAfterMilliseconds: Int = 1000
     ) {
         precondition(maximumFlightCount > 0)
@@ -230,6 +234,7 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
         precondition(maximumRetainedInputByteCount >= 0)
         precondition(maximumPendingHookEventCount > 0)
         precondition(maximumConsecutiveDemandAdmissions > 0)
+        precondition(maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged >= 0)
         precondition(retryAfterMilliseconds > 0)
         self.maximumFlightCount = maximumFlightCount
         self.maximumTotalWaiterCount = maximumTotalWaiterCount
@@ -241,6 +246,9 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
         self.maximumPendingHookEventCount = maximumPendingHookEventCount
         self.maximumConsecutiveDemandAdmissions = maximumConsecutiveDemandAdmissions
         self.agePromotionNanoseconds = agePromotionNanoseconds
+        self.backgroundAgePromotionNanoseconds = backgroundAgePromotionNanoseconds
+        self.maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged =
+            maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged
         self.retryAfterMilliseconds = retryAfterMilliseconds
     }
 }
@@ -520,6 +528,11 @@ struct CodeMapArtifactBuildCoordinatorCounters: Equatable {
     let locatorFailed: UInt64
     let duplicateBuilds: UInt64
     let staleCompletionDrops: UInt64
+    let demandAdmissions: UInt64
+    let explicitAdmissions: UInt64
+    let backgroundAdmissions: UInt64
+    let agedBackgroundAdmissions: UInt64
+    let nonBackgroundAdmissionsWhileBackgroundAged: UInt64
     let droppedHookEvents: UInt64
     let failures: UInt64
 }
@@ -544,6 +557,7 @@ struct CodeMapArtifactBuildCoordinatorAccounting: Equatable {
     let waiterCount: Int
     let retainedInputByteCount: Int
     let ownerAdmissionHistoryCount: Int
+    let consecutiveNonBackgroundAdmissionsWhileBackgroundAged: Int
     let pendingHookEventCount: Int
     let hookDispatcherIsDraining: Bool
     let policy: CodeMapArtifactBuildCoordinatorPolicy
@@ -623,6 +637,7 @@ actor CodeMapArtifactBuildCoordinator {
         var retainedInputByteCount = 0
         var hasRetainedInputReservation = false
         var locatorIntents: [GitBlobCodeMapLocatorIdentity: LocatorIntentOwnership] = [:]
+        var locatorProofInputs: [GitBlobCodeMapLocatorIdentity: CodeMapArtifactBuildInput] = [:]
         var locatorPublications: [GitBlobCodeMapLocatorIdentity: CodeMapArtifactCoordinatorLocatorPublication] = [:]
         var locatorWriteInProgress: GitBlobCodeMapLocatorIdentity?
         var locatorPublicationHasBegun = false
@@ -691,6 +706,11 @@ actor CodeMapArtifactBuildCoordinator {
         var locatorFailed: UInt64 = 0
         var duplicateBuilds: UInt64 = 0
         var staleCompletionDrops: UInt64 = 0
+        var demandAdmissions: UInt64 = 0
+        var explicitAdmissions: UInt64 = 0
+        var backgroundAdmissions: UInt64 = 0
+        var agedBackgroundAdmissions: UInt64 = 0
+        var nonBackgroundAdmissionsWhileBackgroundAged: UInt64 = 0
         var failures: UInt64 = 0
     }
 
@@ -720,6 +740,7 @@ actor CodeMapArtifactBuildCoordinator {
     private var waiterCount = 0
     private var retainedInputByteCount = 0
     private var consecutiveDemandAdmissions = 0
+    private var consecutiveNonBackgroundAdmissionsWhileBackgroundAged = 0
     private var nextOrdinal: UInt64 = 1
     private var ownerLastAdmission: [UUID: UInt64] = [:]
     private var buildingKeys: Set<CodeMapArtifactKey> = []
@@ -868,6 +889,7 @@ actor CodeMapArtifactBuildCoordinator {
 
     func accounting() async -> CodeMapArtifactBuildCoordinatorAccounting {
         let storeAccounting = await artifactStore.accounting()
+        resetBackgroundAgingCountIfNeeded()
         let hookAccounting = hookDispatcher.accounting()
         return CodeMapArtifactBuildCoordinatorAccounting(
             activeFlightCount: flights.count,
@@ -876,6 +898,8 @@ actor CodeMapArtifactBuildCoordinator {
             waiterCount: waiterCount,
             retainedInputByteCount: retainedInputByteCount,
             ownerAdmissionHistoryCount: ownerLastAdmission.count,
+            consecutiveNonBackgroundAdmissionsWhileBackgroundAged:
+            consecutiveNonBackgroundAdmissionsWhileBackgroundAged,
             pendingHookEventCount: hookAccounting.pendingEventCount,
             hookDispatcherIsDraining: hookAccounting.isDraining,
             policy: policy,
@@ -1011,6 +1035,11 @@ actor CodeMapArtifactBuildCoordinator {
         case .missing?, .corrupt?, .stale?: input
         case .existing?, nil: nil
         }
+        if let locatorIdentity, let proofInput,
+           flight.locatorProofInputs[locatorIdentity] == nil
+        {
+            flight.locatorProofInputs[locatorIdentity] = proofInput
+        }
         #if DEBUG
             flight.waiters[id] = Waiter(
                 id: id,
@@ -1042,6 +1071,7 @@ actor CodeMapArtifactBuildCoordinator {
             )
         #endif
         waiterCount += 1
+        resetBackgroundAgingCountIfNeeded()
 
         if joined {
             increment(&counters.joins)
@@ -1117,14 +1147,17 @@ actor CodeMapArtifactBuildCoordinator {
     }
 
     private func scheduleBuilds() {
+        resetBackgroundAgingCountIfNeeded()
         while activeBuildCount < policy.maximumConcurrentBuildCount,
               let key = selectNextBuildKey(),
               let flight = flights[key],
               let input = flight.input,
               !flight.waiters.isEmpty
         {
+            let now = clock.nowNanoseconds()
+            let backgroundAged = hasAgedBackground(now: now)
             queuedBuildKeys.removeAll { $0 == key }
-            let descriptor = schedulingDescriptor(for: flight)
+            let descriptor = schedulingDescriptor(for: flight, now: now)
             ownerLastAdmission[descriptor.ownerID] = takeOrdinal()
             if descriptor.isDemand {
                 if consecutiveDemandAdmissions < policy.maximumConsecutiveDemandAdmissions {
@@ -1133,6 +1166,7 @@ actor CodeMapArtifactBuildCoordinator {
             } else {
                 consecutiveDemandAdmissions = 0
             }
+            recordAdmission(descriptor, backgroundAged: backgroundAged)
             let queueDuration = duration(
                 from: flight.enqueueNanoseconds ?? clock.nowNanoseconds(),
                 to: clock.nowNanoseconds()
@@ -1246,10 +1280,6 @@ actor CodeMapArtifactBuildCoordinator {
         )
         emit(.buildExecutionReturned, flight: flight)
         scheduleBuilds()
-        guard !flight.waiters.isEmpty else {
-            removeFlight(flight, hook: .flightCancelled)
-            return false
-        }
         transition(flight, to: .persistingArtifact)
         emit(.casPersistenceStarting, flight: flight)
         return true
@@ -1307,7 +1337,7 @@ actor CodeMapArtifactBuildCoordinator {
         )
         recordCASTiming(durationNanoseconds)
         emit(.casPersistenceFinished, flight: flight)
-        if hasPendingLocatorPublication(flight), !flight.waiters.isEmpty {
+        if hasPendingLocatorPublication(flight) {
             flight.acceptsNewWaiters = false
             transition(flight, to: .publishingLocators)
             startLocatorPublication(for: flight)
@@ -1360,16 +1390,13 @@ actor CodeMapArtifactBuildCoordinator {
               flight.locatorWriteInProgress == nil,
               let handle = flight.handle
         else { return nil }
-        if !flight.locatorPublicationHasBegun, flight.waiters.isEmpty { return nil }
         let identity = flight.locatorIntents
             .filter { $0.value.intent != .existing && flight.locatorPublications[$0.key] == nil }
             .map(\.key)
             .sorted { $0.storageDigestHex < $1.storageDigestHex }
             .first
         guard let identity else { return nil }
-        guard let proofInput = flight.waiters.values.first(where: {
-            $0.locatorIdentity == identity && $0.proofInput != nil
-        })?.proofInput else {
+        guard let proofInput = flight.locatorProofInputs[identity] else {
             flight.locatorPublications[identity] = .failed
             increment(&counters.locatorFailed)
             return beginNextLocatorPublication(key: key, flightID: flightID)
@@ -1404,6 +1431,7 @@ actor CodeMapArtifactBuildCoordinator {
               flight.locatorWriteInProgress == identity
         else { return }
         flight.locatorWriteInProgress = nil
+        flight.locatorProofInputs.removeValue(forKey: identity)
         flight.locatorPublications[identity] = publication
         switch publication {
         case .inserted: increment(&counters.locatorInserted)
@@ -1522,7 +1550,20 @@ actor CodeMapArtifactBuildCoordinator {
 
     private func cancelWaiter(id: UUID, key: CodeMapArtifactKey) {
         guard let flight = flights[key], let waiter = flight.waiters.removeValue(forKey: id) else { return }
-        releaseLocatorIntent(for: waiter, from: flight)
+        switch (flight.waiters.isEmpty, flight.phase) {
+        case (true, .buildingNonPreemptive),
+             (true, .persistingArtifact),
+             (true, .verifyingArtifact),
+             (true, .publishingLocators),
+             (true, .finishing):
+            // Locator publication is part of the admitted non-preemptive transaction. The
+            // final waiter may detach, but its durable publication intent must finish.
+            break
+        case (false, _),
+             (true, .casLookup),
+             (true, .awaitingBuildAdmission):
+            releaseLocatorIntent(for: waiter, from: flight)
+        }
         waiterCount -= 1
         waiter.continuation.resume(throwing: CancellationError())
         guard flight.waiters.isEmpty else { return }
@@ -1539,9 +1580,10 @@ actor CodeMapArtifactBuildCoordinator {
             removeFlight(flight, hook: .flightCancelled)
             scheduleBuilds()
         case .buildingNonPreemptive:
-            flight.acceptsNewWaiters = false
-            flight.task?.cancel()
-            increment(&counters.sharedTaskCancellations)
+            // Admission is the non-preemptive boundary. Let the shared transaction
+            // finish even when its final retainer is released; a later matching
+            // request may still join the same flight while it drains.
+            break
         case .persistingArtifact, .verifyingArtifact, .publishingLocators, .finishing:
             break
         }
@@ -1586,6 +1628,7 @@ actor CodeMapArtifactBuildCoordinator {
 
     private func releaseRetainedInputReservation(for flight: Flight) {
         flight.input = nil
+        flight.locatorProofInputs.removeAll()
         for id in flight.waiters.keys {
             flight.waiters[id]?.proofInput = nil
         }
@@ -1609,6 +1652,7 @@ actor CodeMapArtifactBuildCoordinator {
         ownership.remove(intent)
         if ownership.isEmpty {
             flight.locatorIntents.removeValue(forKey: identity)
+            flight.locatorProofInputs.removeValue(forKey: identity)
         } else {
             flight.locatorIntents[identity] = ownership
         }
@@ -1638,8 +1682,17 @@ actor CodeMapArtifactBuildCoordinator {
         let demand = candidates.filter { $0.2.tier == .demand }
         let agedExplicit = candidates.filter { $0.2.tier == .agedExplicit }
         let explicit = candidates.filter { $0.2.tier == .explicit }
+        let agedBackground = candidates.filter { $0.2.tier == .agedBackground }
         let background = candidates.filter { $0.2.tier == .background }
-        let pool: [(CodeMapArtifactKey, Flight, SchedulingDescriptor)] = if !agedExplicit.isEmpty {
+        if agedBackground.isEmpty {
+            consecutiveNonBackgroundAdmissionsWhileBackgroundAged = 0
+        }
+        let backgroundDue = !agedBackground.isEmpty
+            && consecutiveNonBackgroundAdmissionsWhileBackgroundAged
+            >= policy.maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged
+        let pool: [(CodeMapArtifactKey, Flight, SchedulingDescriptor)] = if backgroundDue {
+            agedBackground
+        } else if !agedExplicit.isEmpty {
             agedExplicit
         } else if !demand.isEmpty,
                   explicit.isEmpty || consecutiveDemandAdmissions < policy.maximumConsecutiveDemandAdmissions
@@ -1647,6 +1700,8 @@ actor CodeMapArtifactBuildCoordinator {
             demand
         } else if !explicit.isEmpty {
             explicit
+        } else if !agedBackground.isEmpty {
+            agedBackground
         } else {
             background
         }
@@ -1672,6 +1727,7 @@ actor CodeMapArtifactBuildCoordinator {
         case demand
         case agedExplicit
         case explicit
+        case agedBackground
         case background
     }
 
@@ -1692,12 +1748,18 @@ actor CodeMapArtifactBuildCoordinator {
             from: flight.enqueueNanoseconds ?? current,
             to: current
         ) >= policy.agePromotionNanoseconds
+        let backgroundAged = selected.priority == .background && duration(
+            from: flight.enqueueNanoseconds ?? current,
+            to: current
+        ) >= policy.backgroundAgePromotionNanoseconds
         let tier: SchedulingTier = if selected.priority == .demand {
             .demand
         } else if aged {
             .agedExplicit
         } else if selected.priority == .explicit {
             .explicit
+        } else if backgroundAged {
+            .agedBackground
         } else {
             .background
         }
@@ -1706,6 +1768,50 @@ actor CodeMapArtifactBuildCoordinator {
             priority: selected.priority,
             tier: tier
         )
+    }
+
+    private func hasAgedBackground(now: UInt64) -> Bool {
+        queuedBuildKeys.contains { key in
+            guard let flight = flights[key], !flight.waiters.isEmpty else { return false }
+            return schedulingDescriptor(for: flight, now: now).tier == .agedBackground
+        }
+    }
+
+    private func resetBackgroundAgingCountIfNeeded() {
+        guard consecutiveNonBackgroundAdmissionsWhileBackgroundAged > 0 else { return }
+        if !hasAgedBackground(now: clock.nowNanoseconds()) {
+            consecutiveNonBackgroundAdmissionsWhileBackgroundAged = 0
+        }
+    }
+
+    private func recordAdmission(
+        _ descriptor: SchedulingDescriptor,
+        backgroundAged: Bool
+    ) {
+        switch descriptor.priority {
+        case .demand:
+            increment(&counters.demandAdmissions)
+        case .explicit:
+            increment(&counters.explicitAdmissions)
+        case .background:
+            increment(&counters.backgroundAdmissions)
+            if descriptor.tier == .agedBackground {
+                increment(&counters.agedBackgroundAdmissions)
+            }
+        }
+
+        if descriptor.priority == .background {
+            consecutiveNonBackgroundAdmissionsWhileBackgroundAged = 0
+        } else if backgroundAged {
+            if consecutiveNonBackgroundAdmissionsWhileBackgroundAged
+                < policy.maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged
+            {
+                consecutiveNonBackgroundAdmissionsWhileBackgroundAged += 1
+            }
+            increment(&counters.nonBackgroundAdmissionsWhileBackgroundAged)
+        } else {
+            consecutiveNonBackgroundAdmissionsWhileBackgroundAged = 0
+        }
     }
 
     private func transition(_ flight: Flight, to phase: CodeMapArtifactBuildFlightPhase) {
@@ -1784,6 +1890,7 @@ actor CodeMapArtifactBuildCoordinator {
         ownerLastAdmission = ownerLastAdmission.filter { activeOwners.contains($0.key) }
         if flights.isEmpty, queuedBuildKeys.isEmpty {
             consecutiveDemandAdmissions = 0
+            consecutiveNonBackgroundAdmissionsWhileBackgroundAged = 0
         }
     }
 
@@ -1839,6 +1946,11 @@ actor CodeMapArtifactBuildCoordinator {
             locatorFailed: counters.locatorFailed,
             duplicateBuilds: counters.duplicateBuilds,
             staleCompletionDrops: counters.staleCompletionDrops,
+            demandAdmissions: counters.demandAdmissions,
+            explicitAdmissions: counters.explicitAdmissions,
+            backgroundAdmissions: counters.backgroundAdmissions,
+            agedBackgroundAdmissions: counters.agedBackgroundAdmissions,
+            nonBackgroundAdmissionsWhileBackgroundAged: counters.nonBackgroundAdmissionsWhileBackgroundAged,
             droppedHookEvents: droppedHookEvents,
             failures: counters.failures
         )

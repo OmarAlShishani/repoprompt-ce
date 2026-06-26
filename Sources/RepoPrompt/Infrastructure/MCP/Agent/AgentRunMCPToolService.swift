@@ -228,6 +228,7 @@ struct AgentRunMCPToolService {
     var currentSnapshotProvider: (@Sendable (_ sessionID: UUID, _ agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot?)?
     #if DEBUG
         var testAgentModeViewModel: AgentModeViewModel?
+        var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
     #endif
     var vcsService: VCSService = .shared
     var gitTargetResolver: GitRepoTargetResolver = .init()
@@ -414,6 +415,11 @@ struct AgentRunMCPToolService {
         )
         WorktreeStartupInstrumentation.record(.agentRunStarted, context: worktreeStartupContext)
         var expectedRoutedWorktreeBindings: [AgentSessionWorktreeBinding]?
+        var expectedExplicitTabWorktreeSource: (
+            tabID: UUID,
+            sessionID: UUID,
+            bindings: [AgentSessionWorktreeBinding]
+        )?
         do {
             if effectiveParentWorktreeInheritance,
                let parentSourceTabID,
@@ -423,6 +429,36 @@ struct AgentRunMCPToolService {
                     sourceTabID: parentSourceTabID,
                     expectedParentSessionID: spawnParentSessionID,
                     target: target
+                )
+            } else if effectiveParentWorktreeInheritance,
+                      parentSourceTabID == nil,
+                      spawnParentSessionID == nil,
+                      oracleLaunchSource.snapshot.route == .explicitTabContext,
+                      let sourceAgentSessionID = oracleLaunchSource.snapshot.sourceAgentSessionID
+            {
+                guard case let .captured(capturedSource) = oracleLaunchSource.source else {
+                    throw MCPError.invalidParams(
+                        "agent_run.start cannot inherit the explicit-tab worktree because its frozen launch source is unavailable."
+                    )
+                }
+                guard capturedSource.sourceTabID == oracleLaunchSource.snapshot.tabID,
+                      capturedSource.sourceAgentSessionID == sourceAgentSessionID
+                else {
+                    throw MCPError.invalidParams(
+                        "agent_run.start cannot inherit the explicit-tab worktree because its frozen launch source identity does not match the launch snapshot."
+                    )
+                }
+                let capturedBindings = capturedSource.sourceWorktreeBindings
+                try agentModeVM.mcpReconcileExplicitTabSpawnWorktreeBindings(
+                    sourceTabID: oracleLaunchSource.snapshot.tabID,
+                    expectedSourceSessionID: sourceAgentSessionID,
+                    expectedBindings: capturedBindings,
+                    target: target
+                )
+                expectedExplicitTabWorktreeSource = (
+                    oracleLaunchSource.snapshot.tabID,
+                    sourceAgentSessionID,
+                    capturedBindings
                 )
             }
             #if DEBUG
@@ -462,6 +498,19 @@ struct AgentRunMCPToolService {
                 try agentModeVM.mcpRequireRoutedSpawnWorktreeBindings(
                     expectedRoutedWorktreeBindings,
                     expectedParentSessionID: spawnParentSessionID,
+                    target: target
+                )
+            }
+            #if DEBUG
+                if expectedExplicitTabWorktreeSource != nil {
+                    testBeforeExplicitTabWorktreeValidation?()
+                }
+            #endif
+            if let expectedExplicitTabWorktreeSource {
+                try agentModeVM.mcpRequireExplicitTabSpawnWorktreeBindings(
+                    sourceTabID: expectedExplicitTabWorktreeSource.tabID,
+                    expectedSourceSessionID: expectedExplicitTabWorktreeSource.sessionID,
+                    expectedBindings: expectedExplicitTabWorktreeSource.bindings,
                     target: target
                 )
             }

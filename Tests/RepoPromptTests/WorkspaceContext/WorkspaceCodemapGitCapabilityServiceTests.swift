@@ -34,6 +34,78 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         XCTAssertTrue(linkedCapability.repositoryLayout.isLinkedWorktree)
     }
 
+    func testRepositoryTopologySeparatesSharedWorktreesNestedAndSubmoduleAuthorities() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let canonical = try fixture.makeRepository(named: "canonical")
+        let linked = try fixture.makeLinkedWorktree(
+            from: canonical,
+            named: "linked",
+            branch: "linked-topology"
+        )
+        let externalParent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(#function)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: externalParent, withIntermediateDirectories: false)
+        let external = externalParent.appendingPathComponent("external", isDirectory: true)
+        _ = try fixture.runGit(
+            ["worktree", "add", "-b", "external-topology", external.path, "HEAD"],
+            at: canonical
+        )
+        defer {
+            _ = try? fixture.runGit(["worktree", "remove", "--force", external.path], at: canonical)
+            try? FileManager.default.removeItem(at: externalParent)
+        }
+
+        let nested = canonical.appendingPathComponent("NestedRepository", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: false)
+        _ = try fixture.runGit(["init"], at: nested)
+        _ = try fixture.runGit(["config", "user.name", "RepoPrompt Test"], at: nested)
+        _ = try fixture.runGit(["config", "user.email", "repoprompt@example.test"], at: nested)
+        _ = try fixture.runGit(["config", "commit.gpgSign", "false"], at: nested)
+        _ = try fixture.runGit(["checkout", "-b", "nested-main"], at: nested)
+        try fixture.write("struct Nested {}\n", to: "Sources/Nested.swift", at: nested)
+        _ = try fixture.runGit(["add", "."], at: nested)
+        _ = try fixture.runGit(["commit", "-m", "Nested repository"], at: nested)
+
+        let submoduleSource = try fixture.makeRepository(
+            named: "submodule-source",
+            files: ["Sources/Submodule.swift": "struct Submodule {}\n"]
+        )
+        _ = try fixture.runGit(
+            ["-c", "protocol.file.allow=always", "submodule", "add", submoduleSource.path, "Vendor/Sub"],
+            at: canonical
+        )
+        try fixture.commit("Add submodule", at: canonical)
+        let submodule = canonical.appendingPathComponent("Vendor/Sub", isDirectory: true)
+
+        let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let canonicalCapability = try await capability(
+            service.resolve(root: request(for: canonical, seed: 4))
+        )
+        let linkedCapability = try await capability(
+            service.resolve(root: request(for: linked, seed: 5))
+        )
+        let externalCapability = try await capability(
+            service.resolve(root: request(for: external, seed: 6))
+        )
+        let nestedCapability = try await capability(
+            service.resolve(root: request(for: nested, seed: 7))
+        )
+        let submoduleCapability = try await capability(
+            service.resolve(root: request(for: submodule, seed: 8))
+        )
+
+        XCTAssertEqual(canonicalCapability.repositoryNamespace, linkedCapability.repositoryNamespace)
+        XCTAssertEqual(canonicalCapability.repositoryNamespace, externalCapability.repositoryNamespace)
+        XCTAssertNotEqual(canonicalCapability.worktreeID, linkedCapability.worktreeID)
+        XCTAssertNotEqual(canonicalCapability.worktreeID, externalCapability.worktreeID)
+        XCTAssertNotEqual(linkedCapability.worktreeID, externalCapability.worktreeID)
+        XCTAssertTrue(linkedCapability.repositoryLayout.isLinkedWorktree)
+        XCTAssertTrue(externalCapability.repositoryLayout.isLinkedWorktree)
+        XCTAssertNotEqual(canonicalCapability.repositoryNamespace, nestedCapability.repositoryNamespace)
+        XCTAssertNotEqual(canonicalCapability.repositoryNamespace, submoduleCapability.repositoryNamespace)
+        XCTAssertNotEqual(nestedCapability.repositoryNamespace, submoduleCapability.repositoryNamespace)
+    }
+
     func testNonGitBareUnsupportedAndLocalizedDiagnosticsFailClosed() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
         let plain = fixture.sandbox.appendingPathComponent("plain", isDirectory: true)

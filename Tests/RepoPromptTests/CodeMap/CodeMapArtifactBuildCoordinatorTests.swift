@@ -166,10 +166,18 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         XCTAssertEqual(accounting.waiterCount, 0)
     }
 
-    func testLastWaiterCancellationDuringNonPreemptiveBuildSkipsPersistence() async throws {
+    func testLastWaiterCancellationDuringNonPreemptiveBuildCompletesAdmittedTransaction() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
-        let input = try makeInput("non-preemptive", root: fixture.root)
+        let alternateRoot = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: alternateRoot) }
+        let input = try makeInput("non-preemptive", root: fixture.root, withLocator: true)
+        let finalWaiterInput = try makeInput(
+            "non-preemptive",
+            root: alternateRoot,
+            withLocator: true
+        )
+        XCTAssertEqual(input.artifactKey, finalWaiterInput.artifactKey)
         let gate = CoordinatorTestGate()
         let coordinator = makeCoordinator(fixture: fixture) { _, _, _ in
             await gate.enter()
@@ -178,18 +186,31 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
 
         let task = Task { try await coordinator.resolve(request(input)) }
         await gate.waitUntilEntered()
+        let finalWaiter = Task { try await coordinator.resolve(request(finalWaiterInput)) }
+        try await waitUntil { await coordinator.accounting().waiterCount == 2 }
         task.cancel()
         await assertCancellation(task)
+        finalWaiter.cancel()
+        await assertCancellation(finalWaiter)
         await gate.release()
         try await waitUntil { await coordinator.accounting().activeFlightCount == 0 }
 
         switch try await fixture.artifactStore.lookup(key: input.artifactKey) {
-        case .miss: break
-        case .hit: XCTFail("orphaned non-preemptive build persisted")
+        case .miss: XCTFail("admitted non-preemptive build did not persist")
+        case .hit: break
         }
+        let locatorIdentity = try XCTUnwrap(finalWaiterInput.locatorIdentity)
+        let locatorResult = try await fixture.locatorStore.read(identity: locatorIdentity)
+        XCTAssertEqual(
+            locatorResult,
+            .hit(input.artifactKey),
+            "waiter cancellation must not withdraw admitted locator publication"
+        )
         let accounting = await coordinator.accounting()
-        XCTAssertEqual(accounting.counters.casInserted, 0)
+        XCTAssertEqual(accounting.counters.casInserted, 1)
+        XCTAssertEqual(accounting.counters.locatorInserted, 1)
         XCTAssertEqual(accounting.counters.lastWaiterCancellations, 1)
+        XCTAssertEqual(accounting.counters.sharedTaskCancellations, 0)
     }
 
     func testCancellationDuringCASAndLocatorPublicationCompletesStartedAtomicOperation() async throws {
@@ -927,6 +948,279 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         ]))
     }
 
+    func testDemandThenExplicitThenBackgroundBeforeAging() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let blocker = try makeInput("priority-blocker", root: fixture.root)
+        let background = try makeInput("priority-background", root: fixture.root)
+        let explicit = try makeInput("priority-explicit", root: fixture.root)
+        let demand = try makeInput("priority-demand", root: fixture.root)
+        let gate = CoordinatorTestGate()
+        let order = CoordinatorTestRecorder()
+        let clock = CoordinatorTestClock()
+        let coordinator = makeCoordinator(
+            fixture: fixture,
+            policy: policy(maximumConcurrentBuildCount: 1, maximumQueuedBuildCount: 3),
+            clock: clock.clock
+        ) { input, _, _ in
+            await order.record(input.artifactKey.storageDigestHex)
+            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            return .readyNoSymbols
+        }
+        let owner = UUID()
+        let blockerTask = Task {
+            try await coordinator.resolve(request(blocker, ownerID: owner, priority: .explicit))
+        }
+        await gate.waitUntilEntered()
+        let backgroundTask = Task {
+            try await coordinator.resolve(request(background, ownerID: owner, priority: .background))
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 1 }
+        let explicitTask = Task {
+            try await coordinator.resolve(request(explicit, ownerID: owner, priority: .explicit))
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 2 }
+        let demandTask = Task {
+            try await coordinator.resolve(request(demand, ownerID: owner, priority: .demand))
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 3 }
+        await gate.release()
+        _ = try await blockerTask.value
+        _ = try await demandTask.value
+        _ = try await explicitTask.value
+        _ = try await backgroundTask.value
+
+        let values = await order.values
+        XCTAssertEqual(values, [
+            blocker.artifactKey.storageDigestHex,
+            demand.artifactKey.storageDigestHex,
+            explicit.artifactKey.storageDigestHex,
+            background.artifactKey.storageDigestHex
+        ])
+    }
+
+    func testDemandJoinUpgradesQueuedBackgroundFlight() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let blocker = try makeInput("upgrade-blocker", root: fixture.root)
+        let shared = try makeInput("upgrade-shared", root: fixture.root)
+        let explicit = try makeInput("upgrade-explicit", root: fixture.root)
+        let gate = CoordinatorTestGate()
+        let builds = CoordinatorBuildRecorder()
+        let clock = CoordinatorTestClock()
+        let coordinator = makeCoordinator(
+            fixture: fixture,
+            policy: policy(maximumConcurrentBuildCount: 1, maximumQueuedBuildCount: 2),
+            clock: clock.clock
+        ) { input, ownerID, priority in
+            await builds.record(key: input.artifactKey, ownerID: ownerID, priority: priority)
+            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            return .readyNoSymbols
+        }
+        let backgroundOwner = UUID()
+        let demandOwner = UUID()
+        let blockerTask = Task { try await coordinator.resolve(request(blocker, priority: .explicit)) }
+        await gate.waitUntilEntered()
+        let backgroundTask = Task {
+            try await coordinator.resolve(
+                request(shared, ownerID: backgroundOwner, priority: .background)
+            )
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 1 }
+        let explicitTask = Task { try await coordinator.resolve(request(explicit, priority: .explicit)) }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 2 }
+        let demandTask = Task {
+            try await coordinator.resolve(request(shared, ownerID: demandOwner, priority: .demand))
+        }
+        try await waitUntil { await coordinator.accounting().waiterCount == 4 }
+        await gate.release()
+        _ = try await blockerTask.value
+        _ = try await demandTask.value
+        _ = try await backgroundTask.value
+        _ = try await explicitTask.value
+
+        let entries = await builds.entries
+        XCTAssertEqual(entries.map(\.key), [blocker.artifactKey, shared.artifactKey, explicit.artifactKey])
+        let sharedEntry = try XCTUnwrap(entries.first { $0.key == shared.artifactKey })
+        XCTAssertEqual(sharedEntry.ownerID, demandOwner)
+        XCTAssertEqual(sharedEntry.priority, .demand)
+        let accounting = await coordinator.accounting()
+        XCTAssertEqual(accounting.counters.joins, 1)
+        XCTAssertEqual(accounting.counters.demandAdmissions, 1)
+    }
+
+    func testDemandRetainerReleaseDowngradesQueuedSharedFlightWithoutRestart() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let blocker = try makeInput("downgrade-blocker", root: fixture.root)
+        let shared = try makeInput("downgrade-shared", root: fixture.root)
+        let explicit = try makeInput("downgrade-explicit", root: fixture.root)
+        let gate = CoordinatorTestGate()
+        let builds = CoordinatorBuildRecorder()
+        let coordinator = makeCoordinator(
+            fixture: fixture,
+            policy: policy(maximumConcurrentBuildCount: 1, maximumQueuedBuildCount: 2)
+        ) { input, ownerID, priority in
+            await builds.record(key: input.artifactKey, ownerID: ownerID, priority: priority)
+            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            return .readyNoSymbols
+        }
+        let backgroundOwner = UUID()
+        let demandOwner = UUID()
+        let blockerTask = Task { try await coordinator.resolve(request(blocker, priority: .explicit)) }
+        await gate.waitUntilEntered()
+        let backgroundTask = Task {
+            try await coordinator.resolve(
+                request(shared, ownerID: backgroundOwner, priority: .background)
+            )
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 1 }
+        let explicitTask = Task { try await coordinator.resolve(request(explicit, priority: .explicit)) }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 2 }
+        let demandTask = Task {
+            try await coordinator.resolve(request(shared, ownerID: demandOwner, priority: .demand))
+        }
+        try await waitUntil { await coordinator.accounting().waiterCount == 4 }
+        demandTask.cancel()
+        await assertCancellation(demandTask)
+        try await waitUntil { await coordinator.accounting().waiterCount == 3 }
+        await gate.release()
+        _ = try await blockerTask.value
+        _ = try await explicitTask.value
+        _ = try await backgroundTask.value
+
+        let entries = await builds.entries
+        XCTAssertEqual(entries.map(\.key), [blocker.artifactKey, explicit.artifactKey, shared.artifactKey])
+        let sharedEntry = try XCTUnwrap(entries.first { $0.key == shared.artifactKey })
+        XCTAssertEqual(sharedEntry.ownerID, backgroundOwner)
+        XCTAssertEqual(sharedEntry.priority, .background)
+        let accounting = await coordinator.accounting()
+        XCTAssertEqual(accounting.counters.joins, 1)
+        XCTAssertEqual(accounting.counters.buildsStarted, 3)
+        XCTAssertEqual(accounting.counters.duplicateBuilds, 0)
+        XCTAssertEqual(accounting.counters.demandAdmissions, 0)
+    }
+
+    func testAgedBackgroundAdmitsAfterForegroundBound() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let blocker = try makeInput("aged-bound-blocker", root: fixture.root)
+        let background = try makeInput("aged-bound-background", root: fixture.root)
+        let demandA = try makeInput("aged-bound-demand-a", root: fixture.root)
+        let demandB = try makeInput("aged-bound-demand-b", root: fixture.root)
+        let demandC = try makeInput("aged-bound-demand-c", root: fixture.root)
+        let gate = CoordinatorTestGate()
+        let order = CoordinatorTestRecorder()
+        let clock = CoordinatorTestClock()
+        let coordinator = makeCoordinator(
+            fixture: fixture,
+            policy: policy(
+                maximumConcurrentBuildCount: 1,
+                maximumQueuedBuildCount: 4,
+                backgroundAgePromotionNanoseconds: 100,
+                maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged: 2
+            ),
+            clock: clock.clock
+        ) { input, _, _ in
+            await order.record(input.artifactKey.storageDigestHex)
+            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            return .readyNoSymbols
+        }
+        let owner = UUID()
+        let blockerTask = Task {
+            try await coordinator.resolve(request(blocker, ownerID: owner, priority: .explicit))
+        }
+        await gate.waitUntilEntered()
+        let backgroundTask = Task {
+            try await coordinator.resolve(request(background, ownerID: owner, priority: .background))
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 1 }
+        clock.advance(by: 100)
+        let demandATask = Task {
+            try await coordinator.resolve(request(demandA, ownerID: owner, priority: .demand))
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 2 }
+        let demandBTask = Task {
+            try await coordinator.resolve(request(demandB, ownerID: owner, priority: .demand))
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 3 }
+        let demandCTask = Task {
+            try await coordinator.resolve(request(demandC, ownerID: owner, priority: .demand))
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 4 }
+        await gate.release()
+        _ = try await blockerTask.value
+        _ = try await demandATask.value
+        _ = try await demandBTask.value
+        _ = try await backgroundTask.value
+        _ = try await demandCTask.value
+
+        let values = await order.values
+        XCTAssertEqual(values, [
+            blocker.artifactKey.storageDigestHex,
+            demandA.artifactKey.storageDigestHex,
+            demandB.artifactKey.storageDigestHex,
+            background.artifactKey.storageDigestHex,
+            demandC.artifactKey.storageDigestHex
+        ])
+        let accounting = await coordinator.accounting()
+        XCTAssertEqual(accounting.consecutiveNonBackgroundAdmissionsWhileBackgroundAged, 0)
+        XCTAssertEqual(accounting.counters.agedBackgroundAdmissions, 1)
+        XCTAssertEqual(accounting.counters.nonBackgroundAdmissionsWhileBackgroundAged, 2)
+    }
+
+    func testAgedBackgroundAdmissionIsOwnerFair() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let blocker = try makeInput("aged-owner-blocker", root: fixture.root)
+        let repeated = try makeInput("aged-owner-repeated", root: fixture.root)
+        let fresh = try makeInput("aged-owner-fresh", root: fixture.root)
+        let gate = CoordinatorTestGate()
+        let order = CoordinatorTestRecorder()
+        let clock = CoordinatorTestClock()
+        let coordinator = makeCoordinator(
+            fixture: fixture,
+            policy: policy(
+                maximumConcurrentBuildCount: 1,
+                maximumQueuedBuildCount: 2,
+                backgroundAgePromotionNanoseconds: 10,
+                maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged: 0
+            ),
+            clock: clock.clock
+        ) { input, _, _ in
+            await order.record(input.artifactKey.storageDigestHex)
+            if input.artifactKey == blocker.artifactKey { await gate.enter() }
+            return .readyNoSymbols
+        }
+        let repeatedOwner = UUID()
+        let blockerTask = Task {
+            try await coordinator.resolve(request(blocker, ownerID: repeatedOwner, priority: .demand))
+        }
+        await gate.waitUntilEntered()
+        let repeatedTask = Task {
+            try await coordinator.resolve(
+                request(repeated, ownerID: repeatedOwner, priority: .background)
+            )
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 1 }
+        let freshTask = Task {
+            try await coordinator.resolve(request(fresh, ownerID: UUID(), priority: .background))
+        }
+        try await waitUntil { await coordinator.accounting().queuedBuildCount == 2 }
+        clock.advance(by: 10)
+        await gate.release()
+        _ = try await blockerTask.value
+        _ = try await freshTask.value
+        _ = try await repeatedTask.value
+
+        let values = await order.values
+        XCTAssertEqual(values, [
+            blocker.artifactKey.storageDigestHex,
+            fresh.artifactKey.storageDigestHex,
+            repeated.artifactKey.storageDigestHex
+        ])
+    }
+
     func testAgedExplicitAdmissionPrecedesNewerDemandDespiteOwnerHistory() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
@@ -1639,7 +1933,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         maximumRetainedInputByteCount: Int = 128 * 1024 * 1024,
         maximumPendingHookEventCount: Int = 256,
         maximumConsecutiveDemandAdmissions: Int = 2,
-        agePromotionNanoseconds: UInt64 = 1_000_000_000
+        agePromotionNanoseconds: UInt64 = 1_000_000_000,
+        backgroundAgePromotionNanoseconds: UInt64 = 1_000_000_000,
+        maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged: Int = 2
     ) -> CodeMapArtifactBuildCoordinatorPolicy {
         CodeMapArtifactBuildCoordinatorPolicy(
             maximumFlightCount: 16,
@@ -1652,6 +1948,9 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             maximumPendingHookEventCount: maximumPendingHookEventCount,
             maximumConsecutiveDemandAdmissions: maximumConsecutiveDemandAdmissions,
             agePromotionNanoseconds: agePromotionNanoseconds,
+            backgroundAgePromotionNanoseconds: backgroundAgePromotionNanoseconds,
+            maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged:
+            maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged,
             retryAfterMilliseconds: 10
         )
     }
@@ -1986,6 +2285,24 @@ private actor CoordinatorAdmissionRecorder {
 
     func record(ownerID: UUID, priority: TaskPriority) {
         entries.append(Entry(ownerID: ownerID, priority: priority))
+    }
+}
+
+private actor CoordinatorBuildRecorder {
+    struct Entry: Equatable {
+        let key: CodeMapArtifactKey
+        let ownerID: UUID
+        let priority: CodeMapArtifactBuildPriority
+    }
+
+    private(set) var entries: [Entry] = []
+
+    func record(
+        key: CodeMapArtifactKey,
+        ownerID: UUID,
+        priority: CodeMapArtifactBuildPriority
+    ) {
+        entries.append(Entry(key: key, ownerID: ownerID, priority: priority))
     }
 }
 

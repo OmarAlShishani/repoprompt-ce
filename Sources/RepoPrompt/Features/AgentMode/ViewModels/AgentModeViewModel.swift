@@ -5310,6 +5310,75 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    func mcpReconcileExplicitTabSpawnWorktreeBindings(
+        sourceTabID: UUID,
+        expectedSourceSessionID: UUID,
+        expectedBindings: [AgentSessionWorktreeBinding],
+        target: MCPSessionTarget
+    ) throws {
+        guard let sourceSession = sessions[sourceTabID],
+              sourceSession.activeAgentSessionID == expectedSourceSessionID
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start could not validate the explicit-tab source Agent session for worktree inheritance."
+            )
+        }
+        guard sourceSession.hasLoadedPersistedState else {
+            throw MCPError.invalidParams(
+                "agent_run.start cannot inherit worktree bindings before the explicit-tab source Agent session is hydrated."
+            )
+        }
+        guard sourceSession.worktreeBindings == expectedBindings else {
+            throw MCPError.invalidParams(
+                "agent_run.start explicit-tab source worktree bindings changed after launch capture."
+            )
+        }
+        guard let targetSessionID = target.sessionID,
+              let targetSession = sessions[target.tabID],
+              targetSession.activeAgentSessionID == targetSessionID,
+              targetSession.parentSessionID == nil
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start could not validate the top-level target Agent session for explicit-tab worktree inheritance."
+            )
+        }
+
+        if targetSession.worktreeBindings.isEmpty {
+            _ = commitWorktreeBindings(expectedBindings, to: targetSession)
+        } else if targetSession.worktreeBindings != expectedBindings {
+            throw MCPError.invalidParams(
+                "agent_run.start target worktree bindings conflict with the explicit-tab source session."
+            )
+        }
+    }
+
+    func mcpRequireExplicitTabSpawnWorktreeBindings(
+        sourceTabID: UUID,
+        expectedSourceSessionID: UUID,
+        expectedBindings: [AgentSessionWorktreeBinding],
+        target: MCPSessionTarget
+    ) throws {
+        guard let sourceSession = sessions[sourceTabID],
+              sourceSession.activeAgentSessionID == expectedSourceSessionID,
+              sourceSession.hasLoadedPersistedState,
+              sourceSession.worktreeBindings == expectedBindings
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start explicit-tab source Agent session or worktree bindings changed before provider startup."
+            )
+        }
+        guard let targetSessionID = target.sessionID,
+              let targetSession = sessions[target.tabID],
+              targetSession.activeAgentSessionID == targetSessionID,
+              targetSession.parentSessionID == nil,
+              targetSession.worktreeBindings == expectedBindings
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start top-level target worktree bindings changed before provider startup."
+            )
+        }
+    }
+
     func applySpawnParentSessionID(
         _ parentSessionID: UUID?,
         to session: TabSession,

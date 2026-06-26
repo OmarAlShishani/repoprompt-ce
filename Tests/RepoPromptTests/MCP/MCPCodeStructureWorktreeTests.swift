@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPrompt
 import RepoPromptShared
 import XCTest
@@ -80,7 +81,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let dto = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(waitMilliseconds: 12_000),
+            request: request(),
             includePathNotFoundIssue: true,
             lookupContext: context
         )
@@ -135,8 +136,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             try await ServerNetworkManager.withConnectionID(connectionID) {
                 try await tool([
                     "scope": .string("paths"),
-                    "paths": .array([.string(fileURL.path)]),
-                    "limits": .object(["wait_ms": .int(2000)])
+                    "paths": .array([.string(fileURL.path)])
                 ])
             }
         }
@@ -167,8 +167,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             try await ServerNetworkManager.withConnectionID(connectionID) {
                 try await tool([
                     "scope": .string("paths"),
-                    "paths": .array([.string(fileURL.path)]),
-                    "limits": .object(["wait_ms": .int(2000)])
+                    "paths": .array([.string(fileURL.path)])
                 ])
             }
         }
@@ -181,6 +180,175 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(repeatedInvocations.count, 2)
         XCTAssertEqual(repeatedInvocations.map(\.commandCount), [0, 0])
         XCTAssertEqual(repeatedInvocations.map(\.requestIdentity), [requestIdentity, repeatedRequestIdentity])
+    }
+
+    func testWaitMillisecondsParameterIsNotExposedAndIsRejected() async throws {
+        let root = try makeTemporaryRoot(name: "WaitPolicy")
+        let fileURL = root.appendingPathComponent("Sources/App.swift")
+        try write("struct PlainFile {}\n", to: fileURL)
+        let window = try await makeWindow(root: root)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "code-structure-wait-policy",
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.getCodeStructure })
+        let schema = try XCTUnwrap(Value(tool.inputSchema).objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        let limitsSchema = try XCTUnwrap(properties["limits"]?.objectValue)
+        let limitProperties = try XCTUnwrap(limitsSchema["properties"]?.objectValue)
+        XCTAssertNil(limitProperties["wait_ms"])
+        let invoke: ([String: Value]?) async throws -> Value = { submittedLimits in
+            var arguments: [String: Value] = [
+                "scope": .string("paths"),
+                "paths": .array([.string(fileURL.path)])
+            ]
+            if let submittedLimits {
+                arguments["limits"] = .object(submittedLimits)
+            }
+            return try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await tool(arguments)
+            }
+        }
+
+        window.mcpServer.resetLastCodeStructureRequestForTesting()
+        _ = try await invoke(nil)
+        XCTAssertEqual(window.mcpServer.capturedCodeStructureRequestForTesting(), request())
+
+        window.mcpServer.resetLastCodeStructureRequestForTesting()
+        do {
+            _ = try await invoke(["wait_ms": .int(10000)])
+            XCTFail("Expected wait_ms to be rejected as an unknown limits parameter")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("unknown limits parameter"),
+                "Unexpected error: \(error)"
+            )
+        }
+        XCTAssertNil(window.mcpServer.capturedCodeStructureRequestForTesting())
+    }
+
+    func testReadinessPressureDTOsAreTypedEmptyAndRetryConsistent() throws {
+        let rendered = try renderedStructureEntry()
+        let cases: [(
+            outcome: WorkspaceCodemapStructureOutcome,
+            issue: WorkspaceCodemapStructureIssue,
+            status: String,
+            code: String,
+            retryAfterMilliseconds: Int?
+        )] = [
+            (.busy, .busy(retryAfterMilliseconds: 1), "busy", "codemap_busy", 25),
+            (
+                .timeout,
+                .readinessTimeout(
+                    elapsedMilliseconds: 9876,
+                    limitMilliseconds: 10000,
+                    retryAfterMilliseconds: 5000
+                ),
+                "timeout",
+                "readiness_timeout",
+                1000
+            ),
+            (
+                .unavailable,
+                .projectionUnavailable(reason: .generationMismatch, retryAfterMilliseconds: 75),
+                "unavailable",
+                "projection_unavailable",
+                75
+            ),
+            (
+                .unavailable,
+                .projectionUnavailable(reason: .capabilityUnavailable, retryAfterMilliseconds: nil),
+                "unavailable",
+                "projection_unavailable",
+                nil
+            )
+        ]
+
+        for item in cases {
+            let presentation = WorkspaceCodemapStructurePresentation(
+                outcome: item.outcome,
+                entries: [rendered],
+                issues: [item.issue],
+                requestedSeedCount: 1,
+                resolvedSeedCount: 1,
+                examinedEdgeCount: 9,
+                codemapTokenCount: 7
+            )
+            let dto = MCPServerViewModel.codeStructureReplyDTO(
+                presentation: presentation,
+                logicalPathsByFileID: [rendered.entry.fileID: rendered.entry.logicalPath.displayPath],
+                worktreeScope: nil
+            )
+
+            XCTAssertEqual(dto.status, item.status)
+            XCTAssertTrue(dto.files.isEmpty)
+            XCTAssertEqual(dto.summary.returnedFiles, 0)
+            XCTAssertEqual(dto.summary.codemapContentTokens, 0)
+            XCTAssertEqual(dto.summary.examinedEdges, 0)
+            let issue = try XCTUnwrap(dto.issues.first { $0.code == item.code })
+            XCTAssertEqual(issue.retryable, item.retryAfterMilliseconds != nil)
+            XCTAssertEqual(issue.retryAfterMilliseconds, item.retryAfterMilliseconds)
+            XCTAssertEqual(dto.retry?.retryAfterMilliseconds, item.retryAfterMilliseconds)
+            XCTAssertEqual(dto.retry?.retryable, item.retryAfterMilliseconds == nil ? nil : true)
+            if item.code == "readiness_timeout" {
+                XCTAssertEqual(issue.attempted, 9876)
+                XCTAssertEqual(issue.limit, 10000)
+            }
+        }
+
+        for legacyOutcome in [WorkspaceCodemapStructureOutcome.partial, .pending] {
+            let dto = MCPServerViewModel.codeStructureReplyDTO(
+                presentation: WorkspaceCodemapStructurePresentation(
+                    outcome: legacyOutcome,
+                    entries: [rendered],
+                    issues: [],
+                    requestedSeedCount: 1,
+                    resolvedSeedCount: 1,
+                    examinedEdgeCount: 9,
+                    codemapTokenCount: 7
+                ),
+                logicalPathsByFileID: [rendered.entry.fileID: rendered.entry.logicalPath.displayPath],
+                worktreeScope: nil
+            )
+            XCTAssertEqual(dto.status, "timeout")
+            XCTAssertTrue(dto.files.isEmpty)
+            XCTAssertEqual(dto.issues.map(\.code), ["readiness_timeout"])
+            XCTAssertEqual(dto.issues.first?.attempted, 10000)
+            XCTAssertEqual(dto.issues.first?.limit, 10000)
+            XCTAssertNotNil(dto.retry?.retryAfterMilliseconds)
+        }
+
+        let projectionBudget = WorkspaceCodemapProjectionBudget(
+            dimension: .retainedProjectionBytes,
+            attempted: 2049,
+            limit: 2048
+        )
+        let budgetDTO = MCPServerViewModel.codeStructureReplyDTO(
+            presentation: WorkspaceCodemapStructurePresentation(
+                outcome: .budget,
+                entries: [],
+                issues: [.projectionBudget(projectionBudget)],
+                requestedSeedCount: 1,
+                resolvedSeedCount: 0,
+                examinedEdgeCount: 0,
+                codemapTokenCount: 0
+            ),
+            logicalPathsByFileID: [:],
+            worktreeScope: nil
+        )
+        XCTAssertEqual(budgetDTO.status, "budget")
+        XCTAssertEqual(budgetDTO.issues.map(\.code), ["projection_budget"])
+        XCTAssertEqual(budgetDTO.issues.first?.attempted, 2049)
+        XCTAssertEqual(budgetDTO.issues.first?.limit, 2048)
+        XCTAssertNil(budgetDTO.retry)
     }
 
     func testStrictTokenBudgetNeverAdmitsOversizedFirstEntry() async throws {
@@ -207,7 +375,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let primed = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(maximumCodemapTokens: 6_000, waitMilliseconds: 12_000),
+            request: request(maximumCodemapTokens: 6_000),
             includePathNotFoundIssue: true,
             lookupContext: .visibleWorkspace
         )
@@ -216,7 +384,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let dto = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(maximumCodemapTokens: 1, waitMilliseconds: 12_000),
+            request: request(maximumCodemapTokens: 1),
             includePathNotFoundIssue: true,
             lookupContext: .visibleWorkspace
         )
@@ -225,6 +393,213 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertTrue(dto.files.isEmpty)
         XCTAssertEqual(dto.summary.codemapContentTokens, 0)
         XCTAssertTrue(dto.issues.contains { $0.code == "token_limit" })
+    }
+
+    func testBoundedDirectoryExpansionRejectsAtLimitPlusOneBeforeDownstreamWork() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/One.swift": "struct One {}\n",
+                "Sources/Nested/Two.swift": "struct Two {}\n",
+                "Sources/Three.swift": "struct Three {}\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        let window = try await makeWindow(root: root)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let store = window.workspaceFileContextStore
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "bounded-code-structure",
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first {
+            $0.name == MCPWindowToolName.getCodeStructure
+        })
+        window.mcpServer.resetCodeStructureAdmissionWorkCountsForTesting()
+
+        let value = try await ServerNetworkManager.withConnectionID(connectionID) {
+            try await tool([
+                "scope": .string("paths"),
+                "paths": .array([.string(root.appendingPathComponent("Sources").path)]),
+                "limits": .object(["max_files": .int(1)])
+            ])
+        }
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, "budget")
+        XCTAssertTrue(object["files"]?.arrayValue?.isEmpty == true)
+        let issue = try XCTUnwrap(object["issues"]?.arrayValue?.compactMap(\.objectValue).first {
+            $0["phase"]?.stringValue == "seed_demand"
+        })
+        XCTAssertEqual(issue["code"]?.stringValue, "hard_budget_exceeded")
+        XCTAssertEqual(issue["attempted"]?.intValue, 2)
+        XCTAssertEqual(issue["limit"]?.intValue, 1)
+
+        let admission = window.mcpServer.codeStructureAdmissionWorkCountsForTesting()
+        XCTAssertEqual(admission.uniqueSeedCandidatesVisited, 2)
+        XCTAssertEqual(admission.logicalPathComputations, 0)
+        XCTAssertEqual(admission.coordinatorInvocations, 0)
+    }
+
+    func testSelectedScopeRejectsAtLimitPlusOneWithoutContentOrCodemapWork() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/One.swift": "struct One {}\n",
+                "Sources/Two.swift": "struct Two {}\n",
+                "Sources/Three.swift": "struct Three {}\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        let window = try await makeWindow(root: root)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let store = window.workspaceFileContextStore
+        let rootRefs = await store.rootRefs(scope: .visibleWorkspace)
+        let loadedRoot = try XCTUnwrap(rootRefs.first)
+        let files = await store.files(inRoot: loadedRoot.id).sorted {
+            $0.standardizedFullPath < $1.standardizedFullPath
+        }
+        XCTAssertEqual(files.count, 3)
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+        composeTab.selection = StoredSelection(selectedPaths: files.map(\.standardizedFullPath))
+        window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "bounded-selected-code-structure",
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.getCodeStructure })
+        let contentReads = CodeStructureContentReadCounter()
+        let fileSystemServiceCandidate = await store.fileSystemServiceForTesting(rootID: loadedRoot.id)
+        let fileSystemService = try XCTUnwrap(fileSystemServiceCandidate)
+        await fileSystemService.setContentReadChunkHandlerForTesting { _ in
+            await contentReads.increment()
+        }
+        window.mcpServer.resetCodeStructureAdmissionWorkCountsForTesting()
+
+        let value = try await ServerNetworkManager.withConnectionID(connectionID) {
+            try await tool([
+                "scope": .string("selected"),
+                "limits": .object(["max_files": .int(1)])
+            ])
+        }
+        await fileSystemService.setContentReadChunkHandlerForTesting(nil)
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, "budget")
+        let issue = try XCTUnwrap(object["issues"]?.arrayValue?.compactMap(\.objectValue).first {
+            $0["phase"]?.stringValue == "seed_demand"
+        })
+        XCTAssertEqual(issue["code"]?.stringValue, "hard_budget_exceeded")
+        XCTAssertEqual(issue["attempted"]?.intValue, 2)
+        XCTAssertEqual(issue["limit"]?.intValue, 1)
+        let contentReadCount = await contentReads.value
+        XCTAssertEqual(contentReadCount, 0)
+
+        let admission = window.mcpServer.codeStructureAdmissionWorkCountsForTesting()
+        XCTAssertEqual(admission.uniqueSeedCandidatesVisited, 2)
+        XCTAssertEqual(admission.logicalPathComputations, 0)
+        XCTAssertEqual(admission.coordinatorInvocations, 0)
+    }
+
+    func testSelectedScopeStaleFolderIsIgnoredWhileExactRootAliasResolves() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "CurrentParent/SelectedFolder/Only.swift": "struct Only {}\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        let window = try await makeWindow(root: root)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let store = window.workspaceFileContextStore
+        let rootRefs = await store.rootRefs(scope: .visibleWorkspace)
+        let loadedRoot = try XCTUnwrap(rootRefs.first)
+        let staleFolderPath = "StaleParent/SelectedFolder"
+
+        let staleResolution = await store.resolveSelectedCodeStructureFiles(
+            atPaths: [staleFolderPath],
+            rootScope: .visibleWorkspace,
+            maximumUniqueFileCount: 10
+        )
+        XCTAssertFalse(staleResolution.didExceedLimit)
+        XCTAssertTrue(staleResolution.files.isEmpty)
+        XCTAssertEqual(staleResolution.visitedUniqueFileCount, 0)
+
+        let exactAliasResolution = await store.resolveSelectedCodeStructureFiles(
+            atPaths: ["\(loadedRoot.name)/CurrentParent/SelectedFolder"],
+            rootScope: .visibleWorkspace,
+            maximumUniqueFileCount: 10
+        )
+        XCTAssertFalse(exactAliasResolution.didExceedLimit)
+        XCTAssertEqual(
+            exactAliasResolution.files.map(\.standardizedRelativePath),
+            ["CurrentParent/SelectedFolder/Only.swift"]
+        )
+    }
+
+    func testPhysicalPathDedupAvoidsFalseOverflowAcrossOverlappingRoots() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/Shared.swift": "struct Shared {}\n"]
+        )
+        defer { repositories.cleanup() }
+        let window = try await makeWindow(root: root)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let store = window.workspaceFileContextStore
+        let roots = await store.rootRefs(scope: .visibleWorkspace)
+        let outerRoot = try XCTUnwrap(roots.first { $0.standardizedFullPath == root.standardizedFileURL.path })
+        let nestedRoot = try await store.loadRoot(path: root.appendingPathComponent("Sources").path)
+        let outerFiles = await store.files(inRoot: outerRoot.id)
+        let nestedFiles = await store.files(inRoot: nestedRoot.id)
+        let outerFile = try XCTUnwrap(outerFiles.first)
+        let nestedFile = try XCTUnwrap(nestedFiles.first)
+        XCTAssertNotEqual(outerFile.id, nestedFile.id)
+        XCTAssertEqual(outerFile.standardizedFullPath, nestedFile.standardizedFullPath)
+
+        let boundedExpansion = await store.expandFolderInputToFiles(
+            root.appendingPathComponent("Sources").path,
+            rootScope: .allLoaded,
+            profile: .mcpSelection,
+            excludingStandardizedFullPaths: [nestedFile.standardizedFullPath],
+            maximumUniqueFileCount: 0
+        )
+        XCTAssertTrue(boundedExpansion.handled)
+        XCTAssertFalse(boundedExpansion.didExceedLimit)
+        XCTAssertTrue(boundedExpansion.files.isEmpty)
+        XCTAssertEqual(boundedExpansion.visitedUniqueFileCount, 0)
+
+        window.mcpServer.resetCodeStructureAdmissionWorkCountsForTesting()
+        let dto = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [outerFile, nestedFile],
+            request: request(maximumFiles: 1, maximumCodemapTokens: 0),
+            includePathNotFoundIssue: true,
+            lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        )
+
+        XCTAssertFalse(dto.issues.contains { $0.code == "hard_budget_exceeded" })
+        XCTAssertTrue(dto.issues.contains { $0.code == "token_limit" })
+        let admission = window.mcpServer.codeStructureAdmissionWorkCountsForTesting()
+        XCTAssertEqual(admission.logicalPathComputations, 1)
+        XCTAssertEqual(admission.coordinatorInvocations, 1)
     }
 
     func testSeedDemandBudgetRejectsExpandedSeedsBeforeDemand() async throws {
@@ -245,6 +620,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let files = await store.files(inRoot: loadedRoot.id)
         XCTAssertEqual(files.count, 2)
 
+        window.mcpServer.resetCodeStructureAdmissionWorkCountsForTesting()
         let dto = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: files,
             request: request(maximumFiles: 1),
@@ -259,6 +635,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(issue.code, "hard_budget_exceeded")
         XCTAssertEqual(issue.attempted, 2)
         XCTAssertEqual(issue.limit, 1)
+        let admission = window.mcpServer.codeStructureAdmissionWorkCountsForTesting()
+        XCTAssertEqual(admission.logicalPathComputations, 0)
+        XCTAssertEqual(admission.coordinatorInvocations, 0)
     }
 
 
@@ -290,13 +669,13 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let first = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: Array(files.reversed()),
-            request: request(waitMilliseconds: 12_000),
+            request: request(),
             includePathNotFoundIssue: true,
             lookupContext: .visibleWorkspace
         )
         let second = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: files,
-            request: request(waitMilliseconds: 12_000),
+            request: request(),
             includePathNotFoundIssue: true,
             lookupContext: .visibleWorkspace
         )
@@ -313,7 +692,11 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Source.swift": """
+                struct Source {
+                    let target: Target
+                }
+                """,
                 "Sources/Target.swift": "struct Target { func targetMethod() {} }\n"
             ]
         )
@@ -341,25 +724,39 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let forward = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [source],
-            request: request(direction: .referencedDefinitions, maximumDepth: 2, waitMilliseconds: 12_000),
+            request: request(direction: .referencedDefinitions, maximumDepth: 2),
             includePathNotFoundIssue: true,
             lookupContext: .visibleWorkspace
         )
-        XCTAssertEqual(forward.status, "partial")
+        XCTAssertEqual(forward.status, "ready")
+        XCTAssertTrue(forward.issues.isEmpty)
+        XCTAssertEqual(forward.files.count, 2)
+        XCTAssertEqual(forward.files.map(\.path), [
+            "repository/Sources/Source.swift",
+            "repository/Sources/Target.swift"
+        ])
         XCTAssertEqual(forward.files.map(\.role), ["seed", "related"])
         XCTAssertEqual(forward.files.map(\.depth), [0, 1])
-        XCTAssertTrue(forward.files[1].reachedBy.contains("referenced_definitions"))
+        let forwardRelated = try XCTUnwrap(forward.files.first { $0.role == "related" })
+        XCTAssertEqual(forwardRelated.reachedBy, ["referenced_definitions"])
 
         let reverse = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [target],
-            request: request(direction: .referrers, maximumDepth: 2, waitMilliseconds: 12_000),
+            request: request(direction: .referrers, maximumDepth: 2),
             includePathNotFoundIssue: true,
             lookupContext: .visibleWorkspace
         )
-        XCTAssertEqual(reverse.status, "partial")
+        XCTAssertEqual(reverse.status, "ready")
+        XCTAssertTrue(reverse.issues.isEmpty)
+        XCTAssertEqual(reverse.files.count, 2)
+        XCTAssertEqual(reverse.files.map(\.path), [
+            "repository/Sources/Target.swift",
+            "repository/Sources/Source.swift"
+        ])
         XCTAssertEqual(reverse.files.map(\.role), ["seed", "related"])
         XCTAssertEqual(reverse.files.map(\.depth), [0, 1])
-        XCTAssertTrue(reverse.files[1].reachedBy.contains("referrers"))
+        let reverseRelated = try XCTUnwrap(reverse.files.first { $0.role == "related" })
+        XCTAssertEqual(reverseRelated.reachedBy, ["referrers"])
     }
 
     func testStoreCanScanSessionWorktreeRoot() async throws {
@@ -425,7 +822,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let pendingDTO = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(maximumFiles: 10, waitMilliseconds: 0),
+            request: request(maximumFiles: 10),
             includePathNotFoundIssue: true,
             lookupContext: lookupContext
         )
@@ -441,7 +838,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let refreshedDTO = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(maximumFiles: 10, waitMilliseconds: 12_000),
+            request: request(maximumFiles: 10),
             includePathNotFoundIssue: true,
             lookupContext: lookupContext
         )
@@ -503,7 +900,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         defer { Task { _ = await store.cancelCodemapArtifactDemand(ticketA) } }
         let dtoA = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [fileA],
-            request: request(maximumFiles: 10, waitMilliseconds: 12_000),
+            request: request(maximumFiles: 10),
             includePathNotFoundIssue: true,
             lookupContext: WorkspaceLookupContext(rootScope: projectionA.lookupRootScope, bindingProjection: projectionA)
         )
@@ -528,7 +925,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         defer { Task { _ = await store.cancelCodemapArtifactDemand(ticketB) } }
         let dtoB = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [fileA, fileB],
-            request: request(maximumFiles: 10, waitMilliseconds: 12_000),
+            request: request(maximumFiles: 10),
             includePathNotFoundIssue: true,
             lookupContext: WorkspaceLookupContext(rootScope: projectionB.lookupRootScope, bindingProjection: projectionB)
         )
@@ -577,7 +974,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let primed = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(maximumFiles: 10, waitMilliseconds: 12_000),
+            request: request(maximumFiles: 10),
             includePathNotFoundIssue: true,
             lookupContext: lookupContext
         )
@@ -587,7 +984,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let unavailable = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(maximumFiles: 10, waitMilliseconds: 12_000),
+            request: request(maximumFiles: 10),
             includePathNotFoundIssue: true,
             lookupContext: lookupContext
         )
@@ -626,7 +1023,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let dto = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: files,
-            request: request(maximumFiles: 1, waitMilliseconds: 0),
+            request: request(maximumFiles: 1),
             includePathNotFoundIssue: false,
             lookupContext: .visibleWorkspace
         )
@@ -635,11 +1032,12 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(dto.fileCount, 0)
         XCTAssertNil(dto.pendingPaths)
         XCTAssertNil(dto.unmappedPaths)
-        XCTAssertEqual(dto.summary.requestedSeeds, 3)
+        // Seed admission reports the bounded overflow sentinel (limit + 1), not the full input count.
+        XCTAssertEqual(dto.summary.requestedSeeds, 2)
         XCTAssertEqual(dto.summary.resolvedSeeds, 0)
         let issue = try XCTUnwrap(dto.issues.first { $0.phase == "seed_demand" })
         XCTAssertEqual(issue.code, "hard_budget_exceeded")
-        XCTAssertEqual(issue.attempted, 3)
+        XCTAssertEqual(issue.attempted, 2)
         XCTAssertEqual(issue.limit, 1)
     }
 
@@ -697,16 +1095,14 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         direction: WorkspaceCodemapStructureTraversalDirection? = nil,
         maximumDepth: Int = 0,
         maximumFiles: Int = 10,
-        maximumCodemapTokens: Int = 6000,
-        waitMilliseconds: Int = 2000
+        maximumCodemapTokens: Int = 6000
     ) -> MCPServerViewModel.CodeStructureRequest {
         .init(
             direction: direction,
             maximumDepth: maximumDepth,
             maximumFiles: maximumFiles,
             maximumEdges: 500,
-            maximumCodemapTokens: maximumCodemapTokens,
-            waitMilliseconds: waitMilliseconds
+            maximumCodemapTokens: maximumCodemapTokens
         )
     }
 
@@ -716,21 +1112,42 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         fileID: UUID
     ) async throws -> WorkspaceCodemapArtifactDemandTicket {
         var result = await store.requestCodemapArtifact(forFileID: fileID)
+        var activeTicket: WorkspaceCodemapArtifactDemandTicket?
+        var lastResultDescription = String(describing: result)
+        let timeoutMilliseconds = workspaceCodemapProductionDemandWaitMilliseconds + 5_000
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(8))
+        let deadline = clock.now.advanced(by: .milliseconds(timeoutMilliseconds))
         while clock.now < deadline {
+            lastResultDescription = String(describing: result)
             switch result {
             case let .ready(ready):
                 return ready.ticket
             case let .pending(ticket):
+                activeTicket = ticket
                 try await Task.sleep(for: .milliseconds(25))
                 result = await store.codemapArtifactDemandStatus(ticket)
+            case let .unavailable(.busy(retryAfterMilliseconds)):
+                let delayMilliseconds = min(max(retryAfterMilliseconds ?? 100, 25), 1_000)
+                try await Task.sleep(for: .milliseconds(delayMilliseconds))
+                if let activeTicket {
+                    result = await store.retryBusyCodemapArtifactDemand(activeTicket, priority: .demand)
+                } else {
+                    result = await store.requestCodemapArtifact(forFileID: fileID)
+                }
+                switch result {
+                case let .ready(ready):
+                    activeTicket = ready.ticket
+                case let .pending(ticket):
+                    activeTicket = ticket
+                case .unavailable:
+                    break
+                }
             case let .unavailable(reason):
                 XCTFail("Expected ready codemap demand, got \(reason)")
                 throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 2)
             }
         }
-        XCTFail("Timed out waiting for ready codemap demand")
+        XCTFail("Timed out waiting for ready codemap demand after \(timeoutMilliseconds)ms; last result: \(lastResultDescription)")
         throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 3)
     }
 
@@ -807,6 +1224,36 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
     }
 
+    private func renderedStructureEntry() throws -> WorkspaceCodemapStructureRenderedEntry {
+        let pipeline = try SyntaxManager().pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "LogicalRoot",
+            standardizedRelativePath: "Sources/App.swift"
+        ))
+        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+        return WorkspaceCodemapStructureRenderedEntry(
+            entry: WorkspaceCodemapOperationRenderedEntry(
+                bundleID: WorkspaceCodemapFrozenPresentationBundleID(),
+                fileID: UUID(),
+                rootEpoch: rootEpoch,
+                artifactKey: CodeMapArtifactKey(
+                    rawSHA256: CodeMapRawSourceDigest(bytes: Data(repeating: 1, count: 32)),
+                    rawByteCount: 16,
+                    pipelineIdentity: pipeline
+                ),
+                logicalPath: logicalPath,
+                text: "struct App {}",
+                tokenCount: 7
+            ),
+            isSeed: true,
+            depth: 0,
+            reachedBy: []
+        )
+    }
+
     private func fileRecord(
         at url: URL,
         store: WorkspaceFileContextStore,
@@ -832,38 +1279,38 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 }
 
 #if DEBUG
-    private actor AsyncGate {
-        private var started = false
-        private var released = false
-        private var startWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+private actor AsyncGate {
+    private var started = false
+    private var released = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
-        func markStartedAndWaitForRelease() async {
-            started = true
-            let waiters = startWaiters
-            startWaiters.removeAll()
-            waiters.forEach { $0.resume() }
+    func markStartedAndWaitForRelease() async {
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
 
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
-            }
-        }
-
-        func waitUntilStarted() async {
-            guard !started else { return }
-            await withCheckedContinuation { continuation in
-                startWaiters.append(continuation)
-            }
-        }
-
-        func release() {
-            released = true
-            let waiters = releaseWaiters
-            releaseWaiters.removeAll()
-            waiters.forEach { $0.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
         }
     }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
 #endif
 
 private extension Sequence {
@@ -874,5 +1321,13 @@ private extension Sequence {
             try await values.append(transform(element))
         }
         return values
+    }
+}
+
+private actor CodeStructureContentReadCounter {
+    private(set) var value = 0
+
+    func increment() {
+        value += 1
     }
 }

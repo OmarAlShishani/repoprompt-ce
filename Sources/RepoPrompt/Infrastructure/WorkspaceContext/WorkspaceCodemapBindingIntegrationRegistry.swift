@@ -57,6 +57,14 @@ actor WorkspaceCodemapBindingIntegrationRegistry {
     nonisolated func makeBindingCatalogClient() -> WorkspaceCodemapBindingCatalogClient {
         WorkspaceCodemapBindingCatalogClient { [self] rootEpoch, relativePath in
             await resolveManifestBinding(rootEpoch: rootEpoch, relativePath: relativePath)
+        } readProjectionCatalogPage: { [self] request in
+            await readProjectionCatalogPage(request)
+        } revalidateProjectionCatalogToken: { [self] rootEpoch, token in
+            await revalidateProjectionCatalogToken(rootEpoch: rootEpoch, token: token)
+        } publishProjection: { [self] snapshot in
+            await publishProjection(snapshot)
+        } publishMarkerReadiness: { [self] update in
+            await publishMarkerReadiness(update)
         }
     }
 
@@ -122,6 +130,61 @@ actor WorkspaceCodemapBindingIntegrationRegistry {
               result.identity.rootLifetimeID == rootEpoch.rootLifetimeID
         else { return nil }
         return result
+    }
+
+    private func readProjectionCatalogPage(
+        _ request: WorkspaceCodemapProjectionCatalogPageRequest
+    ) async -> WorkspaceCodemapProjectionCatalogPageDisposition {
+        guard let (token, catalogClient) = currentCatalogRoute(for: request.rootEpoch) else {
+            return .unavailable(.rootNotCurrent)
+        }
+        let result = await catalogClient.readProjectionCatalogPage(request)
+        guard isCurrent(token: token) else { return .stale }
+        if case let .page(page) = result {
+            guard page.token.rootEpoch == request.rootEpoch else { return .stale }
+        }
+        return result
+    }
+
+    private func revalidateProjectionCatalogToken(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        token catalogToken: WorkspaceCodemapProjectionCatalogToken
+    ) async -> WorkspaceCodemapProjectionCatalogTokenDisposition {
+        guard catalogToken.rootEpoch == rootEpoch else { return .stale }
+        guard let (token, catalogClient) = currentCatalogRoute(for: rootEpoch) else {
+            return .unavailable(.rootNotCurrent)
+        }
+        let result = await catalogClient.revalidateProjectionCatalogToken(rootEpoch, catalogToken)
+        guard isCurrent(token: token) else { return .stale }
+        return result
+    }
+
+    private func publishProjection(
+        _ snapshot: WorkspaceCodemapProjectionSnapshot
+    ) async -> WorkspaceCodemapProjectionSnapshotDisposition {
+        let rootEpoch: WorkspaceCodemapRootEpoch = switch snapshot {
+        case let .segment(segment):
+            segment.generation.rootEpoch
+        case let .seal(proof):
+            proof.generation.rootEpoch
+        }
+        guard let (token, catalogClient) = currentCatalogRoute(for: rootEpoch) else {
+            return .superseded
+        }
+        let result = await catalogClient.publishProjection(snapshot)
+        guard isCurrent(token: token) else { return .superseded }
+        return result
+    }
+
+    private func publishMarkerReadiness(
+        _ update: WorkspaceCodemapMarkerReadinessUpdate
+    ) async -> Bool {
+        guard let (token, catalogClient) = currentCatalogRoute(for: update.rootEpoch) else {
+            return false
+        }
+        let accepted = await catalogClient.publishMarkerReadiness(update)
+        guard isCurrent(token: token) else { return false }
+        return accepted
     }
 
     private func currentSourceRoute(

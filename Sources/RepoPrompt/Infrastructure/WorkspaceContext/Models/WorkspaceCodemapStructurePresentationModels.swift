@@ -16,6 +16,8 @@ enum WorkspaceCodemapStructureOutcome: String, Equatable {
     case ready
     case partial
     case pending
+    case busy
+    case timeout
     case unavailable
     case stale
     case budget
@@ -30,6 +32,17 @@ enum WorkspaceCodemapStructureIssue: Equatable {
     case traversalUnavailable(WorkspaceCodemapStructureTraversalUnavailableReason)
     case traversalStale(WorkspaceCodemapStructureTraversalStaleReason)
     case traversalBudget(WorkspaceCodemapStructureTraversalBudgetReason)
+    case busy(retryAfterMilliseconds: Int)
+    case readinessTimeout(
+        elapsedMilliseconds: Int,
+        limitMilliseconds: Int,
+        retryAfterMilliseconds: Int
+    )
+    case projectionUnavailable(
+        reason: WorkspaceCodemapProjectionDemandUnavailableReason,
+        retryAfterMilliseconds: Int?
+    )
+    case projectionBudget(WorkspaceCodemapProjectionBudget)
     case freezeUnavailable(
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapPresentationFreezeUnavailableReason

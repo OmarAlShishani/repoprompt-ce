@@ -147,7 +147,7 @@
     final class WorktreeStartupBenchmarkDiagnostics: @unchecked Sendable {
         static let shared = WorktreeStartupBenchmarkDiagnostics()
         static let enabledDefaultsKey = "enableWorktreeStartupBenchmarkDiagnostics"
-        static let requiredWorkspaceNamePrefix = "RPCE 8E Bench "
+        static let requiredWorkspaceNamePrefixes = ["RPCE 8E Bench ", "RPCE Search Bench "]
         @TaskLocal static var currentPendingStart: DebugWorktreeStartupBenchmarkPendingStart?
 
         struct RouteControl: Equatable {

@@ -52,6 +52,10 @@ enum WorkspaceCodemapStructureTraversalUnavailableReason: Hashable {
     case seedNotReady(UUID)
     case graphNotBuilt(WorkspaceCodemapRootEpoch)
     case invalidGraphResult(WorkspaceCodemapRootEpoch)
+    case definitionUniverse(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        coverage: WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage
+    )
     case runtime(
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason

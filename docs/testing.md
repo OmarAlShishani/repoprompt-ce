@@ -209,7 +209,8 @@ test IDs and must not change the curated test ledger.
 
 ### Dedicated workspace and plan
 
-Use a disposable workspace whose name starts with `RPCE 8E Bench `. Never use
+Use a disposable workspace whose name starts with `RPCE 8E Bench ` or the
+established `RPCE Search Bench ` prefix. Never use
 the active development checkout: the driver rejects its own repository root.
 Create/open a separate disposable root with `rpce-cli-debug`, bind the benchmark
 tab, and record its exact window, workspace, context, and root IDs. A name or
@@ -256,6 +257,15 @@ python3 Scripts/worktree_startup_live_benchmark.py plan \
   --output /tmp/rpce-worktree-startup-plan.json
 ```
 
+`read-path` must name a blob committed in the exact `base-ref`, and that blob
+must contain both `search-marker` and `read-marker`. Plan resolves `base-ref` to
+an immutable commit OID, verifies the blob through that OID, and freezes both
+the commit OID and blob SHA-256. Preflight, run, and smoke re-resolve the symbolic
+ref and reject drift; every app/local worktree start uses the stored OID. The rest of a
+100k/1M pressure fixture may remain untracked in the parent root, but an
+untracked-only marker cannot be inherited by an app-created Git worktree and is
+rejected.
+
 `asserted_file_count` is operator-supplied provenance, not an app measurement.
 The plan freezes the ownership-marker digest; do not recreate or edit the marker
 between cohorts.
@@ -283,9 +293,11 @@ python3 Scripts/worktree_startup_live_benchmark.py preflight \
   --confirm-live-debug-app
 ```
 
-Preflight freezes SHA-256 hashes for the relevant CLI schemas and requires the
-DEBUG benchmark token plus `manage_workspaces.remove_folder`. A schema or scope
-change invalidates the campaign; do not silently substitute IDs.
+Preflight rejects a moved symbolic `base-ref`, rechecks the tracked marker blob
+through the stored commit OID, freezes
+SHA-256 hashes for the relevant CLI schemas, and requires the DEBUG benchmark
+token plus `manage_workspaces.remove_folder`. A marker, schema, or scope change
+invalidates the campaign; do not silently substitute IDs.
 Restore the gate to its prior value after all run/smoke cleanup completes.
 
 ### Route and concurrency cohorts
@@ -382,22 +394,41 @@ python3 Scripts/worktree_startup_live_benchmark.py smoke \
 
 The smoke lane uses a script-owned app worktree and temporary roots. It checks:
 
+- the active parent makes exactly 20 calls, alternating ten `file_search` and
+  ten `read_file` calls against the tracked marker, then returns exactly
+  `RPCE_ACTIVE_PARENT_OK`. Its transcript rejects Bash/shell/exec, delegation,
+  any other substitute tool, missing/extra/reordered invocations or paired
+  result events, explicitly unsuccessful statuses, or a missing final sentinel.
+  `agent_manage.get_log` intentionally emits spartan self-closing result events,
+  so the harness does not claim unavailable result payload/status proof; terminal
+  `completed` plus the exact sentinel is the available completion evidence;
 - a nested child started from the parent context has the exact parent session
-  and inherited worktree, reaches terminal `completed`, returns the expected
-  marker, and has one ordered inherited-root `file_search` plus `read_file`
-  tool-call/result pair in its structured transcript. Prompt/request text,
-  assistant prose, missing result payloads, or non-success tool status cannot
-  satisfy this check;
-- selection and explicit/selected `get_code_structure` return the exact planned
-  canonical root UUID/path/type and exact file path/type/content in structured
-  MCP JSON, and exclude cross-root/non-Git records;
+  and inherited worktree. The child start is an atomic CLI bind+call explicitly
+  routed to the parent context; the child must return a distinct context UUID
+  and exactly the same inherited worktree binding ID/path set as the parent.
+  Its spartan transcript must contain one ordered `file_search` plus `read_file`
+  invocation/result pair, terminal `completed`, and the exact final sentinel;
+- every smoke CLI invocation atomically binds its requested context and records
+  exactly two JSON documents in order—binding, then final raw tool result—and
+  rejects missing, extra, or reordered documents. Validators accept the
+  current successful raw shapes (`content_match_groups`, `display_path`,
+  selection `files[].root_path/path_within_root`, and code-structure
+  `files/issues/summary`) while requiring tool success, the exact bound root,
+  exact requested/returned paths, marker content, and no unexpected cross-root
+  files (same-root related codemaps are permitted);
+- relative result paths require explicit per-file root metadata, a unique root
+  prefix, or a single-root atomic binding. Ambiguous roots—including distinct
+  roots sharing a basename—and otherwise unattributed relative paths fail;
+- selection and explicit/selected `get_code_structure` use runtime root
+  UUID/path/type evidence plus binding and per-file root/path evidence to
+  exclude cross-root/non-Git substitutions;
 - main/worktree/non-Git marker searches do not leak across explicit root filters;
 - non-Git search/read work and codemap returns an explicit typed unavailable
   status and issue code rather than a
   graph from another root, with exactly one attributed `get_code_structure`
   work record and zero Git commands;
 - watcher create, edit, rename, and delete converge via bounded polling of
-  structured exact-root success/empty records;
+  successful exact-binding raw search records;
 - before, during, and after every ordinary/linked-worktree add/remove, the
   parent remains `running` on the identical context and the during-poll overlaps
   the mutation interval;
@@ -407,11 +438,16 @@ The smoke lane uses a script-owned app worktree and temporary roots. It checks:
 - add/remove overlaps at least one in-flight `file_search`, `read_file`,
   selection, or `get_code_structure` subprocess call, rather than claiming a
   race from calls that already completed;
-- removed-root search/read/codemap calls retain successful CLI/tool transport
-  and return an explicit `not_found`, `unavailable`, or `removed` status plus a
-  recognized typed issue code for the exact former root UUID/path. Generic CLI,
-  transport, or tool failure is a test failure; surviving roots must still be
-  usable through exact-root structured records.
+- removed-root search must succeed with zero matches/files searched, selection
+  must omit the removed root, and code structure must succeed with
+  `status:unavailable` plus `path_not_found`; all are checked against an atomic
+  binding that must no longer contain the exact former Git root and an explicit request
+  path under that root. `read_file` currently reports removal as an invalid-params
+  error, so only the exact former path plus the explicit “not inside any loaded
+  folder” rejection is accepted. Generic or mismatched failures are rejected,
+  and the surviving root must still succeed through exact binding/path evidence.
+  The separate non-Git codemap check instead requires the current non-Git root
+  remain present in the binding with typed `git_root_unavailable` evidence.
 
 The harness records and checks parent and child terminal status, removes only
 roots it added, cancels/waits only sessions it started, and removes registered,
@@ -429,15 +465,189 @@ python3 Scripts/worktree_startup_live_benchmark.py cleanup \
   --confirm-owned-resources
 ```
 
-Resumed cleanup always sends a memory-sampler stop request and follows it with
-an explicit current-state query. Both calls must succeed and report
-`running:false`; a stale state-file flag is not accepted. Worktree removal still
-occurs only after all recorded agents are terminal/cancelled.
+Resumed cleanup treats `state.json` resource IDs as selectors, never as ownership
+proof. It does not use `agent_manage.list_sessions` or depend on any inventory
+limit. Instead, it directly polls every recorded session ID in that session's
+recorded context, independently reads the live worktree inventory, and requires
+the artifact-derived benchmark branch prefix, the plan's frozen base commit OID,
+and one exact live session-to-worktree ID/path/branch/head relationship. Missing
+or ambiguous proof causes no cancellation or deletion; the cleanup action is
+reported as manual cleanup and the cleanup remains incomplete. These Git-worktree
+ownership gates are separate from the current typed non-Git-root handling.
+
+The DEBUG memory sampler returns an immutable `session_id`, rejects every
+occupied `start` (including requests that contain legacy `reset:true`), refuses
+`reset` while active, and accepts `stop` only for the matching live ID. Normal
+teardown stores and stops that exact ID. Resumed cleanup first proves the live
+`current.session_id` and label match the recorded artifact, then conditionally
+stops that ID; a foreign, missing, failed, or ambiguous session is preserved for
+manual cleanup. A stale state-file flag is not accepted. A proven worktree is
+removed only after all recorded agents are terminal/cancelled.
 
 Raw CLI responses may contain paths or source snippets. Run directories are
 created non-overwriting with mode `0700`; files use `0600`. Review before
 sharing. Summary/scoreboard output must not be treated as privacy-scrubbed raw
 evidence.
+
+### Mandatory live codemap projection-demand gate
+
+`codemap-gate` is the packaged-app release authority for live codemap demand.
+It uses the already-running current DEBUG app, `rpce-cli-debug`, the exact
+dedicated workspace plan above, and real `agent_run` sessions. It never builds,
+launches, stops, or relaunches the app. Prepare lifecycle state separately with
+the approval required by `AGENTS.md`. The planned root must be an owned,
+synthetic or explicitly source-allowlisted Git workspace with at least 5,000
+supported code files; the existing `plan` command's 100,000-file minimum is a
+valid stronger fixture. Each measured directory fixture must remain within the
+gate's 100-file output bound; use the separate overflow fixture for rejection.
+
+Create a private fixture JSON. It must contain at least 20 unique individual
+files and 20 unique directories. Every marker must occur in the exact tracked
+or intentionally synthetic source file named by that entry, and the overflow
+directory must contain at least two listed individual fixtures:
+
+```json
+{
+  "schema_version": 1,
+  "individuals": [
+    {"path": "Sources/Large/A.swift", "marker": "CodemapGateA"}
+  ],
+  "directories": [
+    {
+      "path": "Sources/Large/DirectoryA",
+      "expected_file": "Sources/Large/DirectoryA/Entry.swift",
+      "marker": "CodemapDirectoryGateA"
+    }
+  ],
+  "overflow_directory": "Sources/Large/Overflow",
+  "watcher_directory": ".rpce-codemap-gate"
+}
+```
+
+Use a retained, previously accepted `codemap-gate` `summary.json` from the same
+fixture digest as the baseline, plus a separately reviewed acceptance ledger.
+The ledger is strict JSON and binds the raw summary-file SHA-256, artifact ID,
+and fixture SHA-256; one exact entry must match. Supply the ledger's separately
+reviewed SHA-256 explicitly so a synthetic summary plus synthetic ledger cannot
+self-attest:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "codemap-gate-baseline-ledger",
+  "accepted_summaries": [
+    {
+      "artifact_id": "20260625T000000Z-codemap-gate-example",
+      "summary_sha256": "<sha256-of-the-exact-summary.json-bytes>",
+      "fixture_sha256": "<fixture_sha256-from-summary.json>"
+    }
+  ]
+}
+```
+
+The release gate deliberately refuses a missing, hand-written/unaccepted,
+different-fixture, wrong-count, missing-inventory, zero, `NaN`, or infinite
+baseline:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py codemap-gate \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --fixture /tmp/rpce-codemap-gate-fixture.json \
+  --baseline /tmp/rpce-codemap-retained-baseline/summary.json \
+  --baseline-ledger /tmp/rpce-codemap-baseline-ledger.json \
+  --baseline-ledger-sha256 <independently-reviewed-ledger-sha256> \
+  --cold-samples 20 \
+  --warm-samples 40 \
+  --confirm-live-debug-app \
+  --confirm-dedicated-workspace \
+  --confirm-synthetic-allowlisted-source
+```
+
+The printed artifact directory is local raw evidence. It contains the exact
+`rpce-cli-debug` JSON, agent transcript XML, sample NDJSON, state, cleanup,
+resource, fixture, plan, and derived summary files. Directories must remain
+`0700` and files `0600`. The final scan fails closed on credential patterns,
+the developer checkout, unallowlisted home/private paths, or mode drift.
+Only the separate derived `summary.json` shape is shareable: scenario IDs,
+hashed relative identifiers, content/presence hashes, statuses, issue codes,
+counters, and timings. Do not publish raw artifacts.
+
+The command passes only when all of these gates pass:
+
+1. There are exactly the configured counts (minimum 20 cold and 40 warm) for both the
+   individual-file and directory cohorts. Every cold file must first prove
+   absence of its exact codemap `+` marker through a non-demanding tree probe;
+   warm repetitions reuse those same cold fixtures. All requests use the
+   server-owned fixed 10-second readiness deadline. Before live work begins,
+   the harness saves `rpce-cli-debug describe get_code_structure` and fails
+   immediately if the model-facing schema advertises a caller-controlled
+   readiness deadline; no harness or agent request may tune that deadline.
+2. Every successful structure request is exactly `ready`, contains the expected
+   real codemap marker and a content hash at the current logical path, and is
+   followed by an atomically same-context tree request bound to the exact root,
+   requested direct parent, full reconstructed logical file path, `+` marker and
+   `(+ denotes code-map available)` legend. `partial`/`pending` or a
+   readiness-derived subset fails.
+3. One small, fail-fast real `agent_run` probe covers two individual files and
+   two directories, followed by the inherited-worktree child and concurrent
+   ordinary/linked agents; this is not a large inference/stress loop. Raw
+   transcripts prove ordered call/result pairs and forbid caller-controlled
+   readiness limits.
+   Every agent also has exact monotonic timings and structured content/path/tree
+   evidence. If transcript result events are spartan, the harness performs the
+   exact structure/tree probes atomically in that same session context/worktree
+   and records the session-context-binding correlation. Any Bash, shell,
+   exec, command, delegation, substitute encoding, unexpected tool, missing
+   result, reordering, or wrong final sentinel fails. Spartan self-closing agent
+   result events are invocation evidence only and never borrow evidence from an
+   unrelated cohort.
+4. The primary root continues serving structure while a script-owned secondary
+   linked-worktree root is added and removed. A root-targeted DEBUG hold keeps
+   the linked-root agent itself running immediately before removal. After
+   removal, that exact session/context must terminalize or be cancelled and an
+   atomic probe of its old full path must return typed empty revocation with the
+   linked root absent from binding and no primary/cross-root fallback.
+5. Non-Git search/read succeeds, structure is typed terminal, and the scoped
+   build/projection/catalog counters remain unchanged. Watcher
+   create/edit/rename/delete publishes only current structure and markers.
+   Strict directory overflow returns empty `budget`, `attempted:2`, `limit:1`,
+   and zero downstream build/projection/catalog demand.
+6. Every directly timed server `get_code_structure` request in raw CLI evidence
+   terminates within the 10,000 ms server wait plus 500 ms harness allowance;
+   agent calls additionally require ordered paired results and terminal success.
+   The held timeout itself must occur within 10,000 ms ± 500 ms and
+   report `attempted` in that same band with `limit:10000`; these values come
+   from the internal fixed default, never a request field. An immediate mocked
+   timeout fails. The DEBUG-only token-owned hold pauses only future projection
+   batch admission, auto-expires, and must produce an empty typed `timeout` with
+   `readiness_timeout`, issue-level and reply-level retry metadata. Releasing
+   the exact hold followed by retry must produce current `ready` content.
+7. The baseline must have the exact metric, gate, privacy, configuration, and
+   sample inventories; every required p50/p95 is finite and positive, every
+   gate passes, privacy is complete, and the separate acceptance-ledger digest
+   matches. Separate p50/p95 distributions are present for cold/warm individual
+   structure, cold/warm directory structure, tree-marker availability, first
+   search, first read, root readiness, projection queue wait, operation
+   duration, and memory deltas. Root/search/read p95 and warm structure p50/p95
+   may regress no more than 10% from the retained baseline; memory-delta p95
+   uses the same fail-closed 10% ceiling.
+8. No projection budget/resource counter is exceeded, no byte counter
+   saturates, all holds are released or proven expired, only script-owned roots,
+   files, agents, and worktrees are removed, memory sampling is stopped, the
+   benchmark setting is unchanged, and the workspace returns to its sole
+   planned root. Interrupted Git-root removal additionally requires successful
+   live `cleanup_worktree_ownership_evidence`; non-Git removal requires its live
+   artifact/plan/token-bound marker. Cleanup directly proves every recorded
+   session and has no 1,000-session cap.
+
+Any missing raw evidence, missing retry delay, stale path/content/marker,
+privacy leak, non-Git codemap work, latency/resource regression, nonterminal
+agent, ambiguous ownership, or incomplete cleanup is a hard failure. On an
+interrupted run, use the existing `cleanup` command with the artifact path; it
+releases or proves expiry of recorded codemap holds and removes recorded added
+roots only when its independent ownership checks pass. Temporary non-Git roots
+carry an exclusive artifact/plan/token-bound ownership marker; a mutable
+`state.json` path or basename prefix is never sufficient deletion proof.
 
 ### Aggregation, thresholds, and append-only scoreboard
 
@@ -533,6 +743,7 @@ python3 Scripts/worktree_startup_live_benchmark.py record-evidence --help
 python3 Scripts/worktree_startup_live_benchmark.py preflight --help
 python3 Scripts/worktree_startup_live_benchmark.py run --help
 python3 Scripts/worktree_startup_live_benchmark.py smoke --help
+python3 Scripts/worktree_startup_live_benchmark.py codemap-gate --help
 python3 Scripts/worktree_startup_live_benchmark.py aggregate --help
 python3 Scripts/worktree_startup_live_benchmark.py cleanup --help
 ```

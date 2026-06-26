@@ -204,31 +204,41 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         XCTAssertEqual(finalGitPreflightCount, 1)
     }
 
-    func testGitLayoutWatcherChangeInvalidatesDefiniteNonGitClassification() async throws {
-        let root = try makeDirectory("watcher-invalidation")
+    func testGitLayoutWatcherChangeReprobesAndAdmitsConvertedRepository() async throws {
+        let root = try makeDirectory("watcher-conversion")
         try writeSwiftFile(in: root)
+        let gitFixture = try ReviewGitRepositoryFixture(name: #function)
+        addTeardownBlock { gitFixture.cleanup() }
         let gitPreflightCount = AsyncCounter()
+        let productionGitEligibility = WorkspaceCodemapGitEligibilityProbe.production().resolve
         let store = WorkspaceFileContextStore(
             codemapLocalGitClassificationProbe: .production,
-            codemapGitEligibilityProbe: .init { _ in
+            codemapGitEligibilityProbe: .init { rootURL in
                 await gitPreflightCount.increment()
-                return .terminalUnavailable(.nonGit)
+                return await productionGitEligibility(rootURL)
             }
         )
         let loaded = try await store.loadRoot(path: root.path)
         defer { Task { await store.unloadRoot(id: loaded.id) } }
         let file = try await firstFile(in: loaded, store: store)
-        await assertNonGit(store.requestCodemapArtifact(forFileID: file.id))
 
-        try FileManager.default.createDirectory(
-            at: root.appendingPathComponent(".git", isDirectory: true),
-            withIntermediateDirectories: true
-        )
+        await assertNonGit(store.requestCodemapArtifact(forFileID: file.id))
+        let initialGitPreflightCount = await gitPreflightCount.value
+        XCTAssertEqual(initialGitPreflightCount, 0)
+
+        _ = try gitFixture.runGit(["init"], at: root)
+        _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: root)
+        _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: root)
+        _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: root)
+        _ = try gitFixture.runGit(["add", "."], at: root)
+        _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: root)
         await store.replayObservedFileSystemDeltas(rootID: loaded.id, deltas: [.folderAdded(".git")])
 
-        await assertNonGit(store.requestCodemapArtifact(forFileID: file.id))
-        let count = await gitPreflightCount.value
-        XCTAssertEqual(count, 1)
+        let nextDemand = await store.requestCodemapArtifact(forFileID: file.id)
+        let ready = try await settledReady(nextDemand, store: store)
+        let finalGitPreflightCount = await gitPreflightCount.value
+        XCTAssertEqual(finalGitPreflightCount, 1)
+        _ = await store.cancelCodemapArtifactDemand(ready.ticket)
     }
 
     private func makeDirectory(_ name: String) throws -> URL {
@@ -269,6 +279,28 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         }
     }
 
+    private func settledReady(
+        _ initial: WorkspaceCodemapArtifactDemandResult,
+        store: WorkspaceFileContextStore,
+        timeout: Duration = .seconds(15)
+    ) async throws -> WorkspaceCodemapArtifactDemandReady {
+        var result = initial
+        if case let .pending(ticket) = result {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while clock.now < deadline {
+                result = await store.codemapArtifactDemandStatus(ticket)
+                guard case .pending = result else { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        guard case let .ready(ready) = result else {
+            XCTFail("Expected ready codemap demand, got \(result)")
+            throw LocalGitClassificationTestError.expectedReady
+        }
+        return ready
+    }
+
     private func assertTransient(
         _ result: WorkspaceCodemapArtifactDemandResult,
         file: StaticString = #filePath,
@@ -278,6 +310,10 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
             return XCTFail("Expected transient Git result, got \(result)", file: file, line: line)
         }
     }
+}
+
+private enum LocalGitClassificationTestError: Error {
+    case expectedReady
 }
 
 private actor AsyncCounter {

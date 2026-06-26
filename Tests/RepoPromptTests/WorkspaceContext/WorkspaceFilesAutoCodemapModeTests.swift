@@ -80,6 +80,97 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
     }
 
+    func testNewSourceGenerationClearsExistingInferredMarkersSynchronously() {
+        let fixture = makeFixture(fileName: "Generation.swift")
+        fixture.viewModel.setAutoCodemapFilesForTesting([fixture.file])
+
+        fixture.viewModel.selectFileForTesting(fixture.file)
+
+        XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
+        XCTAssertTrue(fixture.viewModel.codemapAutoEnabled)
+    }
+
+    func testAutomaticPublicationTargetReconstructionPreservesExactReceiptOrder() throws {
+        let fixture = makeReconstructionFixture()
+        let firstTarget = try makeTarget(
+            rootEpoch: fixture.rootEpoch,
+            file: fixture.firstTarget,
+            relativePath: "First.swift"
+        )
+        let secondTarget = try makeTarget(
+            rootEpoch: fixture.rootEpoch,
+            file: fixture.secondTarget,
+            relativePath: "Second.swift"
+        )
+
+        let resolved = fixture.viewModel.reconstructAutomaticCodemapTargetsForTesting(
+            receiptTargets: [secondTarget, firstTarget],
+            revalidatedTargets: [secondTarget, firstTarget],
+            sourceIDs: [fixture.source.id],
+            filesByID: [
+                fixture.firstTarget.id: fixture.firstTarget,
+                fixture.secondTarget.id: fixture.secondTarget
+            ]
+        )
+
+        XCTAssertEqual(resolved?.map(\.id), [fixture.secondTarget.id, fixture.firstTarget.id])
+    }
+
+    func testAutomaticPublicationTargetReconstructionRejectsEveryMismatchAtomicallyAndRetries() throws {
+        let fixture = makeReconstructionFixture()
+        let firstTarget = try makeTarget(
+            rootEpoch: fixture.rootEpoch,
+            file: fixture.firstTarget,
+            relativePath: "First.swift"
+        )
+        let secondTarget = try makeTarget(
+            rootEpoch: fixture.rootEpoch,
+            file: fixture.secondTarget,
+            relativePath: "Second.swift"
+        )
+        let duplicateTargets = [firstTarget, firstTarget]
+        let wrongRootTarget = try makeTarget(
+            rootEpoch: WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID()),
+            file: fixture.firstTarget,
+            relativePath: "First.swift"
+        )
+        let filesByID = [
+            fixture.firstTarget.id: fixture.firstTarget,
+            fixture.secondTarget.id: fixture.secondTarget
+        ]
+        let malformedCases: [(
+            receipt: [WorkspaceCodemapAutomaticSelectionTarget],
+            revalidated: [WorkspaceCodemapAutomaticSelectionTarget],
+            sourceIDs: [UUID],
+            filesByID: [UUID: FileViewModel]
+        )] = [
+            ([firstTarget, secondTarget], [firstTarget], [fixture.source.id], filesByID),
+            ([firstTarget, secondTarget], [secondTarget, firstTarget], [fixture.source.id], filesByID),
+            (duplicateTargets, duplicateTargets, [fixture.source.id], filesByID),
+            ([wrongRootTarget], [wrongRootTarget], [fixture.source.id], filesByID),
+            ([firstTarget], [firstTarget], [fixture.firstTarget.id], filesByID),
+            ([firstTarget, secondTarget], [firstTarget, secondTarget], [fixture.source.id], [
+                fixture.firstTarget.id: fixture.firstTarget
+            ])
+        ]
+
+        for malformed in malformedCases {
+            fixture.viewModel.setAutoCodemapFilesForTesting([
+                fixture.firstTarget,
+                fixture.secondTarget
+            ])
+
+            XCTAssertTrue(fixture.viewModel.rejectInvalidAutomaticCodemapTargetsForTesting(
+                receiptTargets: malformed.receipt,
+                revalidatedTargets: malformed.revalidated,
+                sourceIDs: malformed.sourceIDs,
+                filesByID: malformed.filesByID
+            ))
+            XCTAssertTrue(fixture.viewModel.autoCodemapFiles.isEmpty)
+            XCTAssertTrue(fixture.viewModel.automaticCodemapReadinessRetryPendingForTesting)
+        }
+    }
+
     func testMilestoneDProductionCallersContainNoEagerCodemapOrCacheActions() throws {
         let repoRoot = try RepoRoot.url()
         let relativePaths = [
@@ -152,5 +243,56 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
             fileSystemService: nil
         )
         return (WorkspaceFilesViewModel(), file)
+    }
+
+    private func makeReconstructionFixture() -> (
+        viewModel: WorkspaceFilesViewModel,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        source: FileViewModel,
+        firstTarget: FileViewModel,
+        secondTarget: FileViewModel
+    ) {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceFilesAutoCodemapModeTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let rootID = UUID()
+        return (
+            WorkspaceFilesViewModel(),
+            WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: UUID()),
+            makeFile(name: "Source.swift", rootURL: rootURL, rootID: rootID),
+            makeFile(name: "First.swift", rootURL: rootURL, rootID: rootID),
+            makeFile(name: "Second.swift", rootURL: rootURL, rootID: rootID)
+        )
+    }
+
+    private func makeFile(name: String, rootURL: URL, rootID: UUID) -> FileViewModel {
+        FileViewModel(
+            file: File(
+                name: name,
+                path: rootURL.appendingPathComponent(name).path,
+                modificationDate: Date(timeIntervalSince1970: 1000)
+            ),
+            rootPath: rootURL.path,
+            rootIdentifier: rootID,
+            rootFolderPath: rootURL.path,
+            fileSystemService: nil
+        )
+    }
+
+    private func makeTarget(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        file: FileViewModel,
+        relativePath: String
+    ) throws -> WorkspaceCodemapAutomaticSelectionTarget {
+        try WorkspaceCodemapAutomaticSelectionTarget(
+            rootEpoch: rootEpoch,
+            fileID: file.id,
+            catalogGeneration: 1,
+            requestGeneration: 1,
+            logicalPath: XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                rootDisplayName: "Root",
+                standardizedRelativePath: relativePath
+            ))
+        )
     }
 }

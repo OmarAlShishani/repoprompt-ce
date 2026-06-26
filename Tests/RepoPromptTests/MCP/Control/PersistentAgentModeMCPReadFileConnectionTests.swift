@@ -885,8 +885,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     "name": MCPWindowToolName.getCodeStructure,
                     "arguments": [
                         "scope": "paths",
-                        "paths": [nonGitFile.path],
-                        "limits": ["wait_ms": 2000]
+                        "paths": [nonGitFile.path]
                     ]
                 ]
             )

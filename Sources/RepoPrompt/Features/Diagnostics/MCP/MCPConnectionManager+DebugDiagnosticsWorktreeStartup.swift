@@ -142,6 +142,136 @@ import MCP
                         "correlation_id": correlationID.uuidString,
                         "mark": phase.rawValue
                     ])
+                case "codemap_projection_snapshot":
+                    guard let snapshot = await resolved.store.debugCodemapProjectionAdmissionSnapshot(
+                        rootID: scope.rootID
+                    ) else {
+                        return debugDiagnosticsError(
+                            op: op,
+                            code: "codemap_unavailable",
+                            message: "The scoped Git codemap engine is not ready."
+                        )
+                    }
+                    return debugDiagnosticsResult([
+                        "ok": true,
+                        "op": op,
+                        "action": action,
+                        "codemap_projection": debugCodemapProjectionPayload(snapshot)
+                    ])
+                case "codemap_root_snapshot":
+                    let targetRootID = try debugRequiredUUID(arguments, key: "target_root_id")
+                    let roots = await resolved.store.readSearchRootDiagnosticsSnapshot(
+                        recentPublicationLimit: 0
+                    )
+                    guard roots.contains(where: { $0.rootID == targetRootID }) else {
+                        return debugDiagnosticsError(
+                            op: op,
+                            code: "invalid_scope",
+                            message: "The target root is not loaded in the scoped workspace."
+                        )
+                    }
+                    let enginePresent = await resolved.store.debugCodemapEnginePresent(
+                        rootID: targetRootID
+                    )
+                    let snapshot = await resolved.store.debugCodemapProjectionAdmissionSnapshot(
+                        rootID: targetRootID
+                    )
+                    return debugDiagnosticsResult([
+                        "ok": true,
+                        "op": op,
+                        "action": action,
+                        "target_root_id": targetRootID.uuidString,
+                        "engine_present": enginePresent,
+                        "codemap_projection": snapshot.map { debugCodemapProjectionPayload($0) } ?? [
+                            "hold_count": 0,
+                            "queued_projection_batch_count": 0,
+                            "active_projection_batch_count": 0,
+                            "builds": 0,
+                            "projection_batches_started": 0,
+                            "projection_catalog_candidates": 0,
+                            "projection_budget_rejections": 0,
+                            "retained_path_bytes": 0,
+                            "retained_source_bytes": 0,
+                            "retained_projection_bytes": 0,
+                            "staged_graph_bytes": 0,
+                            "resident_graph_bytes": 0,
+                            "queued_manifest_mutation_bytes": 0,
+                            "queue_wait_ms": []
+                        ]
+                    ])
+                case "codemap_projection_hold_acquire":
+                    let targetRootID: UUID
+                    if debugString(arguments, "target_root_id") != nil {
+                        targetRootID = try debugRequiredUUID(arguments, key: "target_root_id")
+                        let roots = await resolved.store.readSearchRootDiagnosticsSnapshot(
+                            recentPublicationLimit: 0
+                        )
+                        guard roots.contains(where: { $0.rootID == targetRootID }) else {
+                            return debugDiagnosticsError(
+                                op: op,
+                                code: "invalid_scope",
+                                message: "The target root is not loaded in the scoped workspace."
+                            )
+                        }
+                    } else {
+                        targetRootID = scope.rootID
+                    }
+                    let expiresMilliseconds = try debugRequiredBoundedInt(
+                        arguments,
+                        key: "expires_ms",
+                        range: 10501 ... 60000
+                    )
+                    guard let acquired = await resolved.store.debugAcquireCodemapProjectionAdmissionHold(
+                        rootID: targetRootID,
+                        expiresAfterMilliseconds: UInt64(expiresMilliseconds)
+                    ) else {
+                        return debugDiagnosticsError(
+                            op: op,
+                            code: "codemap_unavailable",
+                            message: "The scoped Git codemap engine is not ready."
+                        )
+                    }
+                    return debugDiagnosticsResult([
+                        "ok": true,
+                        "op": op,
+                        "action": action,
+                        "target_root_id": targetRootID.uuidString,
+                        "hold_id": acquired.holdID.uuidString,
+                        "expires_ms": expiresMilliseconds,
+                        "codemap_projection": debugCodemapProjectionPayload((
+                            metrics: acquired.metrics,
+                            queueWaitMilliseconds: acquired.queueWaitMilliseconds
+                        ))
+                    ])
+                case "codemap_projection_hold_release":
+                    let targetRootID: UUID = if debugString(arguments, "target_root_id") != nil {
+                        try debugRequiredUUID(arguments, key: "target_root_id")
+                    } else {
+                        scope.rootID
+                    }
+                    let holdID = try debugRequiredUUID(arguments, key: "hold_id")
+                    guard let released = await resolved.store.debugReleaseCodemapProjectionAdmissionHold(
+                        rootID: targetRootID,
+                        holdID: holdID
+                    ) else {
+                        return debugDiagnosticsError(
+                            op: op,
+                            code: "codemap_unavailable",
+                            message: "The scoped Git codemap engine is not ready."
+                        )
+                    }
+                    return debugDiagnosticsResult([
+                        "ok": true,
+                        "op": op,
+                        "action": action,
+                        "target_root_id": targetRootID.uuidString,
+                        "hold_id": holdID.uuidString,
+                        "released": released.released,
+                        "codemap_projection": debugCodemapProjectionPayload((
+                            metrics: released.metrics,
+                            queueWaitMilliseconds: released.queueWaitMilliseconds
+                        ))
+                    ])
                 case "snapshot", "export":
                     let correlationID = try debugRequiredUUID(arguments, key: "correlation_id")
                     var payload = try diagnostics.snapshotPayload(
@@ -221,8 +351,8 @@ import MCP
                   bindingWindowID == boundWindowID,
                   boundWorkspaceID == workspace.id,
                   workspace.isSystemWorkspace == false,
-                  workspace.name.hasPrefix(WorktreeStartupBenchmarkDiagnostics.requiredWorkspaceNamePrefix),
-                  window.workspaceManager.bindingCandidate(forContextID: boundContextID)?.workspaceID == workspace.id
+                  WorktreeStartupBenchmarkDiagnostics.requiredWorkspaceNamePrefixes.contains { workspace.name.hasPrefix($0) },
+                window.workspaceManager.bindingCandidate(forContextID: boundContextID)?.workspaceID == workspace.id
             else { throw DebugWorktreeStartupBenchmarkError.invalidScope }
             try DebugWorktreeStartupBenchmarkRoutingProvenance(
                 connectionID: connectionID,
@@ -317,6 +447,16 @@ import MCP
             case "first_read_completed": .firstBenchmarkReadCompleted
             default: throw DebugWorktreeStartupBenchmarkRequestError.invalidParameter
             }
+        }
+
+        private nonisolated func debugCodemapProjectionPayload(
+            _ snapshot: (metrics: [String: UInt64], queueWaitMilliseconds: [UInt64])
+        ) -> [String: Any] {
+            var payload = snapshot.metrics.reduce(into: [String: Any]()) { result, item in
+                result[item.key] = item.value
+            }
+            payload["queue_wait_ms"] = snapshot.queueWaitMilliseconds
+            return payload
         }
     }
 

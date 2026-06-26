@@ -21,6 +21,7 @@ actor GitBlobIdentityService {
         case symlinkLeaf(GitBlobLStatFingerprint)
         case symlinkComponent
         case nonRegular(GitBlobLStatFingerprint)
+        case repositoryBoundary(GitBlobLStatFingerprint?)
     }
 
     private let gitService: GitService
@@ -300,6 +301,8 @@ actor GitBlobIdentityService {
                 .securityExcluded(.symlinkPathComponent)
             case .nonRegular:
                 .unsupported(.nonRegularFile)
+            case .repositoryBoundary:
+                .unavailable(.repositoryUnavailable)
             }
             return GitBlobIdentityClassification(
                 relativePath: relativePaths[index],
@@ -365,6 +368,8 @@ actor GitBlobIdentityService {
                 .securityExcluded(.symlinkPathComponent)
             case .nonRegular:
                 .unsupported(.nonRegularFile)
+            case .repositoryBoundary:
+                .unavailable(.repositoryUnavailable)
             case .missing:
                 if skipWorktree, stageZero != nil {
                     .unavailable(.sparseAbsent)
@@ -597,6 +602,17 @@ actor GitBlobIdentityService {
                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
             )
             guard nextDescriptor >= 0 else { return .missing }
+            var repositoryMarker = stat()
+            if fstatat(nextDescriptor, ".git", &repositoryMarker, AT_SYMLINK_NOFOLLOW) == 0 {
+                let fingerprint = Self.lstatFingerprint(repositoryMarker)
+                close(nextDescriptor)
+                return .repositoryBoundary(fingerprint)
+            }
+            let markerError = errno
+            guard markerError == ENOENT else {
+                close(nextDescriptor)
+                return .repositoryBoundary(nil)
+            }
             if directoryDescriptor != rootDescriptor { close(directoryDescriptor) }
             directoryDescriptor = nextDescriptor
             hooks.afterPathSecurityComponentOpen(components[0 ... index].joined(separator: "/"))
@@ -607,6 +623,7 @@ actor GitBlobIdentityService {
     private static func fingerprint(_ state: PathSecurityState) -> GitBlobLStatFingerprint? {
         switch state {
         case let .regular(value), let .symlinkLeaf(value), let .nonRegular(value): value
+        case let .repositoryBoundary(value): value
         case .missing, .symlinkComponent: nil
         }
     }

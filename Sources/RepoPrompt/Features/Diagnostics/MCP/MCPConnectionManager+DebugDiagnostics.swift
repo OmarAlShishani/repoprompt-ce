@@ -420,11 +420,21 @@ import MCP
                     }
                     response = await sampler.mark(mark)
                 case "stop":
+                    guard let rawSessionID = debugString(arguments, "session_id")?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                        let sessionID = UUID(uuidString: rawSessionID)
+                    else {
+                        return debugDiagnosticsError(
+                            op: op,
+                            code: "invalid_params",
+                            message: "`session_id` must be a UUID for action `stop`."
+                        )
+                    }
                     let settleSeconds = debugDouble(arguments, "settle_seconds") ?? 0
                     guard settleSeconds.isFinite, settleSeconds >= 0, settleSeconds <= 300 else {
                         return debugDiagnosticsError(op: op, code: "invalid_params", message: "`settle_seconds` must be a number between 0 and 300.")
                     }
-                    response = await sampler.stop(settleSeconds: settleSeconds)
+                    response = await sampler.stop(sessionID: sessionID, settleSeconds: settleSeconds)
                 case "snapshot":
                     let limit: Int
                     switch debugBoundedInt(arguments, "limit", defaultValue: 50, range: 1 ... 1000) {

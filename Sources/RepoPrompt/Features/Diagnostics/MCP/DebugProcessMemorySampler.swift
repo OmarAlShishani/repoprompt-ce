@@ -125,12 +125,12 @@
             } else {
                 gateGeneration = nil
             }
-            let effectiveLabel = benchmarkGate ? "worktree-startup-benchmark" : label
+            let effectiveLabel = label
             if activeSession != nil {
-                guard reset else {
-                    return .error(code: "already_running", message: "A large workspace memory sampling session is already running. Pass `reset: true` to replace it.")
-                }
-                await resetActiveSession()
+                return .error(
+                    code: "already_running",
+                    message: "A large workspace memory sampling session is already running; ownership cannot be taken over."
+                )
             }
 
             guard let baseline = Self.captureSnapshot() else {
@@ -194,22 +194,35 @@
             return .payload(result)
         }
 
-        func stop(settleSeconds: Double) async -> DebugMemorySamplerResponse {
+        func stop(sessionID: UUID, settleSeconds: Double) async -> DebugMemorySamplerResponse {
             guard revokeStaleBenchmarkSessionIfNeeded() else {
                 return .error(code: "disabled", message: "Benchmark diagnostics were revoked.")
             }
             guard var session = activeSession else {
-                if let lastCompletedSession {
+                if let lastCompletedSession, lastCompletedSession.id == sessionID {
                     return .payload(payload(for: lastCompletedSession, action: "stop", running: false, includeSamplesLimit: 50))
                 }
-                return .error(code: "no_active_session", message: "No large workspace memory sampling session is active.")
+                return .error(
+                    code: "no_matching_active_session",
+                    message: "No matching large workspace memory sampling session is active."
+                )
+            }
+            guard session.id == sessionID else {
+                return .error(
+                    code: "session_mismatch",
+                    message: "The requested memory sampling session does not own the active sampler."
+                )
             }
 
             if settleSeconds > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(settleSeconds * 1_000_000_000.0))
-                if let updated = activeSession, updated.id == session.id {
-                    session = updated
+                guard let updated = activeSession, updated.id == sessionID else {
+                    return .error(
+                        code: "session_no_longer_active",
+                        message: "The owned memory sampling session is no longer active."
+                    )
                 }
+                session = updated
             }
 
             if let finalSnapshot = Self.captureSnapshot() {
@@ -255,6 +268,7 @@
                 "phys_footprint_available": snapshot.physicalFootprintBytes != nil
             ]
             if let activeSession {
+                result["session_id"] = activeSession.id.uuidString
                 result["session"] = sessionPayload(for: activeSession, running: true)
                 result["metrics"] = metricsPayload(for: activeSession)
                 result["recent_samples"] = activeSession.samples.suffix(limit).map { $0.payload() }
@@ -265,7 +279,12 @@
         }
 
         func reset() async -> DebugMemorySamplerResponse {
-            await resetActiveSession()
+            guard activeSession == nil else {
+                return .error(
+                    code: "already_running",
+                    message: "An active memory sampling session cannot be reset or taken over."
+                )
+            }
             lastCompletedSession = nil
             return .payload([
                 "ok": true,
@@ -273,12 +292,6 @@
                 "action": "reset",
                 "running": false
             ])
-        }
-
-        private func resetActiveSession() async {
-            sampleTask?.cancel()
-            sampleTask = nil
-            activeSession = nil
         }
 
         private func runSamplingLoop(sessionID: UUID, intervalMS: Int) async {
@@ -348,6 +361,7 @@
                 "op": "large_workspace_memory",
                 "action": action,
                 "running": running,
+                "session_id": session.id.uuidString,
                 "session": sessionPayload(for: session, running: running),
                 "metrics": metricsPayload(for: session),
                 "baseline": session.baseline.payload(),
@@ -365,6 +379,7 @@
                 "op": "large_workspace_memory",
                 "action": action,
                 "running": running,
+                "session_id": session.id.uuidString,
                 "session": sessionPayload(for: session, running: running),
                 "metrics": metricsPayload(for: session),
                 "baseline": session.baseline.payload(),

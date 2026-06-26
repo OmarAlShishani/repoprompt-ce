@@ -3,6 +3,349 @@ import Foundation
 import XCTest
 
 final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
+    func testStrictQueryIsTargetlessUntilExactProjectionSeal() async throws {
+        let authority = try await makeAuthority(
+            name: #function,
+            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+        )
+        defer { authority.repositoryFixture.cleanup() }
+        let bindings = try await graphBindings(authority: authority)
+        let value = snapshot(authority: authority, bindings: bindings, generation: 1)
+        let graph = WorkspaceCodemapSelectionGraph(rootEpoch: authority.capability.rootEpoch)
+        try await requirePublished(graph.rebuild(from: value))
+
+        let query = WorkspaceCodemapSelectionGraphRuntimeQuery(
+            key: .init(snapshot: value),
+            selectedSources: [.init(
+                fileID: bindings[0].identity.fileID,
+                requestGeneration: 7
+            )]
+        )
+        guard case let .definitionUniverse(.incomplete(progress, remainingCount, retry)) =
+            await graph.query(query)
+        else { return XCTFail("Live demand must not prove the definition universe.") }
+        XCTAssertEqual(progress, .notStarted)
+        XCTAssertNil(remainingCount)
+        XCTAssertNil(retry)
+
+        let proof = try await publishCompleteProjection(on: graph, snapshot: value, seal: false)
+        guard case let .definitionUniverse(.incomplete(stagedProgress, remaining, _)) =
+            await graph.query(query)
+        else { return XCTFail("A staged generation must remain explicitly incomplete.") }
+        XCTAssertEqual(stagedProgress.counts.supportedCandidateCount, 2)
+        XCTAssertEqual(remaining, 0)
+        _ = try await publishCompleteProjection(on: graph, snapshot: value, seal: false)
+        let duplicateAccounting = await graph.accounting()
+        XCTAssertEqual(duplicateAccounting.acceptedProjectionSegmentCount, 1)
+        XCTAssertEqual(duplicateAccounting.exactDuplicateProjectionSegmentCount, 1)
+        guard case .accepted = await graph.applyProjectionSnapshot(.seal(proof)) else {
+            return XCTFail("Expected the exact proof to seal staged coverage.")
+        }
+        let result = try await requireReady(graph.query(query))
+        XCTAssertEqual(result.targets.map(\.fileID), [bindings[1].identity.fileID])
+        XCTAssertEqual(
+            result.definitionUniverseCoverage,
+            .complete(
+                proof: proof,
+                candidateCount: proof.candidateCount,
+                contributedCount: proof.contributedCount,
+                terminalCount: proof.terminalCount
+            )
+        )
+    }
+
+    func testEquivalentProjectionSuccessorResealsGenerationOneToThreeWithoutRebuild() async throws {
+        let authority = try await makeAuthority(
+            name: #function,
+            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+        )
+        defer { authority.repositoryFixture.cleanup() }
+        let bindings = try await graphBindings(authority: authority)
+        let first = snapshot(authority: authority, bindings: bindings, generation: 1)
+        let successorSnapshot = snapshot(authority: authority, bindings: bindings, generation: 3)
+        let graph = WorkspaceCodemapSelectionGraph(rootEpoch: authority.capability.rootEpoch)
+        let firstProof = try await publishCompleteProjection(on: graph, snapshot: first)
+        let firstAccounting = await graph.accounting()
+        let successorProof = try XCTUnwrap(firstProof.successor(
+            contributionGeneration: successorSnapshot.contributionGeneration
+        ))
+        let successorKey = WorkspaceCodemapSelectionGraphRuntimeKey(snapshot: successorSnapshot)
+        let staleDisposition = await graph.query(.init(
+            key: successorKey,
+            selectedSources: [.init(fileID: bindings[0].identity.fileID, requestGeneration: 7)]
+        ))
+        guard case .unavailable(.staleCurrentness) = staleDisposition else {
+            return XCTFail("A generation-1 proof must not serve generation 3 before its successor seal.")
+        }
+
+        let removedSnapshot = snapshot(
+            authority: authority,
+            bindings: Array(bindings.dropLast()),
+            generation: 3
+        )
+        let removedDisposition = await graph.applyEquivalentProjectionSuccessor(
+            WorkspaceCodemapProjectionSuccessorSeal(
+                predecessorProof: firstProof,
+                successorProof: successorProof
+            ),
+            liveSnapshot: removedSnapshot
+        )
+        XCTAssertEqual(removedDisposition, .superseded)
+        let afterRemoval = await graph.accounting()
+        XCTAssertEqual(afterRemoval.publishedSummary?.key, .init(snapshot: first))
+
+        let disposition = await graph.applyEquivalentProjectionSuccessor(
+            WorkspaceCodemapProjectionSuccessorSeal(
+                predecessorProof: firstProof,
+                successorProof: successorProof
+            ),
+            liveSnapshot: successorSnapshot
+        )
+        guard case .accepted = disposition else {
+            return XCTFail("Expected equivalent successor seal, got \(disposition).")
+        }
+        let result = try await requireReady(graph.query(.init(
+            key: successorKey,
+            selectedSources: [.init(fileID: bindings[0].identity.fileID, requestGeneration: 7)]
+        )))
+        XCTAssertEqual(result.targets.map(\.fileID), [bindings[1].identity.fileID])
+        guard case let .complete(proof, _, _, _) = result.definitionUniverseCoverage else {
+            return XCTFail("Expected complete successor coverage.")
+        }
+        XCTAssertEqual(proof, successorProof)
+        let successorAccounting = await graph.accounting()
+        XCTAssertEqual(
+            successorAccounting.residentProjectionByteCount,
+            firstAccounting.residentProjectionByteCount
+        )
+        XCTAssertEqual(successorAccounting.publishedSummary?.key, successorKey)
+
+        let duplicateSnapshot = snapshot(
+            authority: authority,
+            bindings: bindings + [bindings[0]],
+            generation: 3
+        )
+        let duplicateRebuild = await graph.rebuild(from: duplicateSnapshot)
+        XCTAssertEqual(
+            duplicateRebuild,
+            .rejected(
+                .init(snapshot: duplicateSnapshot),
+                .invalidSnapshot(.duplicateFileID)
+            )
+        )
+        let duplicateSuccessor = await graph.applyEquivalentProjectionSuccessor(
+            WorkspaceCodemapProjectionSuccessorSeal(
+                predecessorProof: firstProof,
+                successorProof: successorProof
+            ),
+            liveSnapshot: successorSnapshot
+        )
+        XCTAssertEqual(duplicateSuccessor, .superseded)
+        let conflictedQuery = await graph.query(.init(
+            key: successorKey,
+            selectedSources: [.init(
+                fileID: bindings[0].identity.fileID,
+                requestGeneration: 7
+            )]
+        ))
+        XCTAssertEqual(conflictedQuery, .unavailable(.invalidSnapshot))
+    }
+
+    func testStagedIncompleteShardWithResidentNodesReturnsNoStructureResult() async throws {
+        let authority = try await makeAuthority(
+            name: #function,
+            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+        )
+        defer { authority.repositoryFixture.cleanup() }
+        let bindings = try await graphBindings(authority: authority)
+        let value = snapshot(authority: authority, bindings: bindings, generation: 1)
+        let graph = WorkspaceCodemapSelectionGraph(rootEpoch: authority.capability.rootEpoch)
+        try await requirePublished(graph.rebuild(from: value))
+        _ = try await publishCompleteProjection(on: graph, snapshot: value, seal: false)
+
+        let accounting = await graph.accounting()
+        XCTAssertEqual(accounting.publishedSummary?.nodeCount, 2)
+        guard case .incomplete? = accounting.publishedSummary?.definitionUniverseCoverage else {
+            return XCTFail("Expected staged incomplete coverage over resident live nodes.")
+        }
+        let disposition = await graph.queryStructure(.init(
+            key: .init(snapshot: value),
+            seeds: [.init(fileID: bindings[0].identity.fileID, requestGeneration: 7)],
+            direction: .both,
+            limits: .init(
+                maximumDepth: 2,
+                maximumNodeCount: 10,
+                maximumEdgeCount: 10,
+                maximumByteCount: 4096
+            )
+        ))
+        guard case let .definitionUniverse(.incomplete(progress, remainingCount, retry)) = disposition
+        else { return XCTFail("Incomplete coverage must not return structure nodes.") }
+        XCTAssertEqual(progress.counts.supportedCandidateCount, 2)
+        XCTAssertEqual(remainingCount, 0)
+        XCTAssertNil(retry)
+    }
+
+    func testReplacementProjectionStagingPreservesCompleteShardUntilExactSeal() async throws {
+        let authority = try await makeAuthority(
+            name: #function,
+            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+        )
+        defer { authority.repositoryFixture.cleanup() }
+        let bindings = try await graphBindings(authority: authority)
+        let first = snapshot(authority: authority, bindings: bindings, generation: 1)
+        let replacement = snapshot(authority: authority, bindings: bindings, generation: 2)
+        let graph = WorkspaceCodemapSelectionGraph(rootEpoch: authority.capability.rootEpoch)
+        try await requirePublished(graph.rebuild(from: first))
+        _ = try await publishCompleteProjection(on: graph, snapshot: first)
+        let firstAccounting = await graph.accounting()
+        XCTAssertGreaterThan(firstAccounting.residentProjectionByteCount, 0)
+
+        let replacementProof = try await publishCompleteProjection(
+            on: graph,
+            snapshot: replacement,
+            seal: false
+        )
+        let stagedAccounting = await graph.accounting()
+        XCTAssertEqual(stagedAccounting.publishedSummary?.key, .init(snapshot: first))
+        XCTAssertEqual(
+            stagedAccounting.residentProjectionByteCount,
+            firstAccounting.residentProjectionByteCount
+        )
+        guard case .complete? = stagedAccounting.publishedSummary?.definitionUniverseCoverage else {
+            return XCTFail("Replacement staging must retain the last complete shard.")
+        }
+
+        let stagedQuery = await graph.queryStructure(.init(
+            key: .init(snapshot: replacement),
+            seeds: [.init(fileID: bindings[0].identity.fileID, requestGeneration: 7)],
+            direction: .both,
+            limits: .init(
+                maximumDepth: 2,
+                maximumNodeCount: 10,
+                maximumEdgeCount: 10,
+                maximumByteCount: 4096
+            )
+        ))
+        guard case .definitionUniverse(.incomplete) = stagedQuery else {
+            return XCTFail("Replacement staging must expose typed incomplete coverage without old nodes.")
+        }
+
+        guard case .accepted = await graph.applyProjectionSnapshot(.seal(replacementProof)) else {
+            return XCTFail("Expected the exact replacement proof to commit.")
+        }
+        let committedAccounting = await graph.accounting()
+        XCTAssertEqual(committedAccounting.publishedSummary?.key, .init(snapshot: replacement))
+        guard case .complete? = committedAccounting.publishedSummary?.definitionUniverseCoverage else {
+            return XCTFail("Expected the committed replacement shard to remain complete.")
+        }
+    }
+
+    func testProjectionSegmentByteBudgetIsTypedAndTargetless() async throws {
+        let authority = try await makeAuthority(
+            name: #function,
+            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+        )
+        defer { authority.repositoryFixture.cleanup() }
+        let bindings = try await graphBindings(authority: authority)
+        let value = snapshot(authority: authority, bindings: bindings, generation: 1)
+        let graph = WorkspaceCodemapSelectionGraph(
+            rootEpoch: authority.capability.rootEpoch,
+            policy: runtimePolicy(
+                maximumProjectionSegmentByteCount: 1,
+                maximumStagedProjectionByteCount: 1
+            )
+        )
+        try await requirePublished(graph.rebuild(from: value))
+        do {
+            _ = try await publishCompleteProjection(on: graph, snapshot: value)
+            XCTFail("Expected byte-bounded segment rejection.")
+        } catch SelectionGraphTestError.projectionSegmentRejected {
+            // Expected: the helper observed a typed graph rejection.
+        }
+        let query = WorkspaceCodemapSelectionGraphRuntimeQuery(
+            key: .init(snapshot: value),
+            selectedSources: [.init(fileID: bindings[0].identity.fileID, requestGeneration: 7)]
+        )
+        guard case let .definitionUniverse(.budget(dimension, attempted, limit)) =
+            await graph.query(query)
+        else { return XCTFail("Expected typed projection byte budget coverage.") }
+        XCTAssertEqual(dimension, .retainedProjectionBytes)
+        XCTAssertGreaterThan(attempted, limit)
+        XCTAssertEqual(limit, 1)
+    }
+
+    func testProjectionCoverageAndBytesAreRevokedOnPathFence() async throws {
+        let authority = try await makeAuthority(
+            name: #function,
+            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+        )
+        defer { authority.repositoryFixture.cleanup() }
+        let value = try await snapshot(
+            authority: authority,
+            bindings: graphBindings(authority: authority),
+            generation: 1
+        )
+        let graph = WorkspaceCodemapSelectionGraph(rootEpoch: authority.capability.rootEpoch)
+        try await requirePublished(graph.rebuild(from: value))
+        _ = try await publishCompleteProjection(on: graph, snapshot: value)
+        let sealedAccounting = await graph.accounting()
+        XCTAssertGreaterThan(sealedAccounting.residentProjectionByteCount, 0)
+
+        let fenced = await graph.fenceContributionsForPathInvalidation(
+            rootEpoch: authority.capability.rootEpoch
+        )
+        XCTAssertTrue(fenced)
+        let accounting = await graph.accounting()
+        XCTAssertEqual(accounting.stagedProjectionByteCount, 0)
+        XCTAssertEqual(accounting.residentProjectionByteCount, 0)
+        XCTAssertEqual(accounting.revokedProjectionCoverageCount, 1)
+        let queryDisposition = await graph.query(.init(
+            key: .init(snapshot: value),
+            selectedSources: []
+        ))
+        XCTAssertEqual(
+            queryDisposition,
+            .unavailable(.notBuilt)
+        )
+    }
+
+    func testProjectionSegmentSupersedesSameGenerationLiveBuildWithoutLateDowngrade() async throws {
+        let authority = try await makeAuthority(
+            name: #function,
+            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+        )
+        defer { authority.repositoryFixture.cleanup() }
+        let bindings = try await graphBindings(authority: authority)
+        let value = snapshot(authority: authority, bindings: bindings, generation: 1)
+        let gate = SelectionGraphBuildGate()
+        defer { gate.releaseAll() }
+        let graph = WorkspaceCodemapSelectionGraph(
+            rootEpoch: authority.capability.rootEpoch,
+            diagnostics: gate.diagnostics
+        )
+        let liveBuild = Task { await graph.rebuild(from: value) }
+        XCTAssertTrue(gate.waitUntilBlocked(generation: 1))
+
+        let proof = try await publishCompleteProjection(on: graph, snapshot: value, seal: false)
+        gate.releaseAll()
+        let lateLiveDisposition = await liveBuild.value
+        switch lateLiveDisposition {
+        case .cancelled, .superseded:
+            break
+        case .published, .publishedEmpty, .busy, .rejected:
+            XCTFail("A staged projection must supersede same-generation live publication.")
+        }
+        guard case .accepted = await graph.applyProjectionSnapshot(.seal(proof)) else {
+            return XCTFail("Expected staged projection to seal after live cancellation.")
+        }
+        let result = try await requireReady(graph.query(.init(
+            key: .init(snapshot: value),
+            selectedSources: [.init(fileID: bindings[0].identity.fileID, requestGeneration: 7)]
+        )))
+        XCTAssertEqual(result.targets.map(\.fileID), [bindings[1].identity.fileID])
+    }
+
     func testReadyPartialResolutionIsDeterministicAcrossPermutationsAndCandidateBounds() async throws {
         let authority = try await makeAuthority(
             name: #function,
@@ -52,6 +395,8 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let secondSnapshot = snapshot(authority: authority, bindings: bindings.reversed(), generation: 13)
         try await requirePublished(first.rebuild(from: firstSnapshot))
         try await requirePublished(second.rebuild(from: secondSnapshot))
+        _ = try await publishCompleteProjection(on: first, snapshot: firstSnapshot)
+        _ = try await publishCompleteProjection(on: second, snapshot: secondSnapshot)
 
         let source = WorkspaceCodemapSelectionGraphRuntimeQuerySource(
             fileID: sourceID,
@@ -68,7 +413,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         XCTAssertEqual(firstResult, secondResult)
         XCTAssertEqual(firstResult.targets.map(\.fileID), [aID, bID])
         XCTAssertEqual(firstResult.resolutions.count, 2)
-        XCTAssertEqual(firstResult.referenceFailures.map(\.failure), [.unresolvedDefinitionUniverse])
+        XCTAssertEqual(firstResult.referenceFailures.map(\.failure), [.provenMissingDefinition])
 
         let selectedTargetResult = try await requireReady(first.query(.init(
             key: .init(snapshot: firstSnapshot),
@@ -102,13 +447,14 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             admission: admission
         )
         try await requirePublished(overflowActor.rebuild(from: firstSnapshot))
+        _ = try await publishCompleteProjection(on: overflowActor, snapshot: firstSnapshot)
         let overflow = try await requireReady(overflowActor.query(.init(
             key: .init(snapshot: firstSnapshot),
             selectedSources: [source]
         )))
         XCTAssertTrue(overflow.targets.isEmpty)
         XCTAssertEqual(overflow.referenceFailures.map(\.failure).sorted(by: failurePrecedes), [
-            .unresolvedDefinitionUniverse,
+            .provenMissingDefinition,
             .candidateOverflow
         ].sorted(by: failurePrecedes))
 
@@ -120,16 +466,16 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let duplicateDisposition = await first.rebuild(from: duplicateSnapshot)
         XCTAssertEqual(
             duplicateDisposition,
-            .rejected(.init(snapshot: duplicateSnapshot), .invalidSnapshot(.duplicateFileID))
+            .rejected(
+                .init(snapshot: duplicateSnapshot),
+                .invalidSnapshot(.duplicateFileID)
+            )
         )
-        let retainedResult = try await requireReady(first.query(.init(
+        let conflictedQuery = await first.query(.init(
             key: .init(snapshot: firstSnapshot),
             selectedSources: [source]
-        )))
-        XCTAssertEqual(
-            retainedResult.targets.map(\.fileID),
-            [aID, bID]
-        )
+        ))
+        XCTAssertEqual(conflictedQuery, .unavailable(.invalidSnapshot))
     }
 
     func testStructureTraversalSupportsBoundedForwardReverseAndBothBFS() async throws {
@@ -168,6 +514,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let graph = WorkspaceCodemapSelectionGraph(rootEpoch: authority.capability.rootEpoch)
         let graphSnapshot = snapshot(authority: authority, bindings: bindings, generation: 19)
         try await requirePublished(graph.rebuild(from: graphSnapshot))
+        _ = try await publishCompleteProjection(on: graph, snapshot: graphSnapshot)
         let key = WorkspaceCodemapSelectionGraphRuntimeKey(snapshot: graphSnapshot)
         let limits = WorkspaceCodemapStructureTraversalLimits(
             maximumDepth: 2,
@@ -284,6 +631,8 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         )
         try await requirePublished(first.rebuild(from: firstSnapshot))
         try await requirePublished(second.rebuild(from: secondSnapshot))
+        _ = try await publishCompleteProjection(on: first, snapshot: firstSnapshot)
+        _ = try await publishCompleteProjection(on: second, snapshot: secondSnapshot)
 
         let firstResult = try await requireReady(first.query(.init(
             key: .init(snapshot: firstSnapshot),
@@ -295,7 +644,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         )))
         XCTAssertTrue(firstResult.targets.isEmpty)
         XCTAssertTrue(firstResult.resolutions.isEmpty)
-        XCTAssertEqual(firstResult.referenceFailures.map(\.failure), [.unresolvedDefinitionUniverse])
+        XCTAssertEqual(firstResult.referenceFailures.map(\.failure), [.provenMissingDefinition])
         XCTAssertEqual(secondResult.targets.map(\.fileID), [secondTargetID])
         XCTAssertFalse(firstResult.targets.contains(where: { $0.fileID == secondTargetID }))
 
@@ -369,6 +718,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         guard case .publishedEmpty = await emptyActor.rebuild(from: empty) else {
             return XCTFail("Expected a published empty shard.")
         }
+        _ = try await publishCompleteProjection(on: emptyActor, snapshot: empty)
         let emptyResult = try await requireReady(emptyActor.query(.init(
             key: .init(snapshot: empty),
             selectedSources: [.init(fileID: UUID(), requestGeneration: 1)]
@@ -454,6 +804,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             generation: 3
         )
         try await requirePublished(outputBounded.rebuild(from: duplicateTargetSnapshot))
+        _ = try await publishCompleteProjection(on: outputBounded, snapshot: duplicateTargetSnapshot)
         let outputBoundedQuery = await outputBounded.query(.init(
             key: .init(snapshot: duplicateTargetSnapshot),
             selectedSources: [.init(fileID: duplicateTargetBindings[0].identity.fileID, requestGeneration: 7)]
@@ -514,6 +865,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             admission: admission
         )
         try await requirePublished(bounded.rebuild(from: sharedTargetSnapshot))
+        _ = try await publishCompleteProjection(on: bounded, snapshot: sharedTargetSnapshot)
 
         let firstQuerySource = WorkspaceCodemapSelectionGraphRuntimeQuerySource(
             fileID: firstSourceID,
@@ -558,6 +910,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             admission: admission
         )
         try await requirePublished(exactFailureBound.rebuild(from: failureSnapshot))
+        _ = try await publishCompleteProjection(on: exactFailureBound, snapshot: failureSnapshot)
         let exactFailures = try await requireReady(exactFailureBound.query(.init(
             key: .init(snapshot: failureSnapshot),
             selectedSources: [firstQuerySource]
@@ -570,6 +923,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             admission: admission
         )
         try await requirePublished(rejectedFailurePrefix.rebuild(from: failureSnapshot))
+        _ = try await publishCompleteProjection(on: rejectedFailurePrefix, snapshot: failureSnapshot)
         let failureOverflow = await rejectedFailurePrefix.query(.init(
             key: .init(snapshot: failureSnapshot),
             selectedSources: [firstQuerySource]
@@ -687,6 +1041,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
 
         let higher = snapshot(authority: firstAuthority, bindings: firstBindings, generation: 2)
         try await requirePublished(actor.rebuild(from: higher))
+        _ = try await publishCompleteProjection(on: actor, snapshot: higher)
         _ = try await requireReady(actor.query(.init(key: .init(snapshot: higher), selectedSources: [])))
     }
 
@@ -712,12 +1067,21 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             ))
         )
         try await requirePublished(actor.rebuild(from: firstSnapshot))
-        let staleSource = try await requireReady(actor.query(.init(
+        _ = try await publishCompleteProjection(on: actor, snapshot: firstSnapshot)
+        let beforeStaleSource = await actor.accounting()
+        let staleSource = await actor.query(.init(
             key: .init(snapshot: firstSnapshot),
             selectedSources: [.init(fileID: sourceID, requestGeneration: 6)]
-        )))
-        XCTAssertEqual(staleSource.sourceCoverage.map(\.state), [.stale])
-        XCTAssertTrue(staleSource.targets.isEmpty)
+        ))
+        XCTAssertEqual(
+            staleSource,
+            .unavailable(.staleCurrentness(currentKey: .init(snapshot: firstSnapshot)))
+        )
+        let afterStaleSource = await actor.accounting()
+        XCTAssertEqual(
+            afterStaleSource.materializedQueryResultCount,
+            beforeStaleSource.materializedQueryResultCount
+        )
 
         let secondSource = try await makeResolvedBinding(
             authority: authority,
@@ -736,12 +1100,19 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let secondBindings = [secondSource, secondTarget]
         let secondSnapshot = snapshot(authority: authority, bindings: secondBindings, generation: 2)
         try await requirePublished(actor.rebuild(from: secondSnapshot))
+        _ = try await publishCompleteProjection(on: actor, snapshot: secondSnapshot)
         let current = try await requireReady(actor.query(.init(
             key: .init(snapshot: secondSnapshot),
             selectedSources: [.init(fileID: sourceID, requestGeneration: 8)]
         )))
         XCTAssertEqual(current.targets.map(\.requestGeneration), [8])
         XCTAssertFalse(current.targets.contains(where: { $0.requestGeneration == 7 }))
+        XCTAssertTrue(current.resolutions.allSatisfy {
+            $0.source.requestGeneration == 8 && $0.target.requestGeneration == 8
+        })
+        guard case .complete = current.definitionUniverseCoverage else {
+            return XCTFail("Expected current generations to retain complete publishable coverage.")
+        }
 
         let pending = try await makePendingBinding(
             authority: authority,
@@ -760,7 +1131,11 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             .rejected(.init(snapshot: rejectedSnapshot), .invalidSnapshot(.bindingNotResolved))
         )
         let accounting = await actor.accounting()
+        XCTAssertEqual(accounting.currentObservedKey, .init(snapshot: rejectedSnapshot))
         XCTAssertEqual(accounting.publishedSummary?.key, .init(snapshot: secondSnapshot))
+        guard case .complete? = accounting.publishedSummary?.definitionUniverseCoverage else {
+            return XCTFail("Rejected replacement must retain the prior complete shard.")
+        }
         let rejectedQuery = await actor.query(.init(
             key: .init(snapshot: rejectedSnapshot),
             selectedSources: []
@@ -769,7 +1144,10 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             rejectedQuery,
             .unavailable(.invalidSnapshot)
         )
-        let priorQuery = await actor.query(.init(key: .init(snapshot: secondSnapshot), selectedSources: []))
+        let priorQuery = await actor.query(.init(
+            key: .init(snapshot: secondSnapshot),
+            selectedSources: [.init(fileID: sourceID, requestGeneration: 8)]
+        ))
         XCTAssertEqual(
             priorQuery,
             .unavailable(.staleCurrentness(currentKey: .init(snapshot: rejectedSnapshot)))
@@ -1035,8 +1413,22 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         }
         gate.release(generation: 3)
         try await requirePublished(thirdTask.value)
+        let thirdProof = try await publishCompleteProjection(on: actor, snapshot: third, seal: false)
+        let thirdSealTask = Task { await actor.applyProjectionSnapshot(.seal(thirdProof)) }
+        guard gate.waitUntilBlocked(generation: 3) else {
+            thirdSealTask.cancel()
+            gate.release(generation: 3)
+            return XCTFail("Third projection seal did not reach the publication gate.")
+        }
+        gate.release(generation: 3)
+        guard case .accepted = await thirdSealTask.value else {
+            return XCTFail("Expected the third projection to seal exactly.")
+        }
         let afterLatestPublication = await actor.accounting()
         XCTAssertEqual(afterLatestPublication.publishedSummary?.key, .init(snapshot: third))
+        guard case .complete? = afterLatestPublication.publishedSummary?.definitionUniverseCoverage else {
+            return XCTFail("Expected the retained third shard to have exact complete coverage.")
+        }
 
         gate.release(generation: 2)
         let superseded = await secondTask.value
@@ -1051,12 +1443,17 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let fourth = snapshot(authority: authority, bindings: bindings, generation: 4)
         let cancelledTask = Task { await actor.rebuild(from: fourth) }
         XCTAssertTrue(gate.waitUntilBlocked(generation: 4))
+        let duringReplacement = await actor.accounting()
+        XCTAssertEqual(duringReplacement.publishedSummary?.key, .init(snapshot: third))
         cancelledTask.cancel()
         gate.release(generation: 4)
         let cancelled = await cancelledTask.value
         XCTAssertEqual(cancelled, .cancelled(.init(snapshot: fourth)))
         let afterCancellation = await actor.accounting()
         XCTAssertEqual(afterCancellation.publishedSummary?.key, .init(snapshot: third))
+        guard case .complete? = afterCancellation.publishedSummary?.definitionUniverseCoverage else {
+            return XCTFail("Cancellation must retain the last complete shard.")
+        }
         let cancelledQuery = await actor.query(.init(key: .init(snapshot: fourth), selectedSources: []))
         XCTAssertEqual(
             cancelledQuery,
@@ -1077,6 +1474,9 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         )
         let afterRejection = await actor.accounting()
         XCTAssertEqual(afterRejection.publishedSummary?.key, .init(snapshot: third))
+        guard case .complete? = afterRejection.publishedSummary?.definitionUniverseCoverage else {
+            return XCTFail("Rejection must retain the last complete shard.")
+        }
         XCTAssertFalse(gate.didTimeOut)
     }
 
@@ -1110,6 +1510,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             diagnostics: .none
         )
         try await requirePublished(actor.rebuild(from: value))
+        _ = try await publishCompleteProjection(on: actor, snapshot: value)
         let result = try await requireReady(actor.query(.init(
             key: .init(snapshot: value),
             selectedSources: [.init(fileID: sourceID, requestGeneration: 7)]
@@ -1268,6 +1669,155 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         )
     }
 
+    @discardableResult
+    private func publishCompleteProjection(
+        on graph: WorkspaceCodemapSelectionGraph,
+        snapshot: WorkspaceCodemapLiveGraphSnapshot,
+        seal: Bool = true
+    ) async throws -> WorkspaceCodemapProjectionCoverageProof {
+        let token = WorkspaceCodemapProjectionCatalogToken(
+            rootEpoch: snapshot.rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: snapshot.catalogGeneration,
+            ingressGeneration: snapshot.catalogGeneration,
+            projectionInvalidationGeneration: 1
+        )
+        let generation = WorkspaceCodemapProjectionGeneration(
+            catalogToken: token,
+            repositoryAuthority: snapshot.repositoryAuthority,
+            contributionGeneration: snapshot.contributionGeneration
+        )
+        let entries = try snapshot.bindings.map { binding -> WorkspaceCodemapProjectionEntry in
+            guard case let .resolved(completion) = binding.availability else {
+                throw SelectionGraphTestError.invalidProjectionBinding
+            }
+            let outcome: WorkspaceCodemapProjectionEntryOutcome = switch completion.outcome {
+            case let .ready(artifact):
+                .contributed(CodeMapSelectionGraphContribution(
+                    artifactKey: completion.artifactKey,
+                    artifact: artifact
+                ))
+            case .readyNoSymbols:
+                .empty(CodeMapSelectionGraphContribution(
+                    artifactKey: completion.artifactKey,
+                    definitions: [] as [String],
+                    references: [] as [String]
+                ))
+            case .oversize, .decodeFailed, .parseFailed:
+                throw SelectionGraphTestError.invalidProjectionBinding
+            }
+            return WorkspaceCodemapProjectionEntry(
+                identity: binding.identity,
+                requestGeneration: completion.token.requestGeneration,
+                pathGeneration: completion.token.requestGeneration,
+                pipelineIdentity: completion.artifactKey.pipelineIdentity,
+                outcome: outcome
+            )
+        }.sorted {
+            if $0.identity.standardizedRelativePath != $1.identity.standardizedRelativePath {
+                return $0.identity.standardizedRelativePath.utf8.lexicographicallyPrecedes(
+                    $1.identity.standardizedRelativePath.utf8
+                )
+            }
+            return $0.identity.fileID.uuidString < $1.identity.fileID.uuidString
+        }
+        let contributedCount = UInt64(entries.count(where: {
+            if case .contributed = $0.outcome { return true }
+            return false
+        }))
+        let emptyCount = UInt64(entries.count) - contributedCount
+        let counts = WorkspaceCodemapProjectionCounts(
+            supportedCandidateCount: UInt64(entries.count),
+            processedCandidateCount: UInt64(entries.count),
+            contributedCount: contributedCount,
+            emptyCount: emptyCount,
+            terminalArtifactCount: 0,
+            terminalExcludedCount: 0,
+            transientCount: 0
+        )
+        let completion = WorkspaceCodemapProjectionCatalogCompletion(
+            token: token,
+            finalCursor: entries.last.map {
+                WorkspaceCodemapProjectionCatalogCursor(
+                    standardizedRelativePath: $0.identity.standardizedRelativePath,
+                    fileID: $0.identity.fileID
+                )
+            },
+            supportedCandidateCount: UInt64(entries.count)
+        )
+
+        let lastSegmentSequence: UInt64?
+        if entries.isEmpty {
+            lastSegmentSequence = nil
+        } else {
+            let byteCount: UInt64
+            switch WorkspaceCodemapSelectionGraphProjectionByteAccounting.normalizedByteCount(
+                entries: entries
+            ) {
+            case let .success(value):
+                byteCount = value
+            case .failure:
+                throw SelectionGraphTestError.invalidProjectionAccounting
+            }
+            let progress = WorkspaceCodemapProjectionProgress(
+                phase: .publishingProjectionSegment,
+                counts: counts,
+                catalogPageCount: 1,
+                catalogPathByteCount: UInt64(entries.reduce(0) {
+                    $0 + $1.identity.standardizedRelativePath.utf8.count
+                }),
+                publishedSegmentCount: 1,
+                publishedSegmentByteCount: byteCount,
+                catalogCompletion: completion
+            )
+            let segment: WorkspaceCodemapProjectionSegment
+            switch WorkspaceCodemapProjectionSegment.validated(
+                generation: generation,
+                sequence: 0,
+                entries: entries,
+                progress: progress,
+                byteCount: byteCount
+            ) {
+            case let .success(value):
+                segment = value
+            case .failure:
+                throw SelectionGraphTestError.invalidProjectionSegment
+            }
+            let segmentDisposition = await graph.applyProjectionSnapshot(.segment(segment))
+            switch segmentDisposition {
+            case .accepted, .exactDuplicate:
+                break
+            case .stale, .superseded, .busy, .budget, .unavailable:
+                throw SelectionGraphTestError.projectionSegmentRejected
+            }
+            lastSegmentSequence = 0
+        }
+
+        let proof: WorkspaceCodemapProjectionCoverageProof
+        switch WorkspaceCodemapProjectionCoverageProof.validated(
+            generation: generation,
+            catalogCompletion: completion,
+            counts: counts,
+            lastSegmentSequence: lastSegmentSequence
+        ) {
+        case let .success(value):
+            proof = value
+        case .failure:
+            throw SelectionGraphTestError.invalidProjectionProof
+        }
+        if seal {
+            let sealDisposition = await graph.applyProjectionSnapshot(.seal(proof))
+            switch sealDisposition {
+            case .accepted, .exactDuplicate:
+                break
+            case .stale, .superseded, .busy, .budget, .unavailable:
+                throw SelectionGraphTestError.projectionSealRejected
+            }
+        }
+        return proof
+    }
+
     private func runtimePolicy(
         maximumActiveRebuildCount: Int = 1,
         maximumReservedBindingCount: Int = 100,
@@ -1275,7 +1825,9 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         maximumSelectedSourceCountPerQuery: Int = 100,
         maximumResolvedTargetCountPerQuery: Int = 100,
         maximumReferenceFailureCountPerQuery: Int = 100,
-        graphSizePolicy: WorkspaceCodemapSelectionGraphSizePolicy? = nil
+        graphSizePolicy: WorkspaceCodemapSelectionGraphSizePolicy? = nil,
+        maximumProjectionSegmentByteCount: UInt64 = 8 * 1024 * 1024,
+        maximumStagedProjectionByteCount: UInt64 = 32 * 1024 * 1024
     ) -> WorkspaceCodemapSelectionGraphRuntimePolicy {
         .init(
             maximumActiveRebuildCount: maximumActiveRebuildCount,
@@ -1284,7 +1836,9 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
             maximumSelectedSourceCountPerQuery: maximumSelectedSourceCountPerQuery,
             maximumResolvedTargetCountPerQuery: maximumResolvedTargetCountPerQuery,
             maximumReferenceFailureCountPerQuery: maximumReferenceFailureCountPerQuery,
-            graphSizePolicy: graphSizePolicy ?? graphPolicy()
+            graphSizePolicy: graphSizePolicy ?? graphPolicy(),
+            maximumProjectionSegmentByteCount: maximumProjectionSegmentByteCount,
+            maximumStagedProjectionByteCount: maximumStagedProjectionByteCount
         )
     }
 
@@ -1420,4 +1974,10 @@ private final class SelectionGraphBuildGate: @unchecked Sendable {
 private enum SelectionGraphTestError: Error {
     case expectedPublished(WorkspaceCodemapSelectionGraphRuntimeRebuildDisposition)
     case expectedReady(WorkspaceCodemapSelectionGraphRuntimeQueryDisposition)
+    case invalidProjectionBinding
+    case invalidProjectionAccounting
+    case invalidProjectionSegment
+    case invalidProjectionProof
+    case projectionSegmentRejected
+    case projectionSealRejected
 }

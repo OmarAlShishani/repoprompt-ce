@@ -20,6 +20,15 @@ struct WorkspaceCodemapSelectionGraphRuntimeKey: Hashable {
         self.schemaVersion = schemaVersion
         self.policyVersion = policyVersion
     }
+
+    init(generation: WorkspaceCodemapProjectionGeneration) {
+        rootEpoch = generation.rootEpoch
+        catalogGeneration = generation.catalogGeneration
+        repositoryAuthority = generation.repositoryAuthority
+        contributionGeneration = generation.contributionGeneration
+        schemaVersion = generation.schemaVersion
+        policyVersion = generation.policyVersion
+    }
 }
 
 struct WorkspaceCodemapSelectionGraphRuntimeSizeAccounting: Hashable {
@@ -51,6 +60,27 @@ struct WorkspaceCodemapSelectionGraphRuntimePublishedSummary: Hashable {
     let uniqueEdgeCount: UInt64
     let sizeAccounting: WorkspaceCodemapSelectionGraphRuntimeSizeAccounting
     let isEmpty: Bool
+    let definitionUniverseCoverage: WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage
+
+    init(
+        key: WorkspaceCodemapSelectionGraphRuntimeKey,
+        nodeCount: UInt64,
+        uniqueEdgeCount: UInt64,
+        sizeAccounting: WorkspaceCodemapSelectionGraphRuntimeSizeAccounting,
+        isEmpty: Bool,
+        definitionUniverseCoverage: WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage = .incomplete(
+            progress: .notStarted,
+            remainingCount: nil,
+            retry: nil
+        )
+    ) {
+        self.key = key
+        self.nodeCount = nodeCount
+        self.uniqueEdgeCount = uniqueEdgeCount
+        self.sizeAccounting = sizeAccounting
+        self.isEmpty = isEmpty
+        self.definitionUniverseCoverage = definitionUniverseCoverage
+    }
 }
 
 struct WorkspaceCodemapSelectionGraphRuntimePolicy: Hashable {
@@ -61,7 +91,9 @@ struct WorkspaceCodemapSelectionGraphRuntimePolicy: Hashable {
         maximumSelectedSourceCountPerQuery: 4096,
         maximumResolvedTargetCountPerQuery: 100_000,
         maximumReferenceFailureCountPerQuery: 100_000,
-        graphSizePolicy: .initial
+        graphSizePolicy: .initial,
+        maximumProjectionSegmentByteCount: 8 * 1024 * 1024,
+        maximumStagedProjectionByteCount: 32 * 1024 * 1024
     )
 
     let maximumActiveRebuildCount: Int
@@ -71,6 +103,8 @@ struct WorkspaceCodemapSelectionGraphRuntimePolicy: Hashable {
     let maximumResolvedTargetCountPerQuery: Int
     let maximumReferenceFailureCountPerQuery: Int
     let graphSizePolicy: WorkspaceCodemapSelectionGraphSizePolicy
+    let maximumProjectionSegmentByteCount: UInt64
+    let maximumStagedProjectionByteCount: UInt64
 
     init(
         maximumActiveRebuildCount: Int,
@@ -79,7 +113,9 @@ struct WorkspaceCodemapSelectionGraphRuntimePolicy: Hashable {
         maximumSelectedSourceCountPerQuery: Int,
         maximumResolvedTargetCountPerQuery: Int,
         maximumReferenceFailureCountPerQuery: Int,
-        graphSizePolicy: WorkspaceCodemapSelectionGraphSizePolicy
+        graphSizePolicy: WorkspaceCodemapSelectionGraphSizePolicy,
+        maximumProjectionSegmentByteCount: UInt64 = 8 * 1024 * 1024,
+        maximumStagedProjectionByteCount: UInt64 = 32 * 1024 * 1024
     ) {
         precondition(maximumActiveRebuildCount > 0)
         precondition(maximumReservedBindingCount > 0)
@@ -87,6 +123,8 @@ struct WorkspaceCodemapSelectionGraphRuntimePolicy: Hashable {
         precondition(maximumSelectedSourceCountPerQuery > 0)
         precondition(maximumResolvedTargetCountPerQuery > 0)
         precondition(maximumReferenceFailureCountPerQuery > 0)
+        precondition(maximumProjectionSegmentByteCount > 0)
+        precondition(maximumStagedProjectionByteCount >= maximumProjectionSegmentByteCount)
         self.maximumActiveRebuildCount = maximumActiveRebuildCount
         self.maximumReservedBindingCount = maximumReservedBindingCount
         self.maximumInputBindingCount = maximumInputBindingCount
@@ -94,6 +132,66 @@ struct WorkspaceCodemapSelectionGraphRuntimePolicy: Hashable {
         self.maximumResolvedTargetCountPerQuery = maximumResolvedTargetCountPerQuery
         self.maximumReferenceFailureCountPerQuery = maximumReferenceFailureCountPerQuery
         self.graphSizePolicy = graphSizePolicy
+        self.maximumProjectionSegmentByteCount = maximumProjectionSegmentByteCount
+        self.maximumStagedProjectionByteCount = maximumStagedProjectionByteCount
+    }
+}
+
+enum WorkspaceCodemapSelectionGraphProjectionByteAccounting {
+    /// Conservative retained-byte accounting for a normalized immutable segment. The graph
+    /// recomputes this value and never trusts a producer's declared byte count on its own.
+    static func normalizedByteCount(
+        entries: [WorkspaceCodemapProjectionEntry]
+    ) -> Result<UInt64, WorkspaceCodemapProjectionAccountingError> {
+        do {
+            var bytes: UInt64 = 128
+            for entry in entries {
+                bytes = try add(bytes, UInt64(160))
+                bytes = try add(bytes, entry.identity.standardizedRootPath.utf8.count)
+                bytes = try add(bytes, entry.identity.standardizedRelativePath.utf8.count)
+                bytes = try add(bytes, entry.identity.standardizedFullPath.utf8.count)
+                bytes = try add(bytes, entry.pipelineIdentity.canonicalBytes.count)
+                switch entry.outcome {
+                case let .contributed(contribution), let .empty(contribution):
+                    bytes = try add(bytes, contribution.artifactKey.canonicalBytes.count)
+                    bytes = try add(bytes, UInt64(CodeMapSHA256Digest.byteCount))
+                    for name in contribution.sortedUniqueDefinitions {
+                        bytes = try add(bytes, UInt64(16))
+                        bytes = try add(bytes, name.utf8.count)
+                    }
+                    for name in contribution.sortedUniqueReferences {
+                        bytes = try add(bytes, UInt64(16))
+                        bytes = try add(bytes, name.utf8.count)
+                    }
+                case .terminalArtifact, .terminalExcluded:
+                    bytes = try add(bytes, UInt64(8))
+                }
+            }
+            return .success(bytes)
+        } catch let error as WorkspaceCodemapProjectionAccountingError {
+            return .failure(error)
+        } catch {
+            preconditionFailure("Unexpected projection byte-accounting error: \(error)")
+        }
+    }
+
+    private static func add(_ current: UInt64, _ value: Int) throws -> UInt64 {
+        guard let converted = UInt64(exactly: value) else {
+            throw WorkspaceCodemapProjectionAccountingError.overflow(.stagedGraphBytes)
+        }
+        let (next, overflow) = current.addingReportingOverflow(converted)
+        guard !overflow else {
+            throw WorkspaceCodemapProjectionAccountingError.overflow(.stagedGraphBytes)
+        }
+        return next
+    }
+
+    private static func add(_ current: UInt64, _ value: UInt64) throws -> UInt64 {
+        let (next, overflow) = current.addingReportingOverflow(value)
+        guard !overflow else {
+            throw WorkspaceCodemapProjectionAccountingError.overflow(.stagedGraphBytes)
+        }
+        return next
     }
 }
 
@@ -298,6 +396,7 @@ enum WorkspaceCodemapSelectionGraphRuntimeStructureDisposition: Hashable {
         WorkspaceCodemapSelectionGraphRuntimeStructureResult,
         WorkspaceCodemapSelectionGraphRuntimeStructureBudgetDimension
     )
+    case definitionUniverse(WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage)
     case unavailable(WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason)
 }
 
@@ -317,12 +416,16 @@ enum WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason: Hashable {
 
 enum WorkspaceCodemapSelectionGraphRuntimeQueryDisposition: Hashable {
     case readyPartial(WorkspaceCodemapSelectionGraphRuntimeQueryResult)
+    case definitionUniverse(WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage)
     case unavailable(WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason)
 }
 
 enum WorkspaceCodemapSelectionGraphRuntimeDiagnosticEventKind: Hashable {
     case buildStarted
     case beforePublication
+    case projectionSegmentAccepted
+    case projectionCoverageSealed
+    case projectionCoverageRevoked
 }
 
 struct WorkspaceCodemapSelectionGraphRuntimeDiagnosticEvent: Hashable {
@@ -352,4 +455,57 @@ struct WorkspaceCodemapSelectionGraphRuntimeAccounting: Equatable {
     let invalidSnapshotCount: UInt64
     let supersededPublicationCount: UInt64
     let materializedQueryResultCount: UInt64
+    let stagedProjectionByteCount: UInt64
+    let residentProjectionByteCount: UInt64
+    let acceptedProjectionSegmentCount: UInt64
+    let exactDuplicateProjectionSegmentCount: UInt64
+    let rejectedProjectionSegmentCount: UInt64
+    let completedProjectionCoverageCount: UInt64
+    let revokedProjectionCoverageCount: UInt64
+
+    init(
+        activeRebuildCount: Int,
+        reservedInputBindingCount: Int,
+        publishedSummary: WorkspaceCodemapSelectionGraphRuntimePublishedSummary?,
+        currentObservedKey: WorkspaceCodemapSelectionGraphRuntimeKey?,
+        currentUnavailableReason: WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason?,
+        publishedCount: UInt64,
+        emptyPublishedCount: UInt64,
+        actorBusyCount: UInt64,
+        processBusyCount: UInt64,
+        cancelledCount: UInt64,
+        budgetRejectedCount: UInt64,
+        invalidSnapshotCount: UInt64,
+        supersededPublicationCount: UInt64,
+        materializedQueryResultCount: UInt64,
+        stagedProjectionByteCount: UInt64 = 0,
+        residentProjectionByteCount: UInt64 = 0,
+        acceptedProjectionSegmentCount: UInt64 = 0,
+        exactDuplicateProjectionSegmentCount: UInt64 = 0,
+        rejectedProjectionSegmentCount: UInt64 = 0,
+        completedProjectionCoverageCount: UInt64 = 0,
+        revokedProjectionCoverageCount: UInt64 = 0
+    ) {
+        self.activeRebuildCount = activeRebuildCount
+        self.reservedInputBindingCount = reservedInputBindingCount
+        self.publishedSummary = publishedSummary
+        self.currentObservedKey = currentObservedKey
+        self.currentUnavailableReason = currentUnavailableReason
+        self.publishedCount = publishedCount
+        self.emptyPublishedCount = emptyPublishedCount
+        self.actorBusyCount = actorBusyCount
+        self.processBusyCount = processBusyCount
+        self.cancelledCount = cancelledCount
+        self.budgetRejectedCount = budgetRejectedCount
+        self.invalidSnapshotCount = invalidSnapshotCount
+        self.supersededPublicationCount = supersededPublicationCount
+        self.materializedQueryResultCount = materializedQueryResultCount
+        self.stagedProjectionByteCount = stagedProjectionByteCount
+        self.residentProjectionByteCount = residentProjectionByteCount
+        self.acceptedProjectionSegmentCount = acceptedProjectionSegmentCount
+        self.exactDuplicateProjectionSegmentCount = exactDuplicateProjectionSegmentCount
+        self.rejectedProjectionSegmentCount = rejectedProjectionSegmentCount
+        self.completedProjectionCoverageCount = completedProjectionCoverageCount
+        self.revokedProjectionCoverageCount = revokedProjectionCoverageCount
+    }
 }

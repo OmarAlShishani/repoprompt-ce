@@ -1103,6 +1103,250 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         }
     }
 
+    func testAgentRunExplicitTabContextInheritsWorktreeWithoutParentAndHonorsOptOut() async throws {
+        let root = try makeTemporaryDirectory(named: "explicit-tab-root")
+        let worktree = try makeTemporaryDirectory(named: "explicit-tab-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let initialSourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let sourceBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+
+        for (index, testCase) in [
+            (label: "explicit tab inherited", inherits: true),
+            (label: "explicit tab opt out", inherits: false)
+        ].enumerated() {
+            let sourceTabID: UUID
+            if index == 0 {
+                sourceTabID = initialSourceTabID
+            } else {
+                await window.promptManager.createBlankComposeTab(createAgentSession: false)
+                sourceTabID = try XCTUnwrap(
+                    window.workspaceManager.activeWorkspace?.activeComposeTabID,
+                    testCase.label
+                )
+            }
+            let sourceSessionID = UUID()
+            installParentAgentSession(
+                sourceSessionID,
+                binding: sourceBinding,
+                sourceTabID: sourceTabID,
+                in: window
+            )
+            let service = makeAgentRunStartService(
+                window: window,
+                sourceTabID: nil,
+                oracleLaunchRoute: .explicitTabContext,
+                oracleLaunchSourceTabID: sourceTabID,
+                oracleSourceWorktreeBindings: [sourceBinding]
+            )
+            var args: [String: Value] = [
+                "op": .string("start"),
+                "message": .string(testCase.label),
+                "detach": .bool(true),
+                "timeout": .int(0)
+            ]
+            if !testCase.inherits {
+                args["inherit_worktree"] = .bool(false)
+            }
+
+            let value = try await service.execute(args: args)
+
+            let object = try XCTUnwrap(value.objectValue, testCase.label)
+            let sessionObject = try XCTUnwrap(object["session"]?.objectValue, testCase.label)
+            let childTabID = try XCTUnwrap(
+                try UUID(uuidString: XCTUnwrap(sessionObject["context_id"]?.stringValue, testCase.label)),
+                testCase.label
+            )
+            XCTAssertNil(sessionObject["parent_session_id"]?.stringValue, testCase.label)
+            let child = viewModel.session(for: childTabID)
+            XCTAssertNil(child.parentSessionID, testCase.label)
+            if testCase.inherits {
+                XCTAssertEqual(child.worktreeBindings, [sourceBinding], testCase.label)
+                XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: child), worktree.path, testCase.label)
+            } else {
+                XCTAssertTrue(child.worktreeBindings.isEmpty, testCase.label)
+                XCTAssertNil(object["worktree_bindings"], testCase.label)
+                XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: child), root.path, testCase.label)
+            }
+        }
+    }
+
+    func testAgentRunExplicitTabContextFailsClosedForUnavailableOrMismatchedFrozenSource() async throws {
+        let root = try makeTemporaryDirectory(named: "explicit-tab-frozen-source-root")
+        let worktree = try makeTemporaryDirectory(named: "explicit-tab-frozen-source-worktree")
+        let window = try await makeWindow(root: root)
+        let initialSourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let sourceBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        let cases: [(label: String, capturedBindings: [AgentSessionWorktreeBinding]?, capturedSessionID: UUID?)] = [
+            ("unavailable frozen source", nil, nil),
+            ("mismatched frozen source identity", [sourceBinding], UUID())
+        ]
+
+        for (index, testCase) in cases.enumerated() {
+            let sourceTabID: UUID
+            if index == 0 {
+                sourceTabID = initialSourceTabID
+            } else {
+                await window.promptManager.createBlankComposeTab(createAgentSession: false)
+                sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+            }
+            let sourceSessionID = UUID()
+            installParentAgentSession(
+                sourceSessionID,
+                binding: sourceBinding,
+                sourceTabID: sourceTabID,
+                in: window
+            )
+            let service = makeAgentRunStartService(
+                window: window,
+                sourceTabID: nil,
+                oracleLaunchRoute: .explicitTabContext,
+                oracleLaunchSourceTabID: sourceTabID,
+                oracleSourceWorktreeBindings: testCase.capturedBindings,
+                oracleCapturedSourceAgentSessionID: testCase.capturedSessionID
+            )
+
+            do {
+                _ = try await service.execute(args: [
+                    "op": .string("start"),
+                    "message": .string(testCase.label),
+                    "detach": .bool(true),
+                    "timeout": .int(0)
+                ])
+                XCTFail("Expected explicit-tab inheritance to fail closed: \(testCase.label)")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("frozen launch source"), testCase.label)
+            }
+        }
+    }
+
+    func testAgentRunExplicitTabContextRejectsCapturedSourceDriftBeforeProviderStart() async throws {
+        let root = try makeTemporaryDirectory(named: "explicit-tab-race-root")
+        let worktree = try makeTemporaryDirectory(named: "explicit-tab-race-worktree")
+        let replacement = try makeTemporaryDirectory(named: "explicit-tab-race-replacement")
+        let window = try await makeWindow(root: root)
+        let sourceBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        let replacementBinding = makeBinding(logicalRoot: root.path, worktreeRoot: replacement.path)
+        let initialSourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+
+        for (index, testCase) in ["binding mutation", "session teardown"].enumerated() {
+            let sourceTabID: UUID
+            if index == 0 {
+                sourceTabID = initialSourceTabID
+            } else {
+                await window.promptManager.createBlankComposeTab(createAgentSession: false)
+                sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+            }
+            let sourceSessionID = UUID()
+            installParentAgentSession(
+                sourceSessionID,
+                binding: sourceBinding,
+                sourceTabID: sourceTabID,
+                in: window
+            )
+            var service = makeAgentRunStartService(
+                window: window,
+                sourceTabID: nil,
+                oracleLaunchRoute: .explicitTabContext,
+                oracleLaunchSourceTabID: sourceTabID,
+                oracleSourceWorktreeBindings: [sourceBinding]
+            )
+            service.testBeforeExplicitTabWorktreeValidation = {
+                let source = window.agentModeViewModel.session(for: sourceTabID)
+                if testCase == "binding mutation" {
+                    source.worktreeBindings = [replacementBinding]
+                } else {
+                    source.testInstallPersistentSessionBinding(sessionID: nil)
+                }
+            }
+
+            do {
+                _ = try await service.execute(args: [
+                    "op": .string("start"),
+                    "message": .string(testCase),
+                    "detach": .bool(true),
+                    "timeout": .int(0)
+                ])
+                XCTFail("Expected explicit-tab source drift to reject provider startup: \(testCase)")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("changed before provider startup"), testCase)
+            }
+        }
+    }
+
+    func testAgentRunExplicitTabContextRevalidatesCapturedEmptyBindings() async throws {
+        let root = try makeTemporaryDirectory(named: "explicit-tab-empty-root")
+        let worktree = try makeTemporaryDirectory(named: "explicit-tab-empty-worktree")
+        let window = try await makeWindow(root: root)
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let source = window.agentModeViewModel.session(for: sourceTabID)
+        let sourceSessionID = UUID()
+        source.testInstallPersistentSessionBinding(sessionID: sourceSessionID)
+        source.worktreeBindings = []
+        var service = makeAgentRunStartService(
+            window: window,
+            sourceTabID: nil,
+            oracleLaunchRoute: .explicitTabContext,
+            oracleLaunchSourceTabID: sourceTabID,
+            oracleSourceWorktreeBindings: []
+        )
+        service.testBeforeExplicitTabWorktreeValidation = {
+            source.worktreeBindings = [self.makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
+        }
+
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("start"),
+                "message": .string("empty binding drift"),
+                "detach": .bool(true),
+                "timeout": .int(0)
+            ])
+            XCTFail("Expected captured empty bindings to be revalidated")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("changed before provider startup"))
+        }
+    }
+
+    func testAgentRunExplicitTabContextPreservesCapturedMultiRootBindings() async throws {
+        let firstRoot = try makeTemporaryDirectory(named: "explicit-tab-multi-root-one")
+        let secondRoot = try makeTemporaryDirectory(named: "explicit-tab-multi-root-two")
+        let firstWorktree = try makeTemporaryDirectory(named: "explicit-tab-multi-worktree-one")
+        let secondWorktree = try makeTemporaryDirectory(named: "explicit-tab-multi-worktree-two")
+        let window = try await makeWindow(roots: [firstRoot, secondRoot])
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let sourceSessionID = UUID()
+        let bindings = [
+            makeBinding(logicalRoot: firstRoot.path, worktreeRoot: firstWorktree.path, worktreeID: "multi-one"),
+            makeBinding(logicalRoot: secondRoot.path, worktreeRoot: secondWorktree.path, worktreeID: "multi-two")
+        ]
+        let source = window.agentModeViewModel.session(for: sourceTabID)
+        source.testInstallPersistentSessionBinding(sessionID: sourceSessionID)
+        source.worktreeBindings = bindings
+        let service = makeAgentRunStartService(
+            window: window,
+            sourceTabID: nil,
+            oracleLaunchRoute: .explicitTabContext,
+            oracleLaunchSourceTabID: sourceTabID,
+            oracleSourceWorktreeBindings: bindings
+        )
+
+        let value = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("multi-root inheritance"),
+            "detach": .bool(true),
+            "timeout": .int(0)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        let sessionObject = try XCTUnwrap(object["session"]?.objectValue)
+        XCTAssertNil(sessionObject["parent_session_id"]?.stringValue)
+        let childTabID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(sessionObject["context_id"]?.stringValue))
+        )
+        XCTAssertEqual(window.agentModeViewModel.session(for: childTabID).worktreeBindings, bindings)
+        XCTAssertEqual(object["worktree_bindings"]?.arrayValue?.count, 2)
+    }
+
     func testManualFirstSendCreatesAndBindsNewWorktreeAcrossNewAndLinkedRoutes() async throws {
         let routeCases: [(label: String, linked: Bool, text: String)] = [
             ("new destination tab", false, "start in a worktree"),
@@ -1640,7 +1884,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(session.providerSessionID, "managed-old-identity")
     }
 
-    func testAgentStartExplicitWorktreeIDOverridesInheritedBindingAcrossRunAndExplore() async throws {
+    func testAgentStartExplicitWorktreeIDOverridesInheritedBindingAcrossRunExploreAndExplicitTab() async throws {
         let fixture = try makeGitFixture()
         let parentWorktree = fixture.sandbox.appendingPathComponent("parent-worktree", isDirectory: true)
         let explicitWorktree = fixture.sandbox.appendingPathComponent("explicit-worktree", isDirectory: true)
@@ -1671,6 +1915,38 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             worktreeRoot: parentWorktree.standardizedFileURL.path,
             worktreeID: "parent-\(fixture.suffix)"
         )
+
+        let explicitTabSourceID = UUID()
+        let explicitTabSourceIDForBinding = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        installParentAgentSession(
+            explicitTabSourceID,
+            binding: parentBinding,
+            sourceTabID: explicitTabSourceIDForBinding,
+            in: window
+        )
+        let explicitTabService = makeAgentRunStartService(
+            window: window,
+            sourceTabID: nil,
+            oracleLaunchRoute: .explicitTabContext,
+            oracleLaunchSourceTabID: explicitTabSourceIDForBinding
+        )
+        let explicitTabValue = try await explicitTabService.execute(args: [
+            "op": .string("start"),
+            "message": .string("explicit tab worktree override"),
+            "detach": .bool(true),
+            "timeout": .int(0),
+            "worktree_id": .string(explicitDescriptor.worktreeID)
+        ])
+        let explicitTabObject = try XCTUnwrap(explicitTabValue.objectValue)
+        let explicitTabSessionObject = try XCTUnwrap(explicitTabObject["session"]?.objectValue)
+        XCTAssertNil(explicitTabSessionObject["parent_session_id"]?.stringValue)
+        let explicitTabChildID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(explicitTabSessionObject["context_id"]?.stringValue))
+        )
+        let explicitTabChild = viewModel.session(for: explicitTabChildID)
+        XCTAssertNil(explicitTabChild.parentSessionID)
+        XCTAssertEqual(explicitTabChild.worktreeBindings.first?.worktreeID, explicitDescriptor.worktreeID)
+        XCTAssertFalse(explicitTabChild.worktreeBindings.contains { $0.worktreeID == parentBinding.worktreeID })
 
         for testCase in [
             (label: "run explicit override with inheritance", inherits: true),
@@ -2895,6 +3171,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         }
 
         func makeWindow(root: URL, loadRoot: Bool = true) async throws -> WindowState {
+            try await makeWindow(roots: [root], loadRoots: loadRoot)
+        }
+
+        func makeWindow(roots: [URL], loadRoots: Bool = true) async throws -> WindowState {
             let window = WindowState()
             let ownership = WindowOwnership(window: window)
             windows.append(ownership)
@@ -2903,7 +3183,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
             let workspace = window.workspaceManager.createWorkspace(
                 name: "Agent Run Worktree Start \(UUID().uuidString.prefix(8))",
-                repoPaths: [root.path],
+                repoPaths: roots.map(\.path),
                 ephemeral: true
             )
             await window.workspaceManager.switchWorkspace(
@@ -2913,11 +3193,13 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             )
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-            if loadRoot {
-                _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
-                    in: window,
-                    path: root.path
-                )
+            if loadRoots {
+                for root in roots {
+                    _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                        in: window,
+                        path: root.path
+                    )
+                }
             }
             return window
         }
@@ -3231,7 +3513,11 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
     private func makeAgentRunStartService(
         window: WindowState,
         sourceTabID: UUID?,
-        fallbackParentSessionID: UUID? = nil
+        fallbackParentSessionID: UUID? = nil,
+        oracleLaunchRoute: AgentRunOracleReviewLaunchRoute? = nil,
+        oracleLaunchSourceTabID: UUID? = nil,
+        oracleSourceWorktreeBindings: [AgentSessionWorktreeBinding]? = nil,
+        oracleCapturedSourceAgentSessionID: UUID? = nil
     ) -> AgentRunMCPToolService {
         var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
@@ -3281,12 +3567,12 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         )
         service.resolveOracleReviewLaunchSource = { _, targetWindow in
             let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
-            let packagingTabID = try XCTUnwrap(sourceTabID ?? workspace.activeComposeTabID)
+            let packagingTabID = try XCTUnwrap(oracleLaunchSourceTabID ?? sourceTabID ?? workspace.activeComposeTabID)
             let sourceSessionID = targetWindow.agentModeViewModel
                 .session(for: packagingTabID)
                 .activeAgentSessionID
             let snapshot = AgentRunOracleReviewLaunchSnapshot(
-                route: sourceTabID == nil ? .windowOnlyActiveCompose : .runScoped,
+                route: oracleLaunchRoute ?? (sourceTabID == nil ? .windowOnlyActiveCompose : .runScoped),
                 windowID: targetWindow.windowID,
                 workspaceID: workspace.id,
                 tabID: packagingTabID,
@@ -3299,9 +3585,25 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 sourceAgentSessionID: sourceSessionID,
                 routedRunID: nil
             )
-            return ResolvedAgentRunOracleReviewLaunchSource(
-                snapshot: snapshot,
-                source: .unavailable(.init(
+            let source: AgentRunOracleReviewSource = if let oracleSourceWorktreeBindings {
+                .captured(.init(
+                    sourceTabID: packagingTabID,
+                    workspaceID: workspace.id,
+                    sourceSelectionRevision: snapshot.selectionRevision,
+                    promptText: "",
+                    selection: StoredSelection(),
+                    lookupContext: .visibleWorkspace,
+                    reviewGitContext: .automaticOnly(
+                        base: "HEAD",
+                        workspaceRootPaths: oracleSourceWorktreeBindings.map(\.logicalRootPath),
+                        bindings: oracleSourceWorktreeBindings
+                    ),
+                    sourceAgentSessionID: oracleCapturedSourceAgentSessionID ?? sourceSessionID,
+                    sourceAgentRunID: nil,
+                    sourceWorktreeBindings: oracleSourceWorktreeBindings
+                ))
+            } else {
+                .unavailable(.init(
                     delegationID: UUID(),
                     sourceTabID: packagingTabID,
                     workspaceID: workspace.id,
@@ -3309,6 +3611,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                     sourceAgentRunID: nil,
                     reason: .sourceCaptureFailed("Synthetic start-service fixture")
                 ))
+            }
+            return ResolvedAgentRunOracleReviewLaunchSource(
+                snapshot: snapshot,
+                source: source
             )
         }
         service.resolveSpawnParentSessionIDFromSourceTabID = { (sourceTabID: UUID, window: WindowState) async -> UUID? in
@@ -3390,6 +3696,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
     private func makeWindow(root: URL) async throws -> WindowState {
         try await lifecycleFixture.makeWindow(root: root)
+    }
+
+    private func makeWindow(roots: [URL]) async throws -> WindowState {
+        try await lifecycleFixture.makeWindow(roots: roots)
     }
 
     private func makeViewModel(workspacePath: String) -> AgentModeViewModel {

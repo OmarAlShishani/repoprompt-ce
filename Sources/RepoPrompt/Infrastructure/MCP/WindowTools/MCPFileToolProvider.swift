@@ -106,16 +106,16 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             - referenced_definitions: follow definitions referenced by each seed.
             - referrers: follow resident files that reference definitions in each seed.
             - both: traverse both root-local directions.
-            - Cold relationship discovery may be partial; no eager root scan is performed.
+            - Cold relationship discovery waits for exact current coverage within the server's fixed 10-second deadline.
 
             Limits:
             - max_files (1...200, default 10)
             - max_edges (1...10000, default 500)
             - max_codemap_tokens (256...20000, default 6000)
-            - wait_ms (0...2000, default 350)
 
-            Results report literal ready, partial, pending, unavailable, stale, or budget
-            status with stable issue codes. Cancellation remains an MCP cancellation.
+            Results report literal ready, budget, busy, timeout, unavailable, or stale status
+            with stable issue codes. Readiness pressure never returns partial structure.
+            Cancellation remains an MCP cancellation.
             Per-file paths are logical paths; traversal cannot cross a root epoch.
 
             Examples:
@@ -149,8 +149,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                         properties: [
                             "max_files": .integer(description: "Maximum emitted seed plus related files"),
                             "max_edges": .integer(description: "Maximum root-local graph edges examined"),
-                            "max_codemap_tokens": .integer(description: "Strict codemap-content token budget"),
-                            "wait_ms": .integer(description: "Maximum bounded demand/rebuild wait")
+                            "max_codemap_tokens": .integer(description: "Strict codemap-content token budget")
                         ],
                         required: []
                     )
@@ -205,7 +204,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                         throw MCPError.invalidParams("limits must be an object")
                     }
                     guard Set(object.keys).isSubset(
-                        of: ["max_files", "max_edges", "max_codemap_tokens", "wait_ms"]
+                        of: ["max_files", "max_edges", "max_codemap_tokens"]
                     ) else {
                         throw MCPError.invalidParams("unknown limits parameter")
                     }
@@ -216,7 +215,6 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 let maximumFiles = limits["max_files"]?.intValue ?? 10
                 let maximumEdges = limits["max_edges"]?.intValue ?? 500
                 let maximumCodemapTokens = limits["max_codemap_tokens"]?.intValue ?? 6000
-                let waitMilliseconds = limits["wait_ms"]?.intValue ?? 350
                 guard (1 ... 200).contains(maximumFiles) else {
                     throw MCPError.invalidParams("limits.max_files must be between 1 and 200")
                 }
@@ -226,16 +224,12 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 guard (256 ... 20000).contains(maximumCodemapTokens) else {
                     throw MCPError.invalidParams("limits.max_codemap_tokens must be between 256 and 20000")
                 }
-                guard (0 ... 2000).contains(waitMilliseconds) else {
-                    throw MCPError.invalidParams("limits.wait_ms must be between 0 and 2000")
-                }
                 let request = MCPServerViewModel.CodeStructureRequest(
                     direction: direction,
                     maximumDepth: maximumDepth,
                     maximumFiles: maximumFiles,
                     maximumEdges: maximumEdges,
-                    maximumCodemapTokens: maximumCodemapTokens,
-                    waitMilliseconds: waitMilliseconds
+                    maximumCodemapTokens: maximumCodemapTokens
                 )
 
                 let metadata = await dependencies.captureRequestMetadata()
@@ -259,7 +253,11 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     ) == .completed else {
                         throw CancellationError()
                     }
-                    files = try await dependencies.selectedRecordsForCurrentTabContext()
+                    files = try await dependencies.resolveSelectedFilesForCodeStructure(
+                        metadata,
+                        lookupContext,
+                        MCPServerViewModel.codeStructureSeedLimit(for: request)
+                    )
                 case "paths":
                     guard let rawPaths = args["paths"]?.arrayValue else {
                         throw MCPError.invalidParams("paths is required when scope='paths'")
@@ -288,7 +286,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     }
                     files = try await dependencies.resolveFilesForCodeStructure(
                         translated,
-                        lookupContext.rootScope
+                        lookupContext.rootScope,
+                        MCPServerViewModel.codeStructureSeedLimit(for: request)
                     )
                 default:
                     throw MCPError.invalidParams("invalid scope")

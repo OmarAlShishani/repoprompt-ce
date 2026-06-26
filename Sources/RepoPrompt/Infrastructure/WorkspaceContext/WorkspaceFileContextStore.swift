@@ -384,6 +384,12 @@ actor WorkspaceFileContextStore {
         let logicalPath: WorkspaceCodemapLogicalPresentationPath
     }
 
+    private enum CodemapWarmPublishedMarkerReplayDisposition {
+        case applied
+        case alreadyCurrent
+        case stale
+    }
+
     private struct CodemapProjectionDemandRecord {
         let ticket: WorkspaceCodemapProjectionDemandTicket
         let fileIDs: [UUID]
@@ -1289,6 +1295,13 @@ actor WorkspaceFileContextStore {
 
         func debugCodemapEnginePresent(rootID: UUID) -> Bool {
             debugCodemapBindingEngine(rootID: rootID) != nil
+        }
+
+        func codemapBindingEngineAccountingForTesting(
+            rootID: UUID
+        ) async -> WorkspaceCodemapBindingEngineAccounting? {
+            guard let owner = debugCodemapBindingEngine(rootID: rootID) else { return nil }
+            return await owner.engine.accounting()
         }
 
         private func debugCodemapBindingEngine(
@@ -8232,10 +8245,14 @@ actor WorkspaceFileContextStore {
     private func currentRenderableCodemapFileIDs(
         rootScope: WorkspaceLookupRootScope
     ) -> Set<UUID> {
-        let allowedRootIDs = Set(rootRefs(scope: rootScope).map(\.id))
         var fileIDs = Set<UUID>()
-        for (rootEpoch, session) in codemapSessionsByRootEpoch {
-            guard allowedRootIDs.contains(rootEpoch.rootID),
+        for root in rootRefs(scope: rootScope) {
+            guard let state = rootStatesByID[root.id] else { continue }
+            let rootEpoch = WorkspaceCodemapRootEpoch(
+                rootID: root.id,
+                rootLifetimeID: state.lifetimeID
+            )
+            guard let session = codemapSessionsByRootEpoch[rootEpoch],
                   codemapAuthorityIsCurrent(session.authority)
             else { continue }
             fileIDs.formUnion(session.markerReadinessByFileID.keys)
@@ -12497,6 +12514,16 @@ actor WorkspaceFileContextStore {
             else { return nil }
         }
 
+        for capture in captures {
+            guard let hit = hitsByFileID[capture.request.identity.fileID],
+                  case .ready = hit.handle.outcome
+            else { return nil }
+        }
+        guard replayWarmPublishedCodemapMarkerReadiness(
+            captures,
+            rootScope: rootScope
+        ) != .stale else { return nil }
+
         captures.sort {
             if $0.logicalPath.displayPath != $1.logicalPath.displayPath {
                 return $0.logicalPath.displayPath.utf8.lexicographicallyPrecedes(
@@ -12556,6 +12583,87 @@ actor WorkspaceFileContextStore {
             examinedEdgeCount: 0,
             codemapTokenCount: usedTokens
         )
+    }
+
+    private func replayWarmPublishedCodemapMarkerReadiness(
+        _ captures: [CodemapPublishedStructureCapture],
+        rootScope: WorkspaceLookupRootScope
+    ) -> CodemapWarmPublishedMarkerReplayDisposition {
+        let requestedRootIDs = Set(rootRefs(scope: rootScope).map(\.id))
+        var changesByRootEpoch: [
+            WorkspaceCodemapRootEpoch: [WorkspaceCodemapMarkerReadinessChange]
+        ] = [:]
+        for capture in captures {
+            let request = capture.request
+            let identity = request.identity
+            guard requestedRootIDs.contains(identity.rootID),
+                  capture.rootEpoch == WorkspaceCodemapRootEpoch(
+                      rootID: identity.rootID,
+                      rootLifetimeID: identity.rootLifetimeID
+                  ),
+                  let state = rootStatesByID[identity.rootID],
+                  state.lifetimeID == identity.rootLifetimeID,
+                  state.root.standardizedFullPath == identity.standardizedRootPath,
+                  state.fileIDsByRelativePath[identity.standardizedRelativePath] == identity.fileID,
+                  let file = filesByID[identity.fileID],
+                  isDiscoverableFileID(identity.fileID),
+                  file.rootID == identity.rootID,
+                  file.standardizedRelativePath == identity.standardizedRelativePath,
+                  file.standardizedFullPath == identity.standardizedFullPath,
+                  codemapCleanupFlightsByRootID[identity.rootID] == nil,
+                  !codemapProjectionCatalogIsFenced(rootEpoch: capture.rootEpoch),
+                  let session = codemapSessionsByRootEpoch[capture.rootEpoch],
+                  case .ready? = session.setupDisposition,
+                  session.authority == capture.authority,
+                  codemapAuthorityIsCurrent(session.authority),
+                  session.engine === capture.engine,
+                  session.authority.catalogGeneration == request.catalogGeneration,
+                  session.authority.ingressGeneration == request.ingressGeneration
+            else { return .stale }
+            let currentPathGeneration = session.pathGenerationsByRelativePath[
+                identity.standardizedRelativePath
+            ] ?? session.authority.ingressGeneration
+            guard request.requestGeneration == currentPathGeneration,
+                  request.pathGeneration == currentPathGeneration
+            else { return .stale }
+            changesByRootEpoch[capture.rootEpoch, default: []].append(
+                WorkspaceCodemapMarkerReadinessChange(
+                    fileID: identity.fileID,
+                    standardizedRelativePath: identity.standardizedRelativePath,
+                    requestGeneration: request.requestGeneration,
+                    pathGeneration: request.pathGeneration,
+                    state: .ready
+                )
+            )
+        }
+
+        var applied = false
+        let rootEpochs = changesByRootEpoch.keys.sorted {
+            if $0.rootID != $1.rootID {
+                return $0.rootID.uuidString < $1.rootID.uuidString
+            }
+            return $0.rootLifetimeID.uuidString < $1.rootLifetimeID.uuidString
+        }
+        for rootEpoch in rootEpochs {
+            var session = codemapSessionsByRootEpoch[rootEpoch]!
+            let changes = changesByRootEpoch[rootEpoch]!
+            let effectiveChanges = changes.filter {
+                session.markerReadinessByFileID[$0.fileID] != $0
+            }
+            guard !effectiveChanges.isEmpty else { continue }
+            for change in effectiveChanges {
+                session.markerReadinessByFileID[change.fileID] = change
+            }
+            session.markerReadinessRevision &+= 1
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            yieldCodemapMarkerReadiness(WorkspaceCodemapMarkerReadinessEvent(
+                rootEpoch: rootEpoch,
+                revision: session.markerReadinessRevision,
+                changes: effectiveChanges
+            ))
+            applied = true
+        }
+        return applied ? .applied : .alreadyCurrent
     }
 
     func requestCodemapArtifact(
@@ -16171,6 +16279,47 @@ actor WorkspaceFileContextStore {
                 return false
             }
             return acceptCodemapMarkerReadinessUpdate(update, authority: authority)
+        }
+
+        func codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (revision: UInt64, changes: [WorkspaceCodemapMarkerReadinessChange])? {
+            codemapSessionsByRootEpoch[rootEpoch].map {
+                (
+                    revision: $0.markerReadinessRevision,
+                    changes: $0.markerReadinessByFileID.values.sorted {
+                        $0.standardizedRelativePath < $1.standardizedRelativePath
+                    }
+                )
+            }
+        }
+
+        @discardableResult
+        func clearCodemapMarkerReadinessForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            fileID: UUID
+        ) -> Bool {
+            guard var session = codemapSessionsByRootEpoch[rootEpoch],
+                  let removed = session.markerReadinessByFileID.removeValue(forKey: fileID)
+            else { return false }
+            let pathGeneration = session.pathGenerationsByRelativePath[
+                removed.standardizedRelativePath
+            ] ?? session.authority.ingressGeneration
+            let change = WorkspaceCodemapMarkerReadinessChange(
+                fileID: removed.fileID,
+                standardizedRelativePath: removed.standardizedRelativePath,
+                requestGeneration: pathGeneration,
+                pathGeneration: pathGeneration,
+                state: .unavailable
+            )
+            session.markerReadinessRevision &+= 1
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            yieldCodemapMarkerReadiness(WorkspaceCodemapMarkerReadinessEvent(
+                rootEpoch: rootEpoch,
+                revision: session.markerReadinessRevision,
+                changes: [change]
+            ))
+            return true
         }
     #endif
 

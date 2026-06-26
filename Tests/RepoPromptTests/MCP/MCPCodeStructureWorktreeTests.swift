@@ -41,7 +41,7 @@ private extension ToolResultDTOs.CodeStructureReplyDTO {
 
 @MainActor
 final class MCPCodeStructureWorktreeTests: XCTestCase {
-    func testSeedModernResultUsesLogicalPathWithoutPhysicalLeakage() async throws {
+    func testInheritedWorktreeSequentialStructureThenTreePublishesLogicalMarkerWithoutPhysicalLeakage() async throws {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let logical = try repositories.makeRepository(
             named: "logical",
@@ -61,6 +61,20 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             in: window,
             path: logical.path
         )
+        let setupPhysicalRoot = try await store.loadRoot(path: physical.path, kind: .sessionWorktree)
+        let setupFile = try await fileRecord(
+            at: physical.appendingPathComponent("Sources/App.swift"),
+            store: store,
+            rootScope: .allLoaded
+        )
+        let setupTicket = try await readyTicket(
+            store: store,
+            fileID: setupFile.id,
+            timeout: .seconds(30)
+        )
+        _ = await store.cancelCodemapArtifactDemand(setupTicket)
+        await store.unloadRoot(id: setupPhysicalRoot.id)
+
         let physicalRoot = try await store.loadRoot(path: physical.path, kind: .sessionWorktree)
         let projection = makeProjection(
             logicalRoot: logicalRoot,
@@ -79,27 +93,82 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let ticket = try await readyTicket(store: store, fileID: file.id)
         defer { Task { _ = await store.cancelCodemapArtifactDemand(ticket) } }
 
-        let dto = try await window.mcpServer.buildCodeStructureDTO(
+        let structureRequest = request()
+        let firstDTO = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(),
+            request: structureRequest,
+            includePathNotFoundIssue: true,
+            lookupContext: context
+        )
+        let secondDTO = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [file],
+            request: structureRequest,
             includePathNotFoundIssue: true,
             lookupContext: context
         )
 
-        XCTAssertEqual(dto.status, "ready")
-        XCTAssertEqual(dto.files.count, 1)
-        let renderedFile = try XCTUnwrap(dto.files.first)
-        XCTAssertTrue(renderedFile.path.hasSuffix("Sources/App.swift"), renderedFile.path)
-        XCTAssertEqual(renderedFile.role, "seed")
-        XCTAssertEqual(renderedFile.depth, 0)
-        XCTAssertTrue(renderedFile.content.contains("WorktreeApp"), renderedFile.content)
-        XCTAssertFalse(renderedFile.content.contains("CanonicalOnly"), renderedFile.content)
-        XCTAssertFalse(renderedFile.content.contains(physical.standardizedFileURL.path), renderedFile.content)
-        XCTAssertEqual(dto.summary.codemapContentTokens, renderedFile.tokens)
-        let mapping = try XCTUnwrap(dto.worktreeScope?.rootMappings.first)
-        XCTAssertEqual(mapping.effectiveRootPath, "session-bound")
-        XCTAssertEqual(mapping.worktreeID, "logical-result")
-        XCTAssertFalse(mapping.logicalRootPath.contains(physical.standardizedFileURL.path))
+        for dto in [firstDTO, secondDTO] {
+            XCTAssertEqual(dto.status, "ready")
+            XCTAssertEqual(dto.files.count, 1)
+            let renderedFile = try XCTUnwrap(dto.files.first)
+            XCTAssertEqual(renderedFile.path, "\(logicalRoot.name)/Sources/App.swift")
+            XCTAssertEqual(renderedFile.role, "seed")
+            XCTAssertEqual(renderedFile.depth, 0)
+            XCTAssertTrue(renderedFile.content.contains("WorktreeApp"), renderedFile.content)
+            XCTAssertFalse(renderedFile.content.contains("CanonicalOnly"), renderedFile.content)
+            XCTAssertFalse(renderedFile.content.contains(physical.standardizedFileURL.path), renderedFile.content)
+            XCTAssertEqual(dto.summary.codemapContentTokens, renderedFile.tokens)
+            let mapping = try XCTUnwrap(dto.worktreeScope?.rootMappings.first)
+            XCTAssertEqual(mapping.logicalRootPath, logicalRoot.name)
+            XCTAssertEqual(mapping.effectiveRootPath, "session-bound")
+            XCTAssertEqual(mapping.worktreeID, "logical-result")
+            XCTAssertFalse(mapping.logicalRootPath.contains(physical.standardizedFileURL.path))
+        }
+
+        let rootLifetimeID = try await store.rootLifetimeIDForTesting(rootID: physicalRoot.id)
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: physicalRoot.id,
+            rootLifetimeID: rootLifetimeID
+        )
+        let markerBeforeTreeValue = await store.codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: rootEpoch
+        )
+        let markerBeforeTree = try XCTUnwrap(markerBeforeTreeValue)
+        XCTAssertEqual(markerBeforeTree.changes.map(\.fileID), [file.id])
+        XCTAssertEqual(markerBeforeTree.changes.map(\.state), [.ready])
+        let storeWorkBeforeTree = await store.codemapPresentationOperationCountsForTesting()
+        let engineWorkBeforeTreeValue = await store.codemapBindingEngineAccountingForTesting(
+            rootID: physicalRoot.id
+        )
+        let engineWorkBeforeTree = try XCTUnwrap(engineWorkBeforeTreeValue)
+
+        let tree = await store.makeCurrentSnapshotFileTreePresentation(
+            selection: StoredSelection(),
+            request: WorkspaceFileTreePresentationRequest(
+                mode: .full,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: true,
+                rootScope: projection.lookupRootScope
+            ),
+            lookupContext: context,
+            profile: .mcpRead
+        )
+
+        XCTAssertTrue(tree.content.contains("App.swift +"), tree.content)
+        XCTAssertTrue(tree.content.contains("(+ denotes code-map available)"), tree.content)
+        XCTAssertTrue(tree.content.contains(logicalRoot.name), tree.content)
+        XCTAssertFalse(tree.content.contains(physical.standardizedFileURL.path), tree.content)
+        XCTAssertFalse(tree.content.contains("physical-secret"), tree.content)
+        let markerAfterTree = await store.codemapMarkerReadinessSnapshotForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(markerAfterTree?.revision, markerBeforeTree.revision)
+        XCTAssertEqual(markerAfterTree?.changes, markerBeforeTree.changes)
+        let storeWorkAfterTree = await store.codemapPresentationOperationCountsForTesting()
+        XCTAssertEqual(storeWorkAfterTree, storeWorkBeforeTree)
+        let engineWorkAfterTree = await store.codemapBindingEngineAccountingForTesting(
+            rootID: physicalRoot.id
+        )
+        XCTAssertEqual(engineWorkAfterTree, engineWorkBeforeTree)
     }
 
     func testNonGitRootReturnsTypedUnavailableWithoutLegacySnapshotBuild() async throws {
@@ -1109,14 +1178,15 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
     private func readyTicket(
         store: WorkspaceFileContextStore,
-        fileID: UUID
+        fileID: UUID,
+        timeout: Duration = .seconds(8)
     ) async throws -> WorkspaceCodemapArtifactDemandTicket {
         var result = await store.requestCodemapArtifact(forFileID: fileID)
         var activeTicket: WorkspaceCodemapArtifactDemandTicket?
         var lastResultDescription = String(describing: result)
-        let timeoutMilliseconds = workspaceCodemapProductionDemandWaitMilliseconds + 5_000
+        let timeoutDescription = String(describing: timeout)
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .milliseconds(timeoutMilliseconds))
+        let deadline = clock.now.advanced(by: timeout)
         while clock.now < deadline {
             lastResultDescription = String(describing: result)
             switch result {
@@ -1147,7 +1217,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
                 throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 2)
             }
         }
-        XCTFail("Timed out waiting for ready codemap demand after \(timeoutMilliseconds)ms; last result: \(lastResultDescription)")
+        XCTFail("Timed out waiting for ready codemap demand after \(timeoutDescription); last result: \(lastResultDescription)")
         throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 3)
     }
 

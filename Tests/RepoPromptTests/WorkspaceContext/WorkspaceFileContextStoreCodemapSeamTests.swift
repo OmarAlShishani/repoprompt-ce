@@ -1762,10 +1762,23 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         )
         XCTAssertEqual(published.outcome, .ready)
 
+        let rendered = try XCTUnwrap(published.entries.first)
+        let markerCleared = await store.clearCodemapMarkerReadinessForTesting(
+            rootEpoch: rendered.entry.rootEpoch,
+            fileID: file.id
+        )
+        XCTAssertTrue(markerCleared)
+        let clearedMarkerSnapshotValue = await store.codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: rendered.entry.rootEpoch
+        )
+        let clearedMarkerSnapshot = try XCTUnwrap(clearedMarkerSnapshotValue)
+        XCTAssertTrue(clearedMarkerSnapshot.changes.isEmpty)
+
         let operationsBefore = await store.codemapPresentationOperationCountsForTesting()
         let engine = try fixture.runtime().bindingEngine()
         let engineBefore = await engine.accounting()
-        let warm = try await coordinator.structurePresentation(
+        let buildCountBefore = fixture.buildCount.value
+        let firstWarm = try await coordinator.structurePresentation(
             seedFileIDs: [file.id],
             direction: nil,
             traversalLimits: traversalLimits,
@@ -1773,33 +1786,53 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             rootScope: .allLoaded,
             logicalRootDisplayNamesByRootID: [loaded.id: "Logical"]
         )
+        let firstMarkerSnapshotValue = await store.codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: rendered.entry.rootEpoch
+        )
+        let firstMarkerSnapshot = try XCTUnwrap(firstMarkerSnapshotValue)
+        let secondWarm = try await coordinator.structurePresentation(
+            seedFileIDs: [file.id],
+            direction: nil,
+            traversalLimits: traversalLimits,
+            outputLimits: outputLimits,
+            rootScope: .allLoaded,
+            logicalRootDisplayNamesByRootID: [loaded.id: "Logical"]
+        )
+        let secondMarkerSnapshotValue = await store.codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: rendered.entry.rootEpoch
+        )
+        let secondMarkerSnapshot = try XCTUnwrap(secondMarkerSnapshotValue)
         let operationsAfter = await store.codemapPresentationOperationCountsForTesting()
         let engineAfter = await engine.accounting()
 
-        XCTAssertEqual(warm.outcome, .ready)
-        XCTAssertEqual(warm.entries.map(\.entry.logicalPath.displayPath), ["Logical/Sources/Feature.swift"])
-        XCTAssertEqual(warm.entries.map(\.entry.text), published.entries.map(\.entry.text))
-        XCTAssertEqual(
-            operationsAfter.structureSeedAdmissionRequests,
-            operationsBefore.structureSeedAdmissionRequests
-        )
-        XCTAssertEqual(
-            operationsAfter.presentationCandidateRequests,
-            operationsBefore.presentationCandidateRequests
-        )
-        XCTAssertEqual(operationsAfter.artifactDemandRequests, operationsBefore.artifactDemandRequests)
-        XCTAssertEqual(
-            operationsAfter.presentationFreezeRequests,
-            operationsBefore.presentationFreezeRequests
-        )
-        XCTAssertEqual(operationsAfter.demandTasksCreated, operationsBefore.demandTasksCreated)
-        XCTAssertEqual(operationsAfter.graphBatchSignals, operationsBefore.graphBatchSignals)
+        for warm in [firstWarm, secondWarm] {
+            XCTAssertEqual(warm.outcome, .ready)
+            XCTAssertEqual(warm.entries.map(\.entry.logicalPath.displayPath), ["Logical/Sources/Feature.swift"])
+            XCTAssertEqual(warm.entries.map(\.entry.text), published.entries.map(\.entry.text))
+        }
+        XCTAssertEqual(firstMarkerSnapshot.revision, clearedMarkerSnapshot.revision + 1)
+        XCTAssertEqual(firstMarkerSnapshot.changes.map(\.fileID), [file.id])
+        XCTAssertEqual(firstMarkerSnapshot.changes.first?.state, .ready)
+        XCTAssertEqual(secondMarkerSnapshot.revision, firstMarkerSnapshot.revision)
+        XCTAssertEqual(secondMarkerSnapshot.changes, firstMarkerSnapshot.changes)
+        XCTAssertEqual(operationsAfter, operationsBefore)
+        XCTAssertEqual(fixture.buildCount.value, buildCountBefore)
+        XCTAssertEqual(engineAfter.counters.capabilityResolutions, engineBefore.counters.capabilityResolutions)
         XCTAssertEqual(engineAfter.counters.classifications, engineBefore.counters.classifications)
         XCTAssertEqual(engineAfter.counters.manifestLoads, engineBefore.counters.manifestLoads)
+        XCTAssertEqual(engineAfter.counters.manifestWrites, engineBefore.counters.manifestWrites)
         XCTAssertEqual(engineAfter.counters.builds, engineBefore.counters.builds)
+        XCTAssertEqual(engineAfter.counters.materializations, engineBefore.counters.materializations)
+        XCTAssertEqual(engineAfter.counters.validatedWorktreeReads, engineBefore.counters.validatedWorktreeReads)
+        XCTAssertEqual(engineAfter.counters.projectionPreloadsStarted, engineBefore.counters.projectionPreloadsStarted)
+        XCTAssertEqual(engineAfter.counters.projectionCatalogPages, engineBefore.counters.projectionCatalogPages)
+        XCTAssertEqual(engineAfter.counters.projectionSegmentsPublished, engineBefore.counters.projectionSegmentsPublished)
+        XCTAssertEqual(engineAfter.counters.projectionBuildsStarted, engineBefore.counters.projectionBuildsStarted)
+        XCTAssertEqual(engineAfter.activeRequestCount, engineBefore.activeRequestCount)
+        XCTAssertEqual(engineAfter.projectionJobCount, engineBefore.projectionJobCount)
         XCTAssertEqual(
             engineAfter.counters.publishedArtifactProjectionCASHits,
-            engineBefore.counters.publishedArtifactProjectionCASHits + 1
+            engineBefore.counters.publishedArtifactProjectionCASHits + 2
         )
     }
 
@@ -2499,6 +2532,15 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         let graphWaiterEntered = await graphGate.waitUntilInvocationCount(1)
         XCTAssertTrue(graphWaiterEntered)
 
+        let markerBeforeTreeValue = await store.codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: ticket.rootEpoch
+        )
+        let markerBeforeTree = try XCTUnwrap(markerBeforeTreeValue)
+        XCTAssertEqual(markerBeforeTree.changes.map(\.fileID), [file.id])
+        let engineBeforeTreeValue = await store.codemapBindingEngineAccountingForTesting(
+            rootID: loaded.id
+        )
+        let engineBeforeTree = try XCTUnwrap(engineBeforeTreeValue)
         let buildCountBeforeTree = fixture.buildCount.value
         let graphFactoryCountBeforeTree = graphProbe.factoryCount
         let countsBeforeTree = await store.codemapPresentationOperationCountsForTesting()
@@ -2521,6 +2563,16 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         XCTAssertTrue(tree.content.contains("Feature.swift +"), tree.content)
         XCTAssertTrue(tree.content.contains("(+ denotes code-map available)"), tree.content)
         XCTAssertEqual(fixture.buildCount.value, buildCountBeforeTree)
+        let markerAfterTree = await store.codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: ticket.rootEpoch
+        )
+        XCTAssertEqual(markerAfterTree?.revision, markerBeforeTree.revision)
+        XCTAssertEqual(markerAfterTree?.changes, markerBeforeTree.changes)
+        let engineAfterTreeValue = await store.codemapBindingEngineAccountingForTesting(
+            rootID: loaded.id
+        )
+        let engineAfterTree = try XCTUnwrap(engineAfterTreeValue)
+        XCTAssertEqual(engineAfterTree, engineBeforeTree)
         let countsAfterTree = await store.codemapPresentationOperationCountsForTesting()
         XCTAssertEqual(countsAfterTree, countsBeforeTree)
         XCTAssertEqual(graphProbe.factoryCount, graphFactoryCountBeforeTree)

@@ -784,7 +784,16 @@ extension AgentModeViewModel {
     ) -> UUID? {
         let rootIndices = rows.indices.filter { rows[$0].depth == 0 }
         guard !rootIndices.isEmpty else { return nil }
-        guard rootIndices.count > 1 else { return rows[rootIndices[0]].tabID }
+        guard rootIndices.count > 1 else {
+            let rootIndex = rootIndices[0]
+            let rootTabID = rows[rootIndex].tabID
+            guard let activeTabID,
+                  let activeIndex = rows.firstIndex(where: { $0.tabID == activeTabID })
+            else {
+                return rootTabID
+            }
+            return activeIndex == rootIndex ? nil : rootTabID
+        }
         guard let activeTabID,
               let activeIndex = rows.firstIndex(where: { $0.tabID == activeTabID })
         else {

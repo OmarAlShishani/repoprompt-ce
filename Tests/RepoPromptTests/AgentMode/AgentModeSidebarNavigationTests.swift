@@ -53,6 +53,23 @@ final class AgentModeSidebarNavigationTests: XCTestCase {
         )
     }
 
+    func testParentCyclingSkipsRedundantSwitchWhenOnlyRootIsAlreadyActive() {
+        let root = UUID()
+        let child = UUID()
+        let rows = [
+            row(tabID: root, depth: 0, title: "Root"),
+            row(tabID: child, depth: 1, title: "Child")
+        ]
+
+        XCTAssertNil(
+            AgentModeViewModel.adjacentParentSidebarSessionTabID(from: root, forward: true, rows: rows)
+        )
+        XCTAssertEqual(
+            AgentModeViewModel.adjacentParentSidebarSessionTabID(from: child, forward: true, rows: rows),
+            root
+        )
+    }
+
     private func row(tabID: UUID, depth: Int, title: String) -> AgentModeViewModel.SidebarSession {
         AgentModeViewModel.SidebarSession(
             id: tabID,

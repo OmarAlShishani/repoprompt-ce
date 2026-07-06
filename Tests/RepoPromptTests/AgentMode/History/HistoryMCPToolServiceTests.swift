@@ -2001,6 +2001,41 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(reply.totalActiveDurationSeconds, 0, "An empty live transcript must contribute zero, not the stale stored primitives")
     }
 
+    func testTime_groupByDay_clipsCrossMidnightTurnToAvoidDoubleCount() async throws {
+        // A turn spanning midnight (day1 23:00 -> day2 01:00) overlaps a turn in the
+        // next day (day2 00:30 -> 00:45). Without clipping, the long turn is fully
+        // attributed to day1 (2h) AND the day2 turn is counted in day2 (15min) -> the
+        // overlap is double-counted and day-total > session-total. Clipping the long
+        // turn to [23:00, midnight] in day1 and [midnight, 01:00] in day2 lets the
+        // overlap merge within day2, so day-total == session-total. Regression for the
+        // day>session discrepancy found in live user testing.
+        let cal = Calendar.current
+        var comps = DateComponents()
+        comps.year = 2026
+        comps.month = 6
+        comps.day = 10
+        comps.hour = 23
+        comps.minute = 0
+        let day1Late = try XCTUnwrap(cal.date(from: comps))
+        let t1 = AgentTranscriptTurn(startedAt: day1Late, completedAt: day1Late.addingTimeInterval(2 * 3600)) // 23:00 -> 01:00 (crosses midnight)
+        let t2 = AgentTranscriptTurn(startedAt: day1Late.addingTimeInterval(1.5 * 3600), completedAt: day1Late.addingTimeInterval(1.75 * 3600)) // 00:30 -> 00:45 (within T1's day2 tail)
+        let record = makeRecord(name: "CrossMidnight")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [t1, t2]) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day", "idle_threshold_minutes": 30],
+            scanner: mockScanner
+        )
+        guard case let .time(reply) = result else {
+            return XCTFail("Expected .time reply, got \(result)")
+        }
+        // Session: T1 covers 2h (T2 within it) = 7200s. Day (clipped): day1 = [23:00, midnight] (1h),
+        // day2 = [midnight, 01:00] ∪ [00:30, 00:45] = 1h. Both 7200s.
+        // Without clipping: day = 2h (T1 in day1) + 15min (T2 in day2) = 8100s.
+        XCTAssertEqual(reply.totalActiveDurationSeconds, 7200, "Clipped day-total must equal the session-total (no overlap double-count)")
+    }
+
     func testTime_groupByDayHonorsLimit() async throws {
         let day1 = Date(timeIntervalSince1970: 1_700_000_000)
         let day2 = day1.addingTimeInterval(86400)

@@ -631,6 +631,32 @@ enum HistoryMCPToolService {
         scanner: HistorySessionScanning
     ) async throws -> HistoryToolReply {
         let calendar = Calendar.current
+
+        /// Group boundary for a date: [start, end) + key. Used to clip each turn's
+        /// interval to the group it falls in, so a turn that crosses a group boundary
+        /// (e.g. spans midnight) contributes only its in-boundary portion to each group
+        /// — preventing an overlap with a turn in the next group from being counted
+        /// twice (the all-turns session path merges it once).
+        func groupBounds(for date: Date) -> (start: Date, end: Date, key: String)? {
+            let dayStart = calendar.startOfDay(for: date)
+            switch groupBy {
+            case "day":
+                let end = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+                return (dayStart, end, iso8601DateOnly.string(from: dayStart))
+            case "week":
+                guard let weekStart = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: dayStart)) else { return nil }
+                let end = calendar.date(byAdding: .day, value: 7, to: weekStart) ?? weekStart
+                return (weekStart, end, iso8601DateOnly.string(from: weekStart))
+            case "month":
+                let comps = calendar.dateComponents([.year, .month], from: dayStart)
+                guard let monthStart = calendar.date(from: comps) else { return nil }
+                let end = calendar.date(byAdding: .month, value: 1, to: monthStart) ?? monthStart
+                return (monthStart, end, String(format: "%d-%02d", comps.year ?? 0, comps.month ?? 0))
+            default:
+                return nil
+            }
+        }
+
         var sessionsScanned = 0
         var scanTruncated = false
 
@@ -677,27 +703,31 @@ enum HistoryMCPToolService {
                 if let dateTo, start > dateTo { continue }
                 let end = turn.completedAt ?? turn.lastActivityAt ?? start
                 guard end >= start else { continue }
-                let dayStart = calendar.startOfDay(for: start)
 
-                let key: String
-                switch groupBy {
-                case "day":
-                    key = iso8601DateOnly.string(from: dayStart)
-                case "week":
-                    guard let weekStart = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: dayStart)) else { continue }
-                    key = iso8601DateOnly.string(from: weekStart)
-                case "month":
-                    let comps = calendar.dateComponents([.year, .month], from: dayStart)
-                    key = String(format: "%d-%02d", comps.year ?? 0, comps.month ?? 0)
-                default: continue
+                // The turn (and its tool calls) belong to the group it started in.
+                guard let startGroup = groupBounds(for: start) else { continue }
+                turnsByKey[startGroup.key, default: 0] += 1
+                if let tc = turn.summary?.toolCount, tc > 0 {
+                    toolCallsByKey[startGroup.key, default: 0] += tc
+                } else {
+                    toolCallsByKey[startGroup.key, default: 0] += turn.responseSpans.reduce(0) { $0 + $1.activities.count(where: { $0.toolExecution != nil }) }
                 }
 
-                intervalsByKey[key, default: []].append((start, end))
-                turnsByKey[key, default: 0] += 1
-                if let tc = turn.summary?.toolCount, tc > 0 {
-                    toolCallsByKey[key, default: 0] += tc
+                // Clip the interval to each group boundary it spans, so a cross-boundary
+                // turn contributes only its in-boundary portion to each group (a point
+                // turn — end == start — is attributed as-is). Without clipping, a turn
+                // that spans a boundary is fully attributed to its start's group and can
+                // overlap a turn in the next group, double-counting the overlap.
+                if end == start {
+                    intervalsByKey[startGroup.key, default: []].append((start, end))
                 } else {
-                    toolCallsByKey[key, default: 0] += turn.responseSpans.reduce(0) { $0 + $1.activities.count(where: { $0.toolExecution != nil }) }
+                    var cursor = start
+                    while cursor < end {
+                        guard let g = groupBounds(for: cursor) else { break }
+                        let clippedEnd = min(end, g.end)
+                        intervalsByKey[g.key, default: []].append((cursor, clippedEnd))
+                        cursor = g.end
+                    }
                 }
             }
 

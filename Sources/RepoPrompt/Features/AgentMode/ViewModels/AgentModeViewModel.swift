@@ -14502,6 +14502,9 @@ final class AgentModeViewModel: ObservableObject {
         if validateSubmissionToken, session?.composerSubmissionToken != target.expectedSubmissionToken {
             return "submission_token_mismatch"
         }
+        if workspaceSwitchInFlight, (target.expectedInitialStartLocation ?? .local) == .local {
+            return "workspace_switch_in_flight"
+        }
 
         switch target.route {
         case .existingAgentSession:

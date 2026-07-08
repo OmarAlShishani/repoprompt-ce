@@ -33,7 +33,7 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
     func testOraclePropagationDoesNotFeedbackLoop() async throws {
         let store = try makeIsolatedStore()
         let windowA = makePromptViewModel(windowID: 1, store: store)
-        _ = makePromptViewModel(windowID: 2, store: store) // an additional observer
+        let windowB = makePromptViewModel(windowID: 2, store: store) // retained additional observer
 
         var storeEmissions = 0
         let cancellable = store.objectWillChange.sink { _ in storeEmissions += 1 }
@@ -45,6 +45,7 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
 
         XCTAssertLessThan(storeEmissions, 5, "cross-window re-sync must not feedback-loop into store writes")
         XCTAssertEqual(windowA.planningModelName, "sonnet")
+        XCTAssertEqual(windowB.planningModelName, "sonnet")
     }
 
     // NOTE: Context Builder agent propagation is exercised compositionally — the store-side

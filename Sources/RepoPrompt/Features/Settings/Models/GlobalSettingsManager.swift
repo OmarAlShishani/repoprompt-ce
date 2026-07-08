@@ -1683,15 +1683,38 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     /// User-initiated recovery when `persistenceBlockReason` is non-nil. The file store backs
-    /// up the offending on-disk file, writes fresh current-schema defaults, and clears the
-    /// block; this method then re-reads those defaults so the store and observers refresh.
-    /// Returns whether the existing file was backed up (the reset always happens).
+    /// up the offending on-disk file, writes the current in-memory settings as a fresh
+    /// current-schema document, and clears the block; this method then re-reads state so the
+    /// store and observers refresh.
+    /// Returns true only when recovery completed successfully.
     @discardableResult
     func recoverBlockedPersistenceAfterBackup() -> Bool {
-        let backedUp = fileStore.performUserInitiatedRecovery()
+        let backedUp = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
         objectWillChange.send()
         load()
         return backedUp
+    }
+
+    /// User-initiated compatible import from a blocked newer/different-schema settings file.
+    /// The file store backs up the original, writes a current-schema document containing only
+    /// CE-known fields, then this store reloads those imported settings.
+    @discardableResult
+    func importBlockedPersistenceAfterBackup() -> Bool {
+        let imported = fileStore.performUserInitiatedCompatibleImport()
+        objectWillChange.send()
+        if imported {
+            load()
+        } else {
+            persistenceBlockReason = fileStore.blockReason
+        }
+        return imported
+    }
+
+    /// Retries writing the current in-memory settings after a transient save failure, without
+    /// backing up or resetting the user's settings. Returns true when persistence is unblocked.
+    @discardableResult
+    func retryBlockedPersistenceSave() -> Bool {
+        save()
     }
 
     @discardableResult
@@ -1704,8 +1727,10 @@ class GlobalSettingsStore: ObservableObject {
             globalDefaults = document.globalDefaults
             scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
+            persistenceBlockReason = fileStore.blockReason
             return true
         } catch {
+            persistenceBlockReason = fileStore.blockReason
             print("⚠️ Failed to reload global settings JSON at \(fileStore.fileURL.path): \(error)")
             return false
         }
@@ -1740,18 +1765,29 @@ class GlobalSettingsStore: ObservableObject {
         return "\(trimmed).snap_to_planning"
     }
 
-    private func save() {
-        let document = GlobalSettingsDocument(
+    private func makeDocument() -> GlobalSettingsDocument {
+        GlobalSettingsDocument(
             copySettings: copySettings,
             chatSettings: chatSettings,
             globalDefaults: globalDefaults,
             scalarPreferences: scalarPreferences
         )
+    }
 
+    @discardableResult
+    private func save() -> Bool {
         do {
-            try fileStore.save(document)
+            try fileStore.save(makeDocument())
+            if persistenceBlockReason != fileStore.blockReason {
+                persistenceBlockReason = fileStore.blockReason
+            }
+            return true
         } catch {
+            if persistenceBlockReason != fileStore.blockReason {
+                persistenceBlockReason = fileStore.blockReason
+            }
             print("⚠️ Failed to save global settings JSON at \(fileStore.fileURL.path): \(error)")
+            return false
         }
     }
 }

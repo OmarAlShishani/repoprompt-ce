@@ -1458,7 +1458,7 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         root = SCRIPT_DIR.parent
         style_script = (SCRIPT_DIR / "swift_style.sh").read_text(encoding="utf-8")
         swiftlint_config = (root / ".swiftlint.yml").read_text(encoding="utf-8")
-        lint_body = style_script.split("run_swiftlint(){", 1)[1].split("\n}\n\ncase", 1)[0]
+        lint_body = style_script.split("run_swiftlint(){", 1)[1].split("\n}", 1)[0]
 
         self.assertIn('local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --quiet --force-exclude)', lint_body)
         self.assertNotIn("SCRIPT_INPUT_FILE", lint_body)

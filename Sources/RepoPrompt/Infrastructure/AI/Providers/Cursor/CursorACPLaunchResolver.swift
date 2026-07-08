@@ -108,7 +108,8 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
             let processConfig = CLIProcessConfiguration(
                 command: launch.command,
                 additionalPaths: [],
-                enableDebugLogging: config.enableDebugLogging
+                enableDebugLogging: config.enableDebugLogging,
+                shellLookupMode: .fallbackOnly
             )
             let result = try await CLIProcessRunner(config: processConfig).run(
                 args: CursorACPLaunchCandidate.cursorAgentACP.helpArguments,

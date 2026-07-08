@@ -82,7 +82,8 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
             let processConfig = CLIProcessConfiguration(
                 command: launch.command,
                 additionalPaths: [],
-                enableDebugLogging: config.enableDebugLogging
+                enableDebugLogging: config.enableDebugLogging,
+                shellLookupMode: .fallbackOnly
             )
             let result = try await CLIProcessRunner(config: processConfig).run(
                 args: Self.helpArguments,
@@ -128,7 +129,8 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
             configuredCommand,
             environment: environment,
             additionalPaths: effectiveHints,
-            preferredBasenames: [configuredCommand]
+            preferredBasenames: [configuredCommand],
+            shellLookupMode: .fallbackOnly
         )
         return try validatedLaunch(
             entryPath: resolved,

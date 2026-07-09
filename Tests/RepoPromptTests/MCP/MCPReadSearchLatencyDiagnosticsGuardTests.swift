@@ -7,6 +7,13 @@
     import XCTest
 
     final class MCPReadSearchLatencyDiagnosticsGuardTests: XCTestCase {
+        private var originalMCPAutoStart: Bool?
+
+        override func setUp() {
+            super.setUp()
+            originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        }
+
         @MainActor
         func testReadFileAutoSelectionProbeRegistryRemovesOnTakeAndReleasesOnCallerCancelExpiryAndContextCancellation() async throws {
             let key = MCPReadFileAutoSelectionCoordinator.ContextKey(
@@ -457,7 +464,13 @@
         private var temporaryRoots = FileSystemTemporaryRoots()
 
         override func tearDown() {
+            if let originalMCPAutoStart {
+                GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
+            }
+            originalMCPAutoStart = nil
             EditFlowPerf.resetDebugCaptureForTesting()
+            MCPApplyEditsRebaseProbeRecorder.resetForTesting()
+            MCPResponseDeliveryTracer.resetDebugEvents()
             temporaryRoots.removeAll()
             super.tearDown()
         }

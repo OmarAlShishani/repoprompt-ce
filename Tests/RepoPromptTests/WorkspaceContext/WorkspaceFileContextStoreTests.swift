@@ -23,6 +23,12 @@ private actor UUIDRecorder {
 }
 
 final class WorkspaceFileContextStoreTests: XCTestCase {
+    override func tearDown() {
+        EditFlowPerf.resetDebugCaptureForTesting()
+        MCPToolWorkCountDiagnostics.resetForTesting()
+        super.tearDown()
+    }
+
     func testRootLoadIndexesFilesFoldersReadsContentAndLooksUpPaths() async throws {
         let rootA = try makeTemporaryRoot(name: "RootA")
         let rootB = try makeTemporaryRoot(name: "RootB")

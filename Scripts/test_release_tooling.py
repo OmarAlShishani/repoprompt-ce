@@ -39,7 +39,7 @@ class ReleaseToolingTests(unittest.TestCase):
         info_plist = plistlib.loads((root / "AppBundle" / "Info.plist.template").read_bytes())
 
         self.assertIn('environment["REPOPROMPT_ENABLE_SENTRY"] == "1"', package_manifest)
-        self.assertIn('repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
+        self.assertIn('repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
         self.assertNotIn("let sentryEnabled = true", package_manifest)
 
         self.assertIn(
@@ -1536,6 +1536,50 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
             publish_staged.index("prepare_dist"),
         )
 
+
+    def test_main_tip_workflow_keeps_tip_separate_and_uses_hardened_smoke(self) -> None:
+        tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
+        tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+
+        self.assertIn("name: Publish Tip", tip_workflow)
+        self.assertIn("group: main-tip-channel", tip_workflow)
+        self.assertIn("should-publish", tip_workflow)
+        self.assertIn("stable-appcast.xml", tip_workflow)
+        self.assertIn('build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"', tip_workflow)
+        self.assertIn("environment: tip-release", tip_workflow)
+        self.assertIn("TIP_UPDATE_REPOSITORY_TOKEN", tip_workflow)
+        self.assertIn("repoprompt-ce-tip-updates", tip_workflow)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"', tip_workflow)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"', tip_workflow)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"', tip_workflow)
+        self.assertIn(
+            'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',
+            tip_workflow,
+        )
+        self.assertIn("Check out approved tip source as data", tip_workflow)
+        self.assertIn("extract_staged_release.py", tip_workflow)
+        self.assertIn("RELEASE_COMMIT: ${{ needs.setup.outputs.commit }}", tip_workflow)
+        self.assertIn("REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source", tip_workflow)
+        self.assertIn("REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}", tip_workflow)
+        self.assertIn("tip-source/dist/*-metadata.json", tip_workflow)
+        self.assertNotIn("stable-release-channel", tip_workflow)
+        self.assertNotIn("release-draft-creation", tip_workflow)
+        self.assertNotIn("PUBLIC_UPDATE_REPOSITORY_TOKEN", tip_workflow)
+
+        self.assertIn('TIP_BUILD_NUMBER="$BUILD_NUMBER.$((TIP_BUILD_SEQUENCE / 100)).$((TIP_BUILD_SEQUENCE % 100))"', tip_script)
+        self.assertLess(
+            tip_script.index('if [[ -z "${TIP_BUILD_NUMBER:-}" ]]'),
+            tip_script.index('git rev-list --count "$TIP_COMMIT"'),
+        )
+        self.assertIn('TIP_TAG="${TIP_TAG:-tip-$TIP_SHORT_SHA}"', tip_script)
+        self.assertIn('TIP_UPDATE_REPOSITORY="${TIP_UPDATE_REPOSITORY:-repoprompt/repoprompt-ce-tip-updates}"', tip_script)
+        self.assertNotIn("--prerelease", tip_script)
+        self.assertIn("--latest", tip_script)
+        self.assertIn("--target main", tip_script)
+        self.assertIn('fail "TIP_UPDATE_REPOSITORY must not target the source or stable update repository"', tip_script)
+        self.assertIn('REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER"', tip_script)
+        self.assertIn("stage|sign|publish-tip", tip_script)
+
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
         package_manifest = (root / "Package.swift").read_text(encoding="utf-8")
@@ -1556,8 +1600,8 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         ).read_text(encoding="utf-8")
 
         self.assertIn('.package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1")', package_manifest)
-        self.assertIn('repoPromptDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))', package_manifest)
-        self.assertIn('repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
+        self.assertIn('repoPromptAppDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))', package_manifest)
+        self.assertIn('repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', release_workflow)
         self.assertIn('name: Sentry-enabled Build', ci_workflow)
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', ci_workflow)
@@ -1813,6 +1857,28 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "RepoPrompt|1.0.0|1\n")
+
+    def test_release_metadata_parser_accepts_three_component_tip_build(self) -> None:
+        root = self.make_metadata_root()
+        metadata_path = root / "version.env"
+        metadata_path.write_text(
+            metadata_path.read_text(encoding="utf-8").replace("BUILD_NUMBER=1", "BUILD_NUMBER=28.7.95"),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "{SCRIPT_DIR / "load_release_metadata.sh"}"; '
+                f'load_release_metadata "{root}"; printf "%s\n" "$BUILD_NUMBER"',
+            ],
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "28.7.95\n")
 
     def test_release_metadata_parser_rejects_shell_execution(self) -> None:
         root = self.make_metadata_root()

@@ -228,6 +228,9 @@ public enum ClaudeCompatibleModelCatalog {
         let displayName: String
         let description: String
         let supportsXHigh: Bool
+        /// Ultracode (XHigh + dynamic workflow orchestration) is an Opus 4.8
+        /// session mode; defaults off so only the Opus 4.8 entries opt in.
+        var supportsUltracode: Bool = false
     }
 
     private static let defaultRaw = "default"
@@ -236,9 +239,11 @@ public enum ClaudeCompatibleModelCatalog {
     private static let opusRaw = "opus"
     private static let fable5Raw = "claude-fable-5"
     private static let opus1mRaw = "opus[1m]"
+    private static let opus48Raw = "claude-opus-4-8"
     private static let opus47Raw = "claude-opus-4-7"
     private static let opus46Raw = "claude-opus-4-6"
     private static let opus45Raw = "claude-opus-4-5"
+    private static let sonnet5Raw = "claude-sonnet-5"
     private static let sonnet46Raw = "claude-sonnet-4-6"
     private static let sonnet45Raw = "claude-sonnet-4-5"
     private static let haiku45Raw = "claude-haiku-4-5"
@@ -254,13 +259,22 @@ public enum ClaudeCompatibleModelCatalog {
             rawValue: opus1mRaw,
             displayName: "Opus Latest (1M)",
             description: "Claude Opus with 1M token context. Best for large codebases and tasks requiring extensive context.",
-            supportsXHigh: true
+            supportsXHigh: true,
+            supportsUltracode: true
         ),
         StaticModel(
             rawValue: opusRaw,
             displayName: "Opus Latest",
             description: "Most capable Opus-tier model. Best for open-ended tasks, architecture, and complex reasoning.",
-            supportsXHigh: true
+            supportsXHigh: true,
+            supportsUltracode: true
+        ),
+        StaticModel(
+            rawValue: opus48Raw,
+            displayName: "Opus 4.8",
+            description: "Pinned Claude Opus 4.8. Opus-tier capability for complex reasoning, architecture, and long-horizon agentic work. Supports the Ultracode effort mode.",
+            supportsXHigh: true,
+            supportsUltracode: true
         ),
         StaticModel(
             rawValue: opus47Raw,
@@ -285,6 +299,12 @@ public enum ClaudeCompatibleModelCatalog {
             displayName: "Sonnet Latest",
             description: "Balanced speed and capability. Good for general coding, analysis, and everyday work.",
             supportsXHigh: false
+        ),
+        StaticModel(
+            rawValue: sonnet5Raw,
+            displayName: "Sonnet 5",
+            description: "Pinned Claude Sonnet 5. Near-Opus quality for coding and agentic work at Sonnet cost.",
+            supportsXHigh: true
         ),
         StaticModel(
             rawValue: sonnet46Raw,
@@ -317,7 +337,8 @@ public enum ClaudeCompatibleModelCatalog {
         ("medium", "Medium"),
         ("high", "High"),
         ("max", "Max"),
-        ("xhigh", "XHigh")
+        ("xhigh", "XHigh"),
+        ("ultracode", "Ultracode")
     ]
 
     public static func snapshot(
@@ -334,7 +355,10 @@ public enum ClaudeCompatibleModelCatalog {
                     description: model.description,
                     isPlaceholderDefault: false,
                     isProviderDefault: false,
-                    supportedEffortLevels: supportedEfforts(supportsXHigh: model.supportsXHigh).map(\.raw)
+                    supportedEffortLevels: supportedEfforts(
+                        supportsXHigh: model.supportsXHigh,
+                        supportsUltracode: model.supportsUltracode
+                    ).map(\.raw)
                 )
             }
             return ClaudeCompatibleModelCatalogSnapshot(
@@ -506,8 +530,17 @@ public enum ClaudeCompatibleModelCatalog {
         }
     }
 
-    private static func supportedEfforts(supportsXHigh: Bool) -> [(raw: String, displayName: String)] {
-        supportsXHigh ? effortOrder : effortOrder.filter { $0.raw != "xhigh" }
+    private static func supportedEfforts(
+        supportsXHigh: Bool,
+        supportsUltracode: Bool = false
+    ) -> [(raw: String, displayName: String)] {
+        effortOrder.filter { entry in
+            switch entry.raw {
+            case "xhigh": supportsXHigh
+            case "ultracode": supportsUltracode
+            default: true
+            }
+        }
     }
 }
 

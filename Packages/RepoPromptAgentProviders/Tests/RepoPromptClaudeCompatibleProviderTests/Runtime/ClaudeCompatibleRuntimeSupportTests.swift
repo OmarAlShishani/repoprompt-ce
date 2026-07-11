@@ -229,6 +229,41 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(custom.options.first?.isProviderDefault, true)
     }
 
+    func testUltracodeEffortIsExposedOnlyForOpus48InClaudeCodeCatalog() {
+        let claude = ClaudeCompatibleModelCatalog.snapshot(pluginID: .claudeCode, includeEffortVariants: false)
+
+        // Opus 4.8 (pinned) and the latest-Opus aliases that resolve to it
+        // expose ultracode alongside xhigh.
+        let opus48 = claude.options.first { $0.rawValue == "claude-opus-4-8" }
+        XCTAssertNotNil(opus48)
+        XCTAssertEqual(opus48?.supportedEffortLevels, ["low", "medium", "high", "max", "xhigh", "ultracode"])
+        XCTAssertTrue(claude.options.first { $0.rawValue == "opus" }?.supportedEffortLevels.contains("ultracode") ?? false)
+        XCTAssertTrue(claude.options.first { $0.rawValue == "opus[1m]" }?.supportedEffortLevels.contains("ultracode") ?? false)
+
+        // Sonnet 5 gains xhigh (unlike older Sonnet) but never ultracode; older
+        // Opus/Sonnet do not expose ultracode either.
+        XCTAssertEqual(
+            claude.options.first { $0.rawValue == "claude-sonnet-5" }?.supportedEffortLevels,
+            ["low", "medium", "high", "max", "xhigh"]
+        )
+        XCTAssertFalse(claude.options.first { $0.rawValue == "claude-sonnet-4-6" }?.supportedEffortLevels.contains("ultracode") ?? true)
+        XCTAssertFalse(claude.options.first { $0.rawValue == "claude-opus-4-7" }?.supportedEffortLevels.contains("ultracode") ?? true)
+
+        // Expanded variants encode `:ultracode` only for the Opus 4.8 aliases.
+        let expanded = ClaudeCompatibleModelCatalog.snapshot(pluginID: .claudeCode)
+        XCTAssertTrue(expanded.options.contains { $0.rawValue == "claude-opus-4-8:ultracode" })
+        XCTAssertTrue(expanded.options.contains { $0.rawValue == "claude-sonnet-5:xhigh" })
+        XCTAssertFalse(expanded.options.contains { $0.rawValue == "claude-sonnet-5:ultracode" })
+        XCTAssertFalse(expanded.options.contains { $0.rawValue == "claude-opus-4-7:ultracode" })
+
+        // The `:ultracode` suffix must be stripped by the model normalizer so the
+        // effective model sent to Claude Code is the bare base (like `:xhigh`);
+        // otherwise the malformed `claude-opus-4-8:ultracode` leaks as the model.
+        XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedRequestedModel("claude-opus-4-8:ultracode"), "claude-opus-4-8")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-4-8:ultracode"), "claude-opus-4-8")
+        XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedRequestedModel("opus[1m]:ultracode"), "opus[1m]")
+    }
+
     func testResolverStripsEncodedEffortAndValidatesXHighAgainstBackendModelID() async throws {
         let config = ClaudeCompatibleBackendConfig(
             id: .glmZAI,

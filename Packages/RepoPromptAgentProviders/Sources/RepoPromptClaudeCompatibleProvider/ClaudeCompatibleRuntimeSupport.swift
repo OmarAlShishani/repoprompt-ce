@@ -283,7 +283,11 @@ public extension ClaudeCompatibleBackendConfig {
 }
 
 struct ClaudeCompatibleEffortEncodedModel: Equatable {
-    private static let knownEffortSuffixes: Set<String> = ["low", "medium", "high", "max", "xhigh", "x-high"]
+    /// Keep in sync with `ClaudeCodeEffortLevel` on the app side. `ultracode`
+    /// encodes as a base:effort suffix (e.g. `claude-opus-4-8:ultracode`) and
+    /// must be stripped here so the effective model sent to Claude Code is the
+    /// bare base model; the effort itself travels separately.
+    private static let knownEffortSuffixes: Set<String> = ["low", "medium", "high", "max", "xhigh", "x-high", "ultracode"]
 
     let baseModel: String?
     let effortRaw: String?

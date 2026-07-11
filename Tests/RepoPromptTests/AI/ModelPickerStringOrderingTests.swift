@@ -94,7 +94,7 @@ final class ModelPickerStringOrderingTests: XCTestCase {
     }
 
     func testAgentModelCatalogCodexMenuUsesStableSemanticOrdering() {
-        let menu = AgentModelCatalog.codexMenu(for: [
+        var options = [
             option(raw: AgentModel.defaultModel.rawValue, displayName: AgentModel.defaultModel.displayName, placeholderDefault: true),
             option(raw: "gpt-5.2-high", displayName: "GPT-5.2 High"),
             option(raw: "gpt-5.4-fast-high", displayName: "GPT-5.4 Fast High"),
@@ -103,10 +103,81 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             option(raw: "gpt-5.5-low", displayName: "GPT-5.5 Low"),
             option(raw: "gpt-5.4-fast-low", displayName: "GPT-5.4 Fast Low"),
             option(raw: "gpt-5.5-Low", displayName: "GPT-5.5 Low")
-        ])
+        ]
+        let commonGPT56Efforts: [CodexDynamicReasoningRecord] = [
+            .init(reasoningEffort: "low", description: "Fast responses with lighter reasoning"),
+            .init(reasoningEffort: "medium", description: "Balanced speed and reasoning depth"),
+            .init(reasoningEffort: "high", description: "Greater reasoning depth"),
+            .init(reasoningEffort: "xhigh", description: "Extra high reasoning depth"),
+            .init(reasoningEffort: "max", description: "Maximum reasoning depth")
+        ]
+        let dynamicModels = [
+            CodexDynamicModelRecord(
+                id: "gpt-5.6-sol",
+                model: "gpt-5.6-sol",
+                displayName: "GPT-5.6-Sol",
+                description: "Latest frontier agentic coding model.",
+                isDefault: true,
+                supportedReasoningEfforts: commonGPT56Efforts + [
+                    .init(reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation")
+                ],
+                defaultReasoningEffort: "medium"
+            ),
+            CodexDynamicModelRecord(
+                id: "gpt-5.6-terra",
+                model: "gpt-5.6-terra",
+                displayName: "GPT-5.6-Terra",
+                description: "Balanced agentic coding model for everyday work.",
+                isDefault: false,
+                supportedReasoningEfforts: commonGPT56Efforts + [
+                    .init(reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation")
+                ],
+                defaultReasoningEffort: "medium"
+            ),
+            CodexDynamicModelRecord(
+                id: "gpt-5.6-luna",
+                model: "gpt-5.6-luna",
+                displayName: "GPT-5.6-Luna",
+                description: "Fast and affordable agentic coding model.",
+                isDefault: false,
+                supportedReasoningEfforts: commonGPT56Efforts,
+                defaultReasoningEffort: "medium"
+            )
+        ]
+        let mappedDynamicOptions = CodexDynamicModelMapper.options(from: dynamicModels)
+        XCTAssertEqual(
+            mappedDynamicOptions.filter { $0.baseID == "gpt-5.6-sol" }.map(\.id),
+            [
+                "gpt-5.6-sol-low", "gpt-5.6-sol-medium", "gpt-5.6-sol-high",
+                "gpt-5.6-sol-xhigh", "gpt-5.6-sol-max", "gpt-5.6-sol-ultra"
+            ]
+        )
+        XCTAssertEqual(
+            mappedDynamicOptions.filter { $0.baseID == "gpt-5.6-terra" }.map(\.id),
+            [
+                "gpt-5.6-terra-low", "gpt-5.6-terra-medium", "gpt-5.6-terra-high",
+                "gpt-5.6-terra-xhigh", "gpt-5.6-terra-max", "gpt-5.6-terra-ultra"
+            ]
+        )
+        XCTAssertEqual(
+            mappedDynamicOptions.filter { $0.baseID == "gpt-5.6-luna" }.map(\.id),
+            [
+                "gpt-5.6-luna-low", "gpt-5.6-luna-medium", "gpt-5.6-luna-high",
+                "gpt-5.6-luna-xhigh", "gpt-5.6-luna-max"
+            ]
+        )
+        XCTAssertEqual(mappedDynamicOptions.first(where: \.isDefault)?.id, "gpt-5.6-sol-medium")
+
+        options.append(contentsOf: mappedDynamicOptions.map {
+            option(raw: $0.id, displayName: $0.displayName, providerDefault: $0.isDefault)
+        })
+        let menu = AgentModelCatalog.codexMenu(for: options)
 
         XCTAssertEqual(menu.defaultOption?.rawValue, AgentModel.defaultModel.rawValue)
         XCTAssertEqual(menu.groups.map(\.baseModelID), [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "gpt-5.5",
             "gpt-5.4",
             "gpt-5.4-fast",
@@ -116,6 +187,27 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             menu.groups.first { $0.baseModelID == "gpt-5.5" }?.options.map(\.rawValue),
             ["gpt-5.5-Low", "gpt-5.5-low", "gpt-5.5-high"]
         )
+        XCTAssertEqual(
+            menu.groups.first { $0.baseModelID == "gpt-5.6-sol" }?.options.map(\.rawValue),
+            [
+                "gpt-5.6-sol-low", "gpt-5.6-sol-medium", "gpt-5.6-sol-high",
+                "gpt-5.6-sol-xhigh", "gpt-5.6-sol-max", "gpt-5.6-sol-ultra"
+            ]
+        )
+
+        let maxSpecifier = CodexModelSpecifier(raw: "gpt-5.6-sol-max")
+        XCTAssertEqual(maxSpecifier.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(maxSpecifier.reasoningEffort, .max)
+        let ultraSpecifier = CodexModelSpecifier(raw: "gpt-5.6-sol-ultra")
+        XCTAssertEqual(ultraSpecifier.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(ultraSpecifier.reasoningEffort, .ultra)
+        let legacyMaxModel = CodexModelSpecifier(raw: "gpt-5.1-codex-max")
+        XCTAssertEqual(legacyMaxModel.baseModel, "gpt-5.1-codex-max")
+        XCTAssertNil(legacyMaxModel.reasoningEffort)
+        let legacyModelAtMaxEffort = CodexModelSpecifier(raw: "gpt-5.1-codex-max-max")
+        XCTAssertEqual(legacyModelAtMaxEffort.baseModel, "gpt-5.1-codex-max")
+        XCTAssertEqual(legacyModelAtMaxEffort.reasoningEffort, .max)
+        XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max"), "GPT-5.1 Codex Max")
     }
 
     @MainActor

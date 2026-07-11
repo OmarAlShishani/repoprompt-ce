@@ -1573,8 +1573,17 @@ public enum AIModel: Equatable, Hashable {
     static func stripCodexReasoningSuffix(from label: String) -> String {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
+        let normalizedLegacyBase = trimmed
+            .lowercased()
+            .replacingOccurrences(of: "cli·", with: "")
+            .replacingOccurrences(of: "[\\s_]+", with: "-", options: .regularExpression)
+        if normalizedLegacyBase == "gpt-5.1-codex-max" {
+            return trimmed
+        }
 
         let suffixes = [
+            "-ultra", " ultra",
+            "-max", " max", "-maximum", " maximum",
             "-xhigh", " xhigh", "-x-high", " x-high",
             "-medium", " medium", "-med", " med",
             "-minimal", " minimal",
@@ -1608,6 +1617,12 @@ public enum AIModel: Equatable, Hashable {
             return versionComparison == .orderedDescending
         }
 
+        let leftTierRank = gpt56TierSortRank(lhs)
+        let rightTierRank = gpt56TierSortRank(rhs)
+        if leftTierRank != rightTierRank {
+            return leftTierRank < rightTierRank
+        }
+
         let leftReasoningRank = reasoningSortRank(lhs.reasoningEffort)
         let rightReasoningRank = reasoningSortRank(rhs.reasoningEffort)
         if leftReasoningRank != rightReasoningRank {
@@ -1625,6 +1640,19 @@ public enum AIModel: Equatable, Hashable {
         }
 
         return ModelPickerStringOrdering.precedes(lhs.tieBreaker, rhs.tieBreaker)
+    }
+
+    private static func gpt56TierSortRank(_ metadata: SemanticSortMetadata) -> Int {
+        guard metadata.family == "gpt", metadata.versionComponents == [5, 6] else {
+            return Int.max
+        }
+        let tier = metadata.suffix.split(separator: "-").first.map(String.init) ?? ""
+        switch tier {
+        case "sol": return 0
+        case "terra": return 1
+        case "luna": return 2
+        default: return Int.max
+        }
     }
 
     private static func semanticSortMetadata(for model: AIModel) -> SemanticSortMetadata {

@@ -5270,11 +5270,12 @@ extension ToolOutputFormatter {
 
                     // Extract base: everything after "agentRaw:" minus the effort suffix
                     let afterColon = modelID.contains(":") ? String(modelID[modelID.index(after: modelID.firstIndex(of: ":")!)...]) : modelID
-                    let effortSuffixes = ["-low", "-medium", "-high", "-xhigh", "-none", "-minimal"]
                     var base = afterColon
-                    for suffix in effortSuffixes where base.lowercased().hasSuffix(suffix) {
-                        base = String(base.dropLast(suffix.count))
-                        break
+                    if let effort {
+                        let suffix = "-\(effort.lowercased())"
+                        if base.lowercased().hasSuffix(suffix) {
+                            base = String(base.dropLast(suffix.count))
+                        }
                     }
                     let agentPrefix = modelID.contains(":") ? String(modelID[...modelID.firstIndex(of: ":")!]) : ""
                     let familyKey = agentPrefix + base
@@ -5292,6 +5293,8 @@ extension ToolOutputFormatter {
                             .replacingOccurrences(of: " Medium", with: "")
                             .replacingOccurrences(of: " High", with: "")
                             .replacingOccurrences(of: " XHigh", with: "")
+                            .replacingOccurrences(of: " Max", with: "")
+                            .replacingOccurrences(of: " Ultra", with: "")
                             .trimmingCharacters(in: .whitespaces)
                         families.append((base: base, name: baseName, efforts: [effort!]))
                     } else {

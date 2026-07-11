@@ -186,8 +186,7 @@ final class AgentCodexModelRegistry {
         let requiredKeyGroups: [[String]] = [
             ["gpt-5.5-low"],
             ["gpt-5.5-medium"],
-            ["gpt-5.5-high"],
-            ["gpt-5.3-codex"]
+            ["gpt-5.5-high"]
         ]
         return requiredKeyGroups.contains { group in
             !group.contains { keys.contains($0) }

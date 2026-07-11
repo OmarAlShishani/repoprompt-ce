@@ -288,6 +288,8 @@ enum CodexDynamicModelMapper {
         if lower == "low" { return "Low" }
         if lower == "medium" { return "Medium" }
         if lower == "high" { return "High" }
+        if lower == "max" { return "Max" }
+        if lower == "ultra" { return "Ultra" }
         if lower == "minimal" { return "Minimal" }
         if lower == "none" { return "None" }
         if isONumberToken(lower) { return lower.uppercased() }
@@ -442,8 +444,7 @@ enum CodexAIModelCatalog {
         let requiredIdentityGroups: [[String]] = [
             ["gpt-5.5-low"],
             ["gpt-5.5-medium"],
-            ["gpt-5.5-high"],
-            ["gpt-5.3-codex", "gpt-5.3-codex-medium"]
+            ["gpt-5.5-high"]
         ]
         return requiredIdentityGroups.contains { group in
             !group.contains { identities.contains($0) }

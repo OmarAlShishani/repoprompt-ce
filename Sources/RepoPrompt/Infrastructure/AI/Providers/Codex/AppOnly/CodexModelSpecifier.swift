@@ -34,17 +34,25 @@ struct CodexModelSpecifier: Equatable {
 
         // First strip any reasoning effort suffix
         let suffixes: [(suffix: String, effort: ReasoningEffort)] = [
+            ("-ultra", .ultra),
             ("-xhigh", .xhigh),
             ("-medium", .medium),
             ("-minimal", .minimal),
             ("-high", .high),
             ("-none", .none),
-            ("-low", .low)
+            ("-low", .low),
+            ("-max", .max)
         ]
         var base = raw
         var effort: ReasoningEffort? = nil
         let lowered = raw.lowercased()
         for (suffix, e) in suffixes where lowered.hasSuffix(suffix) {
+            // `gpt-5.1-codex-max` is a legacy base model slug, not a model with
+            // the newly introduced Max effort. Its explicit effort variants
+            // continue to parse through their trailing `-low`/`-high` suffixes.
+            if e == .max, lowered == "gpt-5.1-codex-max" {
+                continue
+            }
             let candidate = String(raw.dropLast(suffix.count))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !candidate.isEmpty {

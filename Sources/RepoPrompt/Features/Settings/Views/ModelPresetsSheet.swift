@@ -296,6 +296,7 @@ struct ModelPresetEditView: View {
                                 let validation = ModelPreset.validateName(newValue)
                                 nameValidationError = validation.error
                             }
+                            .autoWritingDirection(for: name)
 
                         if let error = nameValidationError {
                             HStack(spacing: 4) {
@@ -340,6 +341,7 @@ struct ModelPresetEditView: View {
                                 RoundedRectangle(cornerRadius: 4)
                                     .stroke(Color.gray.opacity(0.3), lineWidth: 1)
                             )
+                            .autoWritingDirection(for: description)
                     }
                 }
 

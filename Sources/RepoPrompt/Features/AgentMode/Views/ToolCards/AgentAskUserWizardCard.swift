@@ -245,6 +245,7 @@ struct AgentAskUserWizardCard: View {
                 onSubmit()
             }
         }
+        .autoWritingDirection(for: draft.customResponse)
     }
 
     private var actionButtons: some View {

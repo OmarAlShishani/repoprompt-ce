@@ -328,6 +328,7 @@ struct MessageBubble: View {
                                 .frame(minHeight: 60)
                                 .scrollContentBackground(.hidden)
                                 .background(Color.clear)
+                                .autoWritingDirection(for: editedText)
 
                             // Invisible buttons to capture keyboard shortcuts
                             Button("") {
@@ -854,6 +855,7 @@ private struct MessageBubbleContent: View {
         Text(message.content)
             .font(fontPreset.font)
             .textSelection(.enabled)
+            .autoWritingDirection(for: message.content)
             .allowsHitTesting(isLatestMessage && message.isFinalized)
     }
 
@@ -874,6 +876,7 @@ private struct MessageBubbleContent: View {
                     .textSelection(.enabled)
                     .allowsHitTesting(message.isFinalized)
                     .lineLimit(10)
+                    .autoWritingDirection(for: assistantPreview)
             } else {
                 markdownAssistantContent
             }

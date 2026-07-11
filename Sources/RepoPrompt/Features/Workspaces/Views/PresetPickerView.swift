@@ -37,6 +37,7 @@ struct PresetPickerView: View {
                 HStack {
                     TextField("Preset name", text: $newPresetName)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .autoWritingDirection(for: newPresetName)
 
                     Button(action: {
                         let finalName = newPresetName.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -649,6 +649,9 @@ struct MarkdownTextView: View, Equatable {
         if let forceTextColor = signature.forceTextColor {
             compiled = applyTextColor(compiled, color: forceTextColor)
         }
+        // WhatsApp-style auto RTL: right-align paragraphs containing right-to-left text.
+        // Left-to-right paragraphs and fenced code blocks are left untouched.
+        compiled = compiled.applyingAutoParagraphWritingDirection()
 
         guard !Task.isCancelled else { return }
         guard latestRequestID == requestID else { return }

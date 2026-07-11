@@ -53,7 +53,7 @@ private struct MeasuredPlainTextView: View {
         NSAttributedString(string: text, attributes: [
             .font: font,
             .foregroundColor: NSColor.textColor
-        ])
+        ]).applyingAutoParagraphWritingDirection()
     }
 
     var body: some View {
@@ -125,6 +125,7 @@ struct CollapsibleUserMessage: View {
                 Text(displayText)
                     .font(fontPreset.font)
                     .textSelection(.enabled)
+                    .autoWritingDirection(for: displayText)
                     .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
             } else {
                 MeasuredPlainTextView(

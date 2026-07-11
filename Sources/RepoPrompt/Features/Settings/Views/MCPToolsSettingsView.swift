@@ -136,6 +136,7 @@ struct MCPToolsSettingsView: View {
             TextField("Search tools...", text: $searchText)
                 .textFieldStyle(PlainTextFieldStyle())
                 .font(fontPreset.font)
+                .autoWritingDirection(for: searchText)
             if !searchText.isEmpty {
                 Button(action: { searchText = "" }) {
                     Image(systemName: "xmark.circle.fill")

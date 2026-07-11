@@ -202,6 +202,7 @@ struct SettingsView: View {
                     }
                     return .ignored
                 }
+                .autoWritingDirection(for: searchText)
             if !searchText.isEmpty {
                 Button(action: { searchText = "" }) {
                     Image(systemName: "xmark.circle.fill")

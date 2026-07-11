@@ -448,6 +448,7 @@ struct AgentApplyEditsReviewCard: View {
                             onReject(trimmedReason)
                         }
                     }
+                    .autoWritingDirection(for: rejectReason)
 
                 if !rejectReason.isEmpty {
                     Button {

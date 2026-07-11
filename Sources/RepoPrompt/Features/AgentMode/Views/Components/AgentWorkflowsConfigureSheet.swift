@@ -28,6 +28,7 @@ struct AgentWorkflowsConfigureSheet: View {
         .frame(width: 460, height: 520)
         .alert("New Workflow", isPresented: $showNewWorkflowPrompt) {
             TextField("Workflow name", text: $newWorkflowName)
+                .autoWritingDirection(for: newWorkflowName)
             Button("Create") { createNewWorkflow() }
             Button("Cancel", role: .cancel) { newWorkflowName = "" }
         } message: {
@@ -35,6 +36,7 @@ struct AgentWorkflowsConfigureSheet: View {
         }
         .alert("Clone Built-in Workflow", isPresented: $showClonePickerPrompt) {
             TextField("New name", text: $newWorkflowName)
+                .autoWritingDirection(for: newWorkflowName)
             Button("Clone") { cloneWorkflow() }
             Button("Cancel", role: .cancel) { newWorkflowName = ""
                 cloneSource = nil

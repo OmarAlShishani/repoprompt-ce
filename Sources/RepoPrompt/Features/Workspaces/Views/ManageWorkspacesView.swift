@@ -420,6 +420,7 @@ struct ManageWorkspacesView: View {
                         .foregroundColor(.secondary)
                     TextField("Search workspaces...", text: $searchText)
                         .textFieldStyle(PlainTextFieldStyle())
+                        .autoWritingDirection(for: searchText)
                     if !searchText.isEmpty {
                         Button(action: { searchText = "" }) {
                             Image(systemName: "xmark.circle.fill")
@@ -507,6 +508,7 @@ struct ManageWorkspacesView: View {
                 )
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .frame(minWidth: fontPreset.scaledMetric(150))
+                .autoWritingDirection(for: workspaceManager.creationDraft.name)
 
                 Button(action: pickFoldersForNewWorkspace) {
                     HStack {
@@ -584,6 +586,7 @@ struct ManageWorkspacesView: View {
             TextField("New name", text: $renameField)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .frame(minWidth: fontPreset.scaledMetric(200))
+                .autoWritingDirection(for: renameField)
 
             HStack {
                 Spacer()

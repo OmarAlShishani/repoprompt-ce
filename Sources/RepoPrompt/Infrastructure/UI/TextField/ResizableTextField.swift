@@ -351,6 +351,7 @@ struct CustomTextField: NSViewRepresentable {
             suggestionsProvider: features.slashSkillSuggestionsProvider
         )
         textView.string = text
+        context.coordinator.applyAutoWritingDirection(to: textView)
         textView.undoManager?.removeAllActions()
 
         // Initial height calculation
@@ -404,6 +405,7 @@ struct CustomTextField: NSViewRepresentable {
             let maxLenFromLoc = max(0, nsLen - clampedLoc)
             let clampedLen = min(max(prevSel.length, 0), maxLenFromLoc)
             textView.setSelectedRange(NSRange(location: clampedLoc, length: clampedLen))
+            context.coordinator.applyAutoWritingDirection(to: textView)
 
             context.coordinator.internalUpdateInProgress = false
             appliedProgrammaticTextChange = true
@@ -446,10 +448,17 @@ struct CustomTextField: NSViewRepresentable {
             self.parent = parent
         }
 
+        /// WhatsApp-style auto RTL: give each composer line that contains RTL text a matching
+        /// base writing direction and alignment.
+        func applyAutoWritingDirection(to textView: NSTextView) {
+            textView.applyAutoParagraphWritingDirection()
+        }
+
         func textDidChange(_ notification: Notification) {
             if internalUpdateInProgress { return }
             guard isActive, let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
+            applyAutoWritingDirection(to: textView)
 
             updateHeightIfNeeded(textView: textView)
             scheduleFileTagSuggestionsRefresh(for: textView, immediate: false)

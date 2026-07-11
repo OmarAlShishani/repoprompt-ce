@@ -26,6 +26,7 @@ struct PresetCreationSheet: View {
                     // Trigger save on Return/Enter, mimicking clicking the Save button
                     save()
                 }
+                .autoWritingDirection(for: name)
 
             HStack {
                 Spacer()

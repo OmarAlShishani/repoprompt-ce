@@ -201,8 +201,10 @@ extension OpenRouterSettingsView {
             HStack {
                 TextField("Header Name", text: $newHeaderKey)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .autoWritingDirection(for: newHeaderKey)
                 TextField("Value", text: $newHeaderValue)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .autoWritingDirection(for: newHeaderValue)
                 Button(action: addCustomHeader) {
                     Image(systemName: "plus.circle")
                 }
@@ -249,6 +251,7 @@ extension OpenRouterSettingsView {
             HStack {
                 TextField("Search fetched models...", text: $viewModel.openRouterModelsSearchText)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .autoWritingDirection(for: viewModel.openRouterModelsSearchText)
 
                 Button(action: {
                     Task {

@@ -182,6 +182,7 @@ struct ChatPresetsSettingsView: View {
                     TextField("Search presets", text: $searchText)
                         .textFieldStyle(PlainTextFieldStyle())
                         .font(.body)
+                        .autoWritingDirection(for: searchText)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
@@ -727,6 +728,7 @@ private struct ChatPresetEditView: View {
                                 } else {
                                     TextField("Preset Name", text: $name)
                                         .textFieldStyle(.roundedBorder)
+                                        .autoWritingDirection(for: name)
                                 }
                             }
                             GridRow {
@@ -751,6 +753,7 @@ private struct ChatPresetEditView: View {
                                         .opacity(0)
                                         .focused($iconFieldFocused)
                                         .disabled(isOverviewDisabled || isReadOnly)
+                                        .autoWritingDirection(for: icon)
 
                                     if !(isOverviewDisabled || isReadOnly) {
                                         Button("Choose Emoji") {
@@ -782,6 +785,7 @@ private struct ChatPresetEditView: View {
                                     TextField("Optional description", text: $descriptionText, axis: .vertical)
                                         .lineLimit(2 ... 4)
                                         .textFieldStyle(.roundedBorder)
+                                        .autoWritingDirection(for: descriptionText)
                                 }
                             }
                         }

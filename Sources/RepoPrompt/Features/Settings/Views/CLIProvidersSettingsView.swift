@@ -1017,6 +1017,7 @@ struct CLIProvidersSettingsView: View {
                     }
                 ))
                 .textFieldStyle(RoundedBorderTextFieldStyle())
+                .autoWritingDirection(for: viewModel.compatibleBackendConfig(for: .custom).displayName)
             }
 
             // Base URL
@@ -1033,6 +1034,7 @@ struct CLIProvidersSettingsView: View {
                     }
                 ))
                 .textFieldStyle(RoundedBorderTextFieldStyle())
+                .autoWritingDirection(for: viewModel.compatibleBackendConfig(for: .custom).baseURL)
             }
 
             // Auth style picker
@@ -1321,6 +1323,7 @@ struct CLIProvidersSettingsView: View {
                 .foregroundColor(.primary)
             TextField(placeholder, text: value)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
+                .autoWritingDirection(for: value.wrappedValue)
             if isEmpty {
                 Image(systemName: "exclamationmark.circle.fill")
                     .foregroundColor(.red)
@@ -1393,6 +1396,7 @@ struct CLIProvidersSettingsView: View {
                             }
                         ))
                         .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .autoWritingDirection(for: viewModel.compatibleBackendConfig(for: backendID).displayName)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
@@ -1408,6 +1412,7 @@ struct CLIProvidersSettingsView: View {
                             }
                         ))
                         .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .autoWritingDirection(for: viewModel.compatibleBackendConfig(for: backendID).baseURL)
                     }
 
                     HStack(spacing: 8) {

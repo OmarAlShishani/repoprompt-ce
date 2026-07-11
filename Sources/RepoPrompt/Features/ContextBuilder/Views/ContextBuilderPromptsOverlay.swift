@@ -532,6 +532,7 @@ struct ContextBuilderPromptEditor: View {
             TextField("Prompt Title", text: $title)
                 .font(fontPreset.font)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
+                .autoWritingDirection(for: title)
 
             TextKitView(text: $content, externalUpdateTick: externalUpdateTick)
                 .frame(height: 250)

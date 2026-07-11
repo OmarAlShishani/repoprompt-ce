@@ -85,6 +85,7 @@ struct TextKitView: NSViewRepresentable {
 
             internalText = newText
             parent.text = newText
+            parent.applyAutoWritingDirection(to: textView)
         }
 
         func textDidBeginEditing(_ notification: Notification) {
@@ -153,6 +154,12 @@ struct TextKitView: NSViewRepresentable {
         Coordinator(self)
     }
 
+    /// WhatsApp-style auto RTL for prose. Monospaced (code/log) content stays left-to-right.
+    fileprivate func applyAutoWritingDirection(to textView: NSTextView) {
+        guard !useMonospacedFont else { return }
+        textView.applyAutoParagraphWritingDirection()
+    }
+
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSTextView.scrollableTextView()
         guard let textView = scrollView.documentView as? NSTextView else {
@@ -183,6 +190,7 @@ struct TextKitView: NSViewRepresentable {
         textView.textContainerInset = NSSize(width: 8, height: 8)
         textView.delegate = coordinator
         textView.string = coordinator.internalText
+        applyAutoWritingDirection(to: textView)
 
         textView.isVerticallyResizable = true
         // Wrapping / horizontal behaviour
@@ -299,6 +307,7 @@ struct TextKitView: NSViewRepresentable {
                 let previousSelection = textView.clampedSelectedRange()
                 textView.string = text
                 textView.setSelectedRange(previousSelection.clamped(to: textView.currentStringLength()))
+                applyAutoWritingDirection(to: textView)
 
                 // Only auto-scroll when not forcing or not focused
                 let nsLen = textView.currentStringLength()

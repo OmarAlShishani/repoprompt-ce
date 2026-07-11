@@ -58,12 +58,14 @@ struct CustomProviderSettingsView: View {
 
             TextField("Provider URL", text: $viewModel.customProviderURL)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
+                .autoWritingDirection(for: viewModel.customProviderURL)
 
             SecureField("API Key", text: $viewModel.customProviderApiKey)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
 
             TextField("Optional: Preferred Model ID (leave blank to auto-detect)", text: $viewModel.customProviderUserModel)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
+                .autoWritingDirection(for: viewModel.customProviderUserModel)
             Text("Enter a model ID to use directly, or leave blank to auto-detect from the provider.").font(.caption).foregroundColor(.secondary)
 
             HStack {
@@ -71,6 +73,7 @@ struct CustomProviderSettingsView: View {
                 TextField("e.g., 8192", text: $viewModel.customProviderMaxTokensString)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                     .frame(maxWidth: 100)
+                    .autoWritingDirection(for: viewModel.customProviderMaxTokensString)
                 Button(action: {
                     Task {
                         do {
@@ -152,6 +155,7 @@ struct CustomProviderSettingsView: View {
             TextField("Search models...", text: $searchText)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .padding(.bottom, 8)
+                .autoWritingDirection(for: searchText)
 
             if viewModel.availableCustomModels.isEmpty {
                 Text("No models available")

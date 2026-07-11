@@ -194,6 +194,7 @@ struct ManagePresetsView: View {
             TextField("New name", text: $renameField)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .frame(minWidth: fontPreset.scaledMetric(200))
+                .autoWritingDirection(for: renameField)
 
             HStack {
                 Spacer()

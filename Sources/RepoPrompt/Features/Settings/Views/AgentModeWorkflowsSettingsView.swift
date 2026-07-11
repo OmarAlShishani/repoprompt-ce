@@ -46,6 +46,7 @@ struct AgentModeWorkflowsSettingsView: View {
         }
         .alert("New Custom Workflow", isPresented: $showNewWorkflowPrompt) {
             TextField("Workflow name", text: $workflowNameDraft)
+                .autoWritingDirection(for: workflowNameDraft)
             Button("Create") { createNewWorkflow() }
             Button("Cancel", role: .cancel) { workflowNameDraft = "" }
         } message: {
@@ -53,6 +54,7 @@ struct AgentModeWorkflowsSettingsView: View {
         }
         .alert("Clone Built-in Workflow", isPresented: $showCloneWorkflowPrompt) {
             TextField("New name", text: $workflowNameDraft)
+                .autoWritingDirection(for: workflowNameDraft)
             Button("Clone") { cloneWorkflow() }
             Button("Cancel", role: .cancel) {
                 workflowNameDraft = ""

@@ -774,6 +774,7 @@ struct AgentMessageBubble: View {
                     Text(item.text)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                         .foregroundColor(.secondary)
+                        .autoWritingDirection(for: item.text)
 
                     Spacer()
 
@@ -830,6 +831,7 @@ struct AgentMessageBubble: View {
                         Text(item.text)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
                             .foregroundColor(.primary)
+                            .autoWritingDirection(for: item.text)
                     }
 
                     if shouldShowCodexManagedLoginAction {
@@ -1476,6 +1478,7 @@ private struct CollapsibleAssistantTranscriptContent: View {
                     .foregroundColor(.primary)
                     .textSelection(.enabled)
                     .lineLimit(previewLineCount)
+                    .autoWritingDirection(for: summary.previewText)
             }
 
             if summary.needsCollapse {

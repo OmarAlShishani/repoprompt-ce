@@ -27,6 +27,7 @@ struct WorkspaceSetupView: View {
             TextField("Workspace Name", text: $workspaceManager.creationDraft.name)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .padding(.horizontal)
+                .autoWritingDirection(for: workspaceManager.creationDraft.name)
 
             // Show the selected repo paths from the manager’s creationDraft
             List {

@@ -34,6 +34,7 @@ struct AgentSessionRenameSheet: View {
                             onConfirm(trimmedText)
                         }
                     }
+                    .autoWritingDirection(for: renameText)
 
                 if !renameText.isEmpty {
                     Button {

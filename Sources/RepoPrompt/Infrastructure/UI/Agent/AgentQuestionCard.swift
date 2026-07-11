@@ -49,6 +49,7 @@ struct AgentQuestionCard: View {
                     .textFieldStyle(.roundedBorder)
                     .focused($focusedField, equals: .other)
                     .onSubmit { submitIfValid() }
+                    .autoWritingDirection(for: responseText)
             }
 
             // Action buttons
@@ -190,6 +191,7 @@ struct AgentQuestionCard: View {
                 .font(.callout)
                 .focused($focusedField, equals: .other)
                 .onSubmit { submitIfValid() }
+                .autoWritingDirection(for: responseText)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -431,6 +433,7 @@ struct AgentRequestUserInputCard: View {
                 TextField(notePlaceholder(for: question), text: noteBinding(for: question), axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(2 ... 6)
+                    .autoWritingDirection(for: noteBinding(for: question).wrappedValue)
             }
         }
         .padding(12)

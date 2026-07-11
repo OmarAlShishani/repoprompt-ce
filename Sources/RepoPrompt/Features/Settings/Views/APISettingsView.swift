@@ -394,6 +394,7 @@ struct APISettingsView: View {
                 if isURL {
                     TextField("Enter URL", text: key)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .autoWritingDirection(for: key.wrappedValue)
                 } else {
                     SecureField("Enter key", text: key)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -545,6 +546,7 @@ struct APISettingsView: View {
                     HStack {
                         TextField("Enter model name", text: customModel)
                             .textFieldStyle(RoundedBorderTextFieldStyle())
+                            .autoWritingDirection(for: customModel.wrappedValue)
 
                         Button(action: {
                             switch title {
@@ -635,6 +637,7 @@ struct APISettingsView: View {
                         .frame(width: 120, alignment: .leading)
                     TextField("https://example.openai.azure.com", text: $viewModel.azureBaseURL)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .autoWritingDirection(for: viewModel.azureBaseURL)
                 }
 
                 HStack {
@@ -642,6 +645,7 @@ struct APISettingsView: View {
                         .frame(width: 120, alignment: .leading)
                     TextField("API Version", text: $viewModel.azureApiVersion)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .autoWritingDirection(for: viewModel.azureApiVersion)
                 }
 
                 HStack {
@@ -714,6 +718,7 @@ struct APISettingsView: View {
                 HStack {
                     TextField("Enter URL", text: $viewModel.ollamaURL)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
+                        .autoWritingDirection(for: viewModel.ollamaURL)
 
                     if isLoadingOllama {
                         ProgressView()

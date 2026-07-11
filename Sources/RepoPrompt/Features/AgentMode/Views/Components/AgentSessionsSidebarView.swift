@@ -226,6 +226,7 @@ struct AgentModeSessionsSidebarView: View {
                     }
                     return .ignored
                 }
+                .autoWritingDirection(for: agentModeVM.sidebarSearchBinding().wrappedValue)
 
             if !sidebarUI.snapshot.searchText.isEmpty {
                 Button(action: { agentModeVM.clearSessionSidebarSearchText() }) {

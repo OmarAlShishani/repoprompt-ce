@@ -345,6 +345,7 @@ struct AgentExportCard: View {
                 .font(.system(size: 11))
                 .scrollContentBackground(.hidden)
                 .frame(minHeight: 150, maxHeight: 150)
+                .autoWritingDirection(for: promptManager.promptText)
 
             if promptManager.promptText.isEmpty {
                 Text(Self.placeholderText)

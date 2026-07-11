@@ -62,8 +62,10 @@ enum AgentModel: String, CaseIterable, Codable {
 
     // Claude Code full model IDs (static known versions; no dynamic probing)
     case claudeFable5 = "claude-fable-5"
+    case claudeSonnet5 = "claude-sonnet-5"
     case claudeSonnet46 = "claude-sonnet-4-6"
     case claudeSonnet45 = "claude-sonnet-4-5"
+    case claudeOpus48 = "claude-opus-4-8"
     case claudeOpus47 = "claude-opus-4-7"
     case claudeOpus46 = "claude-opus-4-6"
     case claudeOpus45 = "claude-opus-4-5"
@@ -115,8 +117,10 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeHaiku: "Haiku Latest"
         case .claudeOpus1m: "Opus Latest (1M)"
         case .claudeFable5: "Fable 5"
+        case .claudeSonnet5: "Sonnet 5"
         case .claudeSonnet46: "Sonnet 4.6"
         case .claudeSonnet45: "Sonnet 4.5"
+        case .claudeOpus48: "Opus 4.8"
         case .claudeOpus47: "Opus 4.7"
         case .claudeOpus46: "Opus 4.6"
         case .claudeOpus45: "Opus 4.5"
@@ -162,8 +166,10 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeHaiku: "Fast and lightweight. Good for exploration, quick edits, and mapping codebases."
         case .claudeOpus1m: "Claude Opus with 1M token context. Best for large codebases and tasks requiring extensive context."
         case .claudeFable5: "Claude Fable 5. Anthropic's most capable widely released model for demanding reasoning and long-horizon agentic work."
+        case .claudeSonnet5: "Pinned Claude Sonnet 5. Near-Opus quality for coding and agentic work at Sonnet cost."
         case .claudeSonnet46: "Pinned Claude Sonnet 4.6. Balanced speed and capability for everyday engineering."
         case .claudeSonnet45: "Pinned Claude Sonnet 4.5. Balanced speed and capability for everyday engineering."
+        case .claudeOpus48: "Pinned Claude Opus 4.8. Most capable Opus-tier model for complex reasoning, architecture, and long-horizon agentic work. Supports the Ultracode effort mode."
         case .claudeOpus47: "Pinned Claude Opus 4.7. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus46: "Pinned Claude Opus 4.6. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus45: "Pinned Claude Opus 4.5. Opus-tier capability for complex reasoning and architecture."
@@ -217,8 +223,8 @@ enum AgentModel: String, CaseIterable, Codable {
                 .defaultModel,
                 .claudeFable5,
                 .claudeOpus1m,
-                .claudeOpus, .claudeOpus47, .claudeOpus46, .claudeOpus45,
-                .claudeSonnet, .claudeSonnet46, .claudeSonnet45,
+                .claudeOpus, .claudeOpus48, .claudeOpus47, .claudeOpus46, .claudeOpus45,
+                .claudeSonnet, .claudeSonnet5, .claudeSonnet46, .claudeSonnet45,
                 .claudeHaiku, .claudeHaiku45
             ]
         case .openCode:
@@ -437,6 +443,8 @@ enum AgentModel: String, CaseIterable, Codable {
             [.complex, .engineering, .pair]
         case .claudeFable5:
             [.complex, .engineering, .pair, .extendedContext]
+        case .claudeOpus48:
+            [.complex, .engineering, .pair]
         case .claudeOpus:
             [.complex, .engineering, .pair]
         default:
@@ -451,8 +459,8 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeFable5, .claudeOpus1m, .glm52_1m:
             1_000_000
         case .claudeSonnet, .claudeOpus, .claudeHaiku,
-             .claudeSonnet46, .claudeSonnet45,
-             .claudeOpus47, .claudeOpus46, .claudeOpus45,
+             .claudeSonnet5, .claudeSonnet46, .claudeSonnet45,
+             .claudeOpus48, .claudeOpus47, .claudeOpus46, .claudeOpus45,
              .claudeHaiku45:
             200_000
         default:

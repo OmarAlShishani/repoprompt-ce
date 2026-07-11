@@ -200,21 +200,37 @@ enum ClaudeCompatibleModelCatalogAdapter {
         if let agentKind, compatibleBackendModelBehavior(for: agentKind) == .noModel {
             return false
         }
-        guard effort == .xhigh else { return true }
-        if let agentKind, compatibleBackendID(for: agentKind) != nil {
-            guard let baseModelRaw,
-                  let config = compatibleBackendConfig(for: agentKind),
-                  let canonicalBase = canonicalCompatibleBackendBaseRaw(baseModelRaw, for: agentKind)
-            else {
+        switch effort {
+        case .low, .medium, .high, .max:
+            return true
+        case .xhigh:
+            if let agentKind, compatibleBackendID(for: agentKind) != nil {
+                guard let baseModelRaw,
+                      let config = compatibleBackendConfig(for: agentKind),
+                      let canonicalBase = canonicalCompatibleBackendBaseRaw(baseModelRaw, for: agentKind)
+                else {
+                    return false
+                }
+                let backendModelID = directBackendModelID(forCanonicalBaseRaw: canonicalBase, agentKind: agentKind)
+                    ?? backendModelID(forCanonicalSlotRaw: canonicalBase, config: config)
+                return ClaudeCompatibleProviderRuntimeBridge.supportsGLMXHighEffort(backendModelID: backendModelID)
+            }
+            guard let baseModelRaw else { return false }
+            let normalized = baseModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return claudeXHighEligibleBaseRaws.contains(normalized)
+        case .ultracode:
+            // Ultracode (XHigh reasoning + dynamic workflow orchestration) is an
+            // Anthropic Opus 4.8 session mode. It is never offered on
+            // Claude-compatible backends (GLM/Kimi/custom), which cannot honor it,
+            // and only on the Opus 4.8 base model (or the latest-Opus aliases that
+            // resolve to it).
+            if let agentKind, compatibleBackendID(for: agentKind) != nil {
                 return false
             }
-            let backendModelID = directBackendModelID(forCanonicalBaseRaw: canonicalBase, agentKind: agentKind)
-                ?? backendModelID(forCanonicalSlotRaw: canonicalBase, config: config)
-            return ClaudeCompatibleProviderRuntimeBridge.supportsGLMXHighEffort(backendModelID: backendModelID)
+            guard let baseModelRaw else { return false }
+            let normalized = baseModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return claudeUltracodeEligibleBaseRaws.contains(normalized)
         }
-        guard let baseModelRaw else { return false }
-        let normalized = baseModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return claudeXHighEligibleBaseRaws.contains(normalized)
     }
 
     private static func pluginCatalogSnapshot(
@@ -387,8 +403,19 @@ enum ClaudeCompatibleModelCatalogAdapter {
         AgentModel.claudeFable5.rawValue.lowercased(),
         AgentModel.claudeOpus.rawValue.lowercased(),
         AgentModel.claudeOpus1m.rawValue.lowercased(),
+        AgentModel.claudeOpus48.rawValue.lowercased(),
         AgentModel.claudeOpus47.rawValue.lowercased(),
         AgentModel.claudeOpus46.rawValue.lowercased(),
-        AgentModel.claudeOpus45.rawValue.lowercased()
+        AgentModel.claudeOpus45.rawValue.lowercased(),
+        AgentModel.claudeSonnet5.rawValue.lowercased()
+    ]
+
+    /// Base model raw values (lowercased) that support the Ultracode session
+    /// mode. Ultracode is Opus 4.8 only, so this is the pinned `claude-opus-4-8`
+    /// raw plus the latest-Opus aliases that currently resolve to it.
+    private static let claudeUltracodeEligibleBaseRaws: Set<String> = [
+        AgentModel.claudeOpus48.rawValue.lowercased(),
+        AgentModel.claudeOpus.rawValue.lowercased(),
+        AgentModel.claudeOpus1m.rawValue.lowercased()
     ]
 }

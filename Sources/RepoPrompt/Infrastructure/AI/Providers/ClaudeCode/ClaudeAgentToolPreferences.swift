@@ -495,6 +495,15 @@ enum ClaudeCodeEffortLevel: String, CaseIterable {
     // Ordered highest → lowest so UI pickers and variant menus list the
     // strongest effort first. `allCases` drives both `AgentInputBar`'s Claude
     // effort picker and `claudeEffortSortRank` in `AgentModelCatalog`.
+    //
+    // `ultracode` is Claude Code's session mode that pins reasoning to XHigh
+    // and turns on dynamic workflow orchestration. It is offered only on
+    // Opus 4.8 (see `ClaudeCompatibleModelCatalogAdapter.claudeEffort`). The
+    // interactive Claude Code process understands it through a control message
+    // (mirroring the `/effort ultracode` command) and silently falls back to
+    // `high` on older models. Environment variables and config files do not
+    // accept `ultracode`, so `envValue` maps it to its `xhigh` reasoning tier.
+    case ultracode
     case max
     case xhigh
     case high
@@ -517,6 +526,8 @@ enum ClaudeCodeEffortLevel: String, CaseIterable {
             return .max
         case "xhigh", "x-high":
             return .xhigh
+        case "ultracode", "ultra-code":
+            return .ultracode
         default:
             return nil
         }
@@ -529,11 +540,21 @@ enum ClaudeCodeEffortLevel: String, CaseIterable {
         case .high: "High"
         case .max: "Max"
         case .xhigh: "XHigh"
+        case .ultracode: "Ultracode"
         }
     }
 
     /// Value passed to the `CLAUDE_CODE_EFFORT_LEVEL` environment variable.
+    ///
+    /// Every level maps to its raw value verbatim except `ultracode`, which the
+    /// environment variable and config files do not accept (only the
+    /// interactive `/effort` command does). For the environment path it
+    /// therefore resolves to its underlying reasoning tier, `xhigh`; the
+    /// interactive control-message path keeps the raw `ultracode` value.
     var envValue: String {
-        rawValue
+        switch self {
+        case .ultracode: "xhigh"
+        default: rawValue
+        }
     }
 }

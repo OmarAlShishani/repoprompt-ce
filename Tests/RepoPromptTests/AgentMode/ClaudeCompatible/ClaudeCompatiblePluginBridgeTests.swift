@@ -12,6 +12,50 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(imports, [expected])
     }
 
+    func testUltracodeEffortMapsToXHighEnvValueAndGatesToOpus48() {
+        // Env-var path: `ultracode` is not accepted by CLAUDE_CODE_EFFORT_LEVEL
+        // or config, so `envValue` resolves to its `xhigh` reasoning tier while
+        // the raw value (used by the interactive control message) stays
+        // `ultracode`. Every other level keeps rawValue == envValue.
+        XCTAssertEqual(ClaudeCodeEffortLevel.ultracode.rawValue, "ultracode")
+        XCTAssertEqual(ClaudeCodeEffortLevel.ultracode.envValue, "xhigh")
+        XCTAssertEqual(ClaudeCodeEffortLevel.ultracode.displayName, "Ultracode")
+        XCTAssertEqual(ClaudeCodeEffortLevel.parse("ultracode"), .ultracode)
+        XCTAssertEqual(ClaudeCodeEffortLevel.parse("ultra-code"), .ultracode)
+        for level in ClaudeCodeEffortLevel.allCases where level != .ultracode {
+            XCTAssertEqual(level.envValue, level.rawValue)
+        }
+
+        func ultracodeSupported(_ raw: String, _ kind: AgentProviderKind) -> Bool {
+            ClaudeCompatibleModelCatalogAdapter.claudeEffort(
+                .ultracode, isSupportedForBaseModelRaw: raw, agentKind: kind
+            )
+        }
+        // Ultracode is Opus 4.8 only — the pinned raw plus the latest-Opus
+        // aliases that resolve to it, and never on older Opus, Sonnet, or
+        // compatible backends.
+        XCTAssertTrue(ultracodeSupported(AgentModel.claudeOpus48.rawValue, .claudeCode))
+        XCTAssertTrue(ultracodeSupported(AgentModel.claudeOpus.rawValue, .claudeCode))
+        XCTAssertTrue(ultracodeSupported(AgentModel.claudeOpus1m.rawValue, .claudeCode))
+        XCTAssertFalse(ultracodeSupported(AgentModel.claudeOpus47.rawValue, .claudeCode))
+        XCTAssertFalse(ultracodeSupported(AgentModel.claudeFable5.rawValue, .claudeCode))
+        XCTAssertFalse(ultracodeSupported(AgentModel.claudeSonnet5.rawValue, .claudeCode))
+        XCTAssertFalse(ultracodeSupported(AgentModel.claudeOpus.rawValue, .claudeCodeGLM))
+
+        // Sonnet 5 gains xhigh (unlike older Sonnet) but never ultracode.
+        XCTAssertTrue(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
+            .xhigh, isSupportedForBaseModelRaw: AgentModel.claudeSonnet5.rawValue, agentKind: .claudeCode
+        ))
+
+        // Picker composition surfaces ultracode only for the Opus 4.8 selection.
+        XCTAssertTrue(AgentModelCatalog.supportedClaudeEfforts(
+            forSelectedModelRaw: AgentModel.claudeOpus48.rawValue, agentKind: .claudeCode
+        ).contains(.ultracode))
+        XCTAssertFalse(AgentModelCatalog.supportedClaudeEfforts(
+            forSelectedModelRaw: AgentModel.claudeSonnet5.rawValue, agentKind: .claudeCode
+        ).contains(.ultracode))
+    }
+
     func testBridgeRuntimeSmokeMapsPluginIDsDiscoveryRuntimeAndHeadlessAdapters() throws {
         let cases: [(AgentProviderKind, String)] = [
             (.claudeCode, "claude-code"),

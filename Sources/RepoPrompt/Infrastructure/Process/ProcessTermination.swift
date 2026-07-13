@@ -1,6 +1,45 @@
 import Darwin
 import Foundation
 
+/// Detailed child termination outcome preserving the exited-vs-signaled
+/// distinction that the normalized `Int32` APIs collapse into `128 + signal`.
+enum ProcessExitStatus: Equatable, Sendable {
+    case exited(code: Int32)
+    case uncaughtSignal(signal: Int32)
+
+    /// Matches the historical normalization used by `waitForTermination` and
+    /// `terminateAndReap`: exit code as-is, uncaught signals as `128 + signal`.
+    var normalizedExitCode: Int32 {
+        switch self {
+        case let .exited(code):
+            code
+        case let .uncaughtSignal(signal):
+            128 &+ signal
+        }
+    }
+
+    /// `Process.terminationStatus` parity: the exit code for normal exits and
+    /// the raw signal number for uncaught signals.
+    var terminationStatus: Int32 {
+        switch self {
+        case let .exited(code):
+            code
+        case let .uncaughtSignal(signal):
+            signal
+        }
+    }
+
+    /// `Process.terminationReason` parity.
+    var terminationReason: Process.TerminationReason {
+        switch self {
+        case .exited:
+            .exit
+        case .uncaughtSignal:
+            .uncaughtSignal
+        }
+    }
+}
+
 enum ProcessTerminationError: Error, LocalizedError {
     case waitFailed(String)
 
@@ -88,11 +127,14 @@ enum ProcessTermination {
         status & 0x7F
     }
 
-    @inline(__always)
-    private static func normalizedExitCode(_ rawStatus: Int32) -> Int32 {
-        if waitStatusExited(rawStatus) { return waitStatusExitCode(rawStatus) }
-        if waitStatusSignaled(rawStatus) { return 128 &+ waitStatusSignal(rawStatus) }
-        return rawStatus
+    /// Decodes a raw `waitpid` status into a detailed exit status. Statuses that
+    /// are neither a normal exit nor an uncaught signal (for example a stopped
+    /// child) fall back to `.exited(code: rawStatus)`, matching the historical
+    /// normalized fallback of returning the raw status unchanged.
+    static func decodeWaitStatus(_ rawStatus: Int32) -> ProcessExitStatus {
+        if waitStatusExited(rawStatus) { return .exited(code: waitStatusExitCode(rawStatus)) }
+        if waitStatusSignaled(rawStatus) { return .uncaughtSignal(signal: waitStatusSignal(rawStatus)) }
+        return .exited(code: rawStatus)
     }
 
     private static func safeProcessGroupID(_ processGroupID: pid_t?) -> pid_t? {
@@ -177,6 +219,24 @@ enum ProcessTermination {
         sigkillGrace: TimeInterval,
         logger: (String) -> Void
     ) async -> Int32 {
+        await terminateAndReapStatus(
+            pid: pid,
+            processGroupID: processGroupID,
+            status: &status,
+            sigtermGrace: sigtermGrace,
+            sigkillGrace: sigkillGrace,
+            logger: logger
+        ).normalizedExitCode
+    }
+
+    private static func terminateAndReapStatus(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        status: inout Int32,
+        sigtermGrace: TimeInterval,
+        sigkillGrace: TimeInterval,
+        logger: (String) -> Void
+    ) async -> ProcessExitStatus {
         let shortPollNs = UInt64(pollInterval * 1_000_000_000)
         var lastSignal: Int32?
 
@@ -197,7 +257,7 @@ enum ProcessTermination {
             waitForProcessGroupExit: waitForProcessGroupExit,
             logger: logger
         ) {
-            return normalizedExitCode(status)
+            return decodeWaitStatus(status)
         }
 
         logger("Process \(pid) family did not exit after SIGTERM; sending SIGKILL")
@@ -217,13 +277,13 @@ enum ProcessTermination {
             waitForProcessGroupExit: waitForProcessGroupExit,
             logger: logger
         ) {
-            return normalizedExitCode(status)
+            return decodeWaitStatus(status)
         }
 
         if let signal = lastSignal {
-            return 128 &+ signal
+            return .uncaughtSignal(signal: signal)
         }
-        return normalizedExitCode(status)
+        return decodeWaitStatus(status)
     }
 
     static func waitForTermination(
@@ -232,6 +292,24 @@ enum ProcessTermination {
         timeout: TimeInterval?,
         logger: (String) -> Void = { _ in }
     ) async throws -> (exitCode: Int32, timedOut: Bool) {
+        let outcome = try await waitForTerminationStatus(
+            pid: pid,
+            processGroupID: processGroupID,
+            timeout: timeout,
+            logger: logger
+        )
+        return (outcome.status.normalizedExitCode, outcome.timedOut)
+    }
+
+    /// Detailed variant of `waitForTermination` that preserves exited-vs-signaled
+    /// semantics. Identical waiting, cancellation, timeout, and escalation
+    /// behavior; only the result representation differs.
+    static func waitForTerminationStatus(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        timeout: TimeInterval?,
+        logger: (String) -> Void = { _ in }
+    ) async throws -> (status: ProcessExitStatus, timedOut: Bool) {
         var status: Int32 = 0
         let start = ProcessInfo.processInfo.systemUptime
         let shortPollNs = UInt64(pollInterval * 1_000_000_000)
@@ -249,7 +327,7 @@ enum ProcessTermination {
                 if Task.isCancelled {
                     let timing = currentTiming()
                     logger("Process cancelled; terminating")
-                    let code = await terminateAndReap(
+                    let exitStatus = await terminateAndReapStatus(
                         pid: pid,
                         processGroupID: processGroupID,
                         status: &status,
@@ -257,16 +335,16 @@ enum ProcessTermination {
                         sigkillGrace: timing.sigkillGrace,
                         logger: logger
                     )
-                    return (code, false)
+                    return (exitStatus, false)
                 }
 
                 let r = waitpid(pid, &status, WNOHANG)
-                if r == pid { return (normalizedExitCode(status), false) }
+                if r == pid { return (decodeWaitStatus(status), false) }
                 if r == 0 {
                     if ProcessInfo.processInfo.systemUptime >= deadline {
                         let timing = currentTiming()
                         logger("Process timed out after \(timeout) seconds; sending SIGTERM")
-                        let code = await terminateAndReap(
+                        let exitStatus = await terminateAndReapStatus(
                             pid: pid,
                             processGroupID: processGroupID,
                             status: &status,
@@ -274,13 +352,13 @@ enum ProcessTermination {
                             sigkillGrace: timing.sigkillGrace,
                             logger: logger
                         )
-                        return (code, true)
+                        return (exitStatus, true)
                     }
                     try? await Task.sleep(nanoseconds: currentPollNs())
                     continue
                 }
                 if r == -1, errno == EINTR { continue }
-                if r == -1, errno == ECHILD { return (normalizedExitCode(status), false) }
+                if r == -1, errno == ECHILD { return (decodeWaitStatus(status), false) }
                 if r == -1 {
                     let message = String(cString: strerror(errno))
                     throw ProcessTerminationError.waitFailed(message)
@@ -292,7 +370,7 @@ enum ProcessTermination {
             if Task.isCancelled {
                 let timing = currentTiming()
                 logger("Process cancelled; terminating")
-                let code = await terminateAndReap(
+                let exitStatus = await terminateAndReapStatus(
                     pid: pid,
                     processGroupID: processGroupID,
                     status: &status,
@@ -300,17 +378,17 @@ enum ProcessTermination {
                     sigkillGrace: timing.sigkillGrace,
                     logger: logger
                 )
-                return (code, false)
+                return (exitStatus, false)
             }
 
             let r = waitpid(pid, &status, WNOHANG)
-            if r == pid { return (normalizedExitCode(status), false) }
+            if r == pid { return (decodeWaitStatus(status), false) }
             if r == 0 {
                 try? await Task.sleep(nanoseconds: currentPollNs())
                 continue
             }
             if r == -1, errno == EINTR { continue }
-            if r == -1, errno == ECHILD { return (normalizedExitCode(status), false) }
+            if r == -1, errno == ECHILD { return (decodeWaitStatus(status), false) }
             if r == -1 {
                 let message = String(cString: strerror(errno))
                 throw ProcessTerminationError.waitFailed(message)

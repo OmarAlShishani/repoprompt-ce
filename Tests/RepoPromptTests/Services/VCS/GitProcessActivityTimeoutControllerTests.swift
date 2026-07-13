@@ -8,11 +8,10 @@ import XCTest
             let driver = TimeoutCheckpointDriver()
             let signals = TimeoutSignalRecorder()
             let controller = makeController(driver: driver, signals: signals)
-            let process = Process()
+            let target = GitProcessLifecycleTarget(processIdentifier: 101, processGroupID: nil)
 
             controller.schedule(
-                process: process,
-                processIdentifier: 101,
+                target: target,
                 timeout: .seconds(30),
                 terminationGrace: .seconds(1)
             )
@@ -21,8 +20,7 @@ import XCTest
             await driver.waitFor(.beforeTimeoutClaim(1))
 
             controller.schedule(
-                process: process,
-                processIdentifier: 101,
+                target: target,
                 timeout: .seconds(30),
                 terminationGrace: .seconds(1)
             )
@@ -38,11 +36,10 @@ import XCTest
             let driver = TimeoutCheckpointDriver()
             let signals = TimeoutSignalRecorder()
             let controller = makeController(driver: driver, signals: signals)
-            let process = Process()
+            let target = GitProcessLifecycleTarget(processIdentifier: 202, processGroupID: nil)
 
             controller.schedule(
-                process: process,
-                processIdentifier: 202,
+                target: target,
                 timeout: .seconds(30),
                 terminationGrace: .seconds(1)
             )
@@ -56,8 +53,7 @@ import XCTest
 
             await driver.waitFor(.sleep(1, .terminationGrace))
             controller.schedule(
-                process: process,
-                processIdentifier: 202,
+                target: target,
                 timeout: .seconds(30),
                 terminationGrace: .seconds(1)
             )
@@ -76,11 +72,10 @@ import XCTest
             let driver = TimeoutCheckpointDriver()
             let signals = TimeoutSignalRecorder()
             let controller = makeController(driver: driver, signals: signals)
-            let process = Process()
+            let target = GitProcessLifecycleTarget(processIdentifier: 303, processGroupID: nil)
 
             controller.schedule(
-                process: process,
-                processIdentifier: 303,
+                target: target,
                 timeout: .seconds(30),
                 terminationGrace: .seconds(1)
             )

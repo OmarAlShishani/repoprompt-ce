@@ -115,6 +115,10 @@ import XCTest
                 at: manager.workspaceFileURL(for: workspace)
             )
             XCTAssertEqual(saved.currentPromptText, "newer state")
+            XCTAssertEqual(
+                manager.debugLastSavedVersionForWorkspace(workspace.id),
+                manager.debugStateVersionForWorkspace(workspace.id)
+            )
         }
 
         func testPreparationFailureDoesNotAdvanceLastSavedVersion() async throws {

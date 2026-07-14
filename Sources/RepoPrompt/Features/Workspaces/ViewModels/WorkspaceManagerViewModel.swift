@@ -4861,14 +4861,17 @@ class WorkspaceManagerViewModel: ObservableObject {
         if let snapshot {
             composeTabSnapshotSubject.send(snapshot)
         }
-        guard await saveWorkspaceAsync(
+        guard let savedStateVersion = await saveWorkspaceAsync(
             workspaceID: wsID,
             fileURL: fileURL,
             source: source
         ) else { return }
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
         guard workspace(withID: wsID) != nil else { return }
-        lastSavedVersionByWorkspaceID[wsID] = cur
+        lastSavedVersionByWorkspaceID[wsID] = max(
+            lastSavedVersionByWorkspaceID[wsID, default: -1],
+            savedStateVersion
+        )
     }
 
     func restoreWorkspaceState(
@@ -7188,12 +7191,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileURL: URL,
         source: WorkspaceSaveSource = .saveWorkspaceAsync,
         remainingRetryCount: Int = 1
-    ) async -> Bool {
-        guard !Task.isCancelled else { return false }
+    ) async -> Int? {
+        guard !Task.isCancelled else { return nil }
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
         guard !Task.isCancelled,
               let currentIndex = workspaceIndex(for: workspaceID)
-        else { return false }
+        else { return nil }
 
         let current = workspaces[currentIndex]
         let capturedStateVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
@@ -7255,7 +7258,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
             guard !Task.isCancelled,
                   let latestIndex = workspaceIndex(for: workspaceID)
-            else { return false }
+            else { return nil }
             let latestStateVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
             if latestStateVersion != capturedStateVersion {
                 #if DEBUG
@@ -7268,7 +7271,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                         ]
                     )
                 #endif
-                guard remainingRetryCount > 0 else { return false }
+                guard remainingRetryCount > 0 else { return nil }
                 return await saveWorkspaceAsync(
                     workspaceID: workspaceID,
                     fileURL: fileURL,
@@ -7299,10 +7302,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             if indexFieldsChanged, workspaceIndex(for: workspaceID) != nil {
                 await rebuildAndSaveIndexAsync()
             }
-            return true
+            return capturedStateVersion
         } catch {
             print("💾 Failed to serialize workspace: \(error)")
-            return false
+            return nil
         }
     }
 

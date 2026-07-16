@@ -19,13 +19,13 @@ final class ChildProcessExitObserver: @unchecked Sendable {
 
     private final class State: @unchecked Sendable {
         private let lock = NSLock()
-        private var rootReaped = false
+        private var rootSignalingClosed = false
         private var outcome: Outcome?
         private var waiters: [UUID: CheckedContinuation<Outcome?, Never>] = [:]
 
         func closeRootSignalingBeforeReap() {
             lock.lock()
-            rootReaped = true
+            rootSignalingClosed = true
             lock.unlock()
         }
 
@@ -33,7 +33,7 @@ final class ChildProcessExitObserver: @unchecked Sendable {
             lock.lock()
             defer { lock.unlock() }
             guard outcome == nil else { return false }
-            rootReaped = false
+            rootSignalingClosed = false
             return true
         }
 
@@ -46,7 +46,7 @@ final class ChildProcessExitObserver: @unchecked Sendable {
             self.outcome = outcome
             // Keep publication idempotently closed to PID signaling even if a
             // future result path reaches finish without the callback boundary.
-            rootReaped = true
+            rootSignalingClosed = true
             let continuations = waiters.values
             waiters.removeAll()
             lock.unlock()
@@ -82,14 +82,14 @@ final class ChildProcessExitObserver: @unchecked Sendable {
         func withRootSignalingWindow<T>(_ operation: () -> T) -> T? {
             lock.lock()
             defer { lock.unlock() }
-            guard !rootReaped, outcome == nil else { return nil }
+            guard !rootSignalingClosed, outcome == nil else { return nil }
             return operation()
         }
 
         var isRootSignalingClosed: Bool {
             lock.lock()
             defer { lock.unlock() }
-            return rootReaped
+            return rootSignalingClosed
         }
 
         private func expireWaiter(_ waiterID: UUID) {

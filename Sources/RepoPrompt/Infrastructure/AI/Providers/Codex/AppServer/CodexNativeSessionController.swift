@@ -575,10 +575,9 @@ final class CodexNativeSessionController {
     private let runID: UUID
     private let tabID: UUID
     private let windowID: Int
-    /// App-server process launch directory (the workspace logical root when worktree-bound).
-    private let processLaunchDirectory: String?
-    /// Thread/turn execution directory (the bound worktree when one is selected).
-    private let executionDirectory: String?
+    /// Launch/execution directory pair; kept whole so the two roles cannot
+    /// drift apart through partial initialization or copying.
+    private let workspacePaths: CodexRuntimeWorkspacePaths
     private let options: Options
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
@@ -756,8 +755,7 @@ final class CodexNativeSessionController {
         self.runID = runID
         self.tabID = tabID
         self.windowID = windowID
-        processLaunchDirectory = workspacePaths.processLaunchDirectory
-        executionDirectory = workspacePaths.executionDirectory
+        self.workspacePaths = workspacePaths
         self.options = options ?? Self.Options.agentModeDefault(forceExperimentalSteering: forceExperimentalSteering)
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
@@ -948,7 +946,7 @@ final class CodexNativeSessionController {
             return
         }
         guard let fileURL = Self.makeRawEventLogFileURL(
-            executionDirectory: executionDirectory,
+            executionDirectory: workspacePaths.executionDirectory,
             threadID: threadIdentifier
         ) else {
             return
@@ -1002,7 +1000,7 @@ final class CodexNativeSessionController {
                 "runID": runID.uuidString,
                 "tabID": tabID.uuidString,
                 "threadID": threadID ?? "",
-                "workspacePath": executionDirectory ?? ""
+                "workspacePath": workspacePaths.executionDirectory ?? ""
             ])
         }
         var record: [String: Any] = [
@@ -1084,7 +1082,7 @@ final class CodexNativeSessionController {
                     .init(clientName: expectedMCPClientName, runID: runID)
                 )
             }
-            await client.updateProcessLaunchDirectory(processLaunchDirectory)
+            await client.updateProcessLaunchDirectory(workspacePaths.processLaunchDirectory)
             await updateClientProcessLaunchPolicy()
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
@@ -1107,7 +1105,7 @@ final class CodexNativeSessionController {
                     params["effort"] = reasoningEffort
                 }
                 Self.addServiceTier(serviceTier, to: &params)
-                if let executionDirectory {
+                if let executionDirectory = workspacePaths.executionDirectory {
                     params["cwd"] = executionDirectory
                 }
                 if !configOverrides.isEmpty {
@@ -1136,7 +1134,7 @@ final class CodexNativeSessionController {
                     params["effort"] = reasoningEffort
                 }
                 Self.addServiceTier(serviceTier, to: &params)
-                if let executionDirectory {
+                if let executionDirectory = workspacePaths.executionDirectory {
                     params["cwd"] = executionDirectory
                 }
                 if !configOverrides.isEmpty {
@@ -1394,7 +1392,7 @@ final class CodexNativeSessionController {
             params["effort"] = reasoningEffort
         }
         Self.addServiceTier(serviceTier, to: &params)
-        if let executionDirectory {
+        if let executionDirectory = workspacePaths.executionDirectory {
             params["cwd"] = executionDirectory
         }
         #if DEBUG
@@ -1411,7 +1409,7 @@ final class CodexNativeSessionController {
             requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
             requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
                 mode: sandboxMode,
-                executionDirectory: executionDirectory
+                executionDirectory: workspacePaths.executionDirectory
             )
             // app-server v2 turn/start does not accept a config override bag.
             // Thread-level config changes take effect on thread/start or thread/resume.

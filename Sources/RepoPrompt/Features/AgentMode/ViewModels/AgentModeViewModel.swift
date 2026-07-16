@@ -1413,18 +1413,8 @@ final class AgentModeViewModel: ObservableObject {
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
         }
-        let sessionWorkspacePathProvider: (TabSession) throws -> String? = { session in
-            try Self.effectiveWorkspacePath(
-                for: session,
-                fallbackWorkspacePath: codexWorkspacePathProvider()
-            )
-        }
-        let codexRuntimeWorkspacePathsProvider: (TabSession) throws -> CodexRuntimeWorkspacePaths = { session in
-            try Self.codexRuntimeWorkspacePaths(
-                for: session,
-                fallbackWorkspacePath: codexWorkspacePathProvider()
-            )
-        }
+        let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
+            Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
         workspacePathProvider = codexWorkspacePathProvider
         attachmentWorkspaceDirectoryProvider = { [weak workspaceManager] in
             guard let workspaceManager, workspaceManager.activeWorkspace != nil else {
@@ -1647,18 +1637,8 @@ final class AgentModeViewModel: ObservableObject {
                 return FileManager.default.temporaryDirectory
             }
             let codexWorkspacePathProvider = { testWorkspacePath }
-            let sessionWorkspacePathProvider: (TabSession) throws -> String? = { session in
-                try Self.effectiveWorkspacePath(
-                    for: session,
-                    fallbackWorkspacePath: codexWorkspacePathProvider()
-                )
-            }
-            let codexRuntimeWorkspacePathsProvider: (TabSession) throws -> CodexRuntimeWorkspacePaths = { session in
-                try Self.codexRuntimeWorkspacePaths(
-                    for: session,
-                    fallbackWorkspacePath: codexWorkspacePathProvider()
-                )
-            }
+            let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
+                Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
             workspacePathProvider = codexWorkspacePathProvider
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
                 ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _ in
@@ -1895,6 +1875,31 @@ final class AgentModeViewModel: ObservableObject {
         try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
             bindings: session.worktreeBindings,
             fallbackWorkspacePath: fallbackWorkspacePath
+        )
+    }
+
+    /// One projection contract for both initializers: session-scoped scalar
+    /// workspace path and Codex launch/execution path pair, derived from the
+    /// same fallback workspace provider.
+    private static func makeSessionWorkspaceProviders(
+        fallbackWorkspacePath: @escaping () -> String?
+    ) -> (
+        sessionWorkspacePath: (TabSession) throws -> String?,
+        codexRuntimeWorkspacePaths: (TabSession) throws -> CodexRuntimeWorkspacePaths
+    ) {
+        (
+            sessionWorkspacePath: { session in
+                try Self.effectiveWorkspacePath(
+                    for: session,
+                    fallbackWorkspacePath: fallbackWorkspacePath()
+                )
+            },
+            codexRuntimeWorkspacePaths: { session in
+                try Self.codexRuntimeWorkspacePaths(
+                    for: session,
+                    fallbackWorkspacePath: fallbackWorkspacePath()
+                )
+            }
         )
     }
 

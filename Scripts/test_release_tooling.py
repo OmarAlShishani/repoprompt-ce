@@ -1815,6 +1815,47 @@ sys.stdout.write(str(status))
         ):
             self.assertIn(f"  - {excluded_path}", swiftlint_config)
 
+    def test_swiftformat_rule_policy_is_explicit_and_stable(self) -> None:
+        swiftformat_config = (SCRIPT_DIR.parent / ".swiftformat").read_text(encoding="utf-8")
+        explicit_rule_lines = [
+            line for line in swiftformat_config.splitlines() if line.startswith("--rules ")
+        ]
+
+        self.assertEqual(len(explicit_rule_lines), 1)
+        explicit_rules = explicit_rule_lines[0].removeprefix("--rules ").split(",")
+        self.assertEqual(explicit_rules, sorted(set(explicit_rules)))
+        self.assertEqual(len(explicit_rules), 113)
+        policy_digest = hashlib.sha256(",".join(explicit_rules).encode("utf-8")).hexdigest()
+        self.assertEqual(policy_digest, "da05f3f15cb054b0fd2421004a58876a7839ba45ff3c753aa91054b20c242ee6")
+
+    def test_format_tool_check_rejects_unsupported_swiftformat_versions(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir)
+            swiftlint = bin_dir / "swiftlint"
+            swiftlint.write_text("#!/bin/sh\necho 0.58.0\n", encoding="utf-8")
+            swiftlint.chmod(0o755)
+
+            for version, expected_success in (("0.60.10", False), ("0.61.1", True), ("0.62.1", True)):
+                with self.subTest(version=version):
+                    swiftformat = bin_dir / "swiftformat"
+                    swiftformat.write_text(f"#!/bin/sh\necho {version}\n", encoding="utf-8")
+                    swiftformat.chmod(0o755)
+                    environment = dict(os.environ)
+                    environment["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+                    result = subprocess.run(
+                        [str(installer), "check"],
+                        text=True,
+                        capture_output=True,
+                        env=environment,
+                        check=False,
+                    )
+
+                    self.assertEqual(result.returncode == 0, expected_success, result.stdout + result.stderr)
+                    if not expected_success:
+                        self.assertIn("unsupported", result.stdout)
+                        self.assertIn("requires >= 0.61.1", result.stdout)
+
     def test_publish_staged_validates_before_creating_dist(self) -> None:
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}", 1)[0]

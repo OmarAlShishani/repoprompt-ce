@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTION="status"
+SWIFTFORMAT_MIN_VERSION="0.61.1"
 
 if (( $# > 0 )) && [[ "${1:-}" != -* ]]; then
     ACTION="$1"
@@ -44,6 +45,33 @@ swiftlint_version(){
     swiftlint version 2>/dev/null || swiftlint --version 2>/dev/null || true
 }
 
+version_at_least(){
+    local actual="${1%%-*}"
+    local minimum="$2"
+    local actual_major actual_minor actual_patch
+    local minimum_major minimum_minor minimum_patch
+
+    IFS=. read -r actual_major actual_minor actual_patch <<<"$actual"
+    IFS=. read -r minimum_major minimum_minor minimum_patch <<<"$minimum"
+    for component in "$actual_major" "$actual_minor" "$actual_patch" "$minimum_major" "$minimum_minor" "$minimum_patch"; do
+        [[ "$component" =~ ^[0-9]+$ ]] || return 1
+    done
+
+    if (( actual_major != minimum_major )); then
+        (( actual_major > minimum_major ))
+        return
+    fi
+    if (( actual_minor != minimum_minor )); then
+        (( actual_minor > minimum_minor ))
+        return
+    fi
+    (( actual_patch >= minimum_patch ))
+}
+
+swiftformat_is_supported(){
+    has_tool swiftformat && version_at_least "$(swiftformat_version)" "$SWIFTFORMAT_MIN_VERSION"
+}
+
 print_tool_status(){
     local name="$1"
     local command_name="$2"
@@ -55,7 +83,9 @@ print_tool_status(){
             swiftlint) version="$(swiftlint_version)" ;;
             *) version="" ;;
         esac
-        if [[ -n "$version" ]]; then
+        if [[ "$command_name" == "swiftformat" ]] && ! version_at_least "$version" "$SWIFTFORMAT_MIN_VERSION"; then
+            echo "  $name: unsupported ($version; requires >= $SWIFTFORMAT_MIN_VERSION)"
+        elif [[ -n "$version" ]]; then
             echo "  $name: OK ($version)"
         else
             echo "  $name: OK ($(command -v "$command_name"))"
@@ -72,7 +102,7 @@ print_status(){
 }
 
 all_tools_present(){
-    has_tool swiftformat && has_tool swiftlint
+    swiftformat_is_supported && has_tool swiftlint
 }
 
 print_remediation(){
@@ -81,6 +111,7 @@ Install missing format tools with:
   make install-format-tools
 
 Or directly with Homebrew:
+  brew upgrade swiftformat
   brew install swiftformat swiftlint
 EOF
 }
@@ -99,8 +130,11 @@ install_missing_tools(){
         fail "Homebrew is required to install SwiftFormat and SwiftLint. Install Homebrew first, then rerun 'make install-format-tools'."
     fi
 
-    if has_tool swiftformat; then
+    if swiftformat_is_supported; then
         echo "SwiftFormat already installed."
+    elif has_tool swiftformat; then
+        echo "Upgrading SwiftFormat with Homebrew..."
+        brew upgrade swiftformat || brew install swiftformat
     else
         echo "Installing SwiftFormat with Homebrew..."
         brew install swiftformat

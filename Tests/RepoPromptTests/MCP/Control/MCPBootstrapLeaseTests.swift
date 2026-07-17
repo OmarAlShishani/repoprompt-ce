@@ -336,6 +336,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
     func testLateCommittedRouteRecheckWinsBeforeTimeoutCleanup() async {
         let runID = UUID()
         let policyRecorder = PolicyRecorder()
+        let progressRecorder = BootstrapProgressRecorder()
         await HeadlessAgentConnectionGate.cancelAll()
         await MCPRoutingWaiter.cleanup(runID: runID)
         let lease = MCPBootstrapLease(
@@ -359,16 +360,28 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             policyClearer: { _ in await policyRecorder.recordClear() },
             committedRouteConfirmer: { _ in true }
         )
-        await XCTAssertTrue(lease.acquire())
+        let acquired = await lease.acquire()
+        XCTAssertTrue(acquired)
 
         let outcome = await lease.releaseWhenRouted(
             waitPolicy: MCPRoutingWaitPolicy(
                 noConnectionTimeout: .milliseconds(10),
                 observedConnectionGrace: .milliseconds(20)
-            )
+            ),
+            progressReporter: { progress in
+                await progressRecorder.record(progress)
+            }
         )
         XCTAssertEqual(outcome, .routed)
-        await XCTAssertEqual(policyRecorder.clearCount, 0)
+        let progress = await progressRecorder.snapshot()
+        XCTAssertEqual(progress, [
+            .waitingForChildConnection,
+            .childConnectionObserved,
+            .waitingForRouting,
+            .routingConfirmed
+        ])
+        let clearCount = await policyRecorder.clearCount
+        XCTAssertEqual(clearCount, 0)
         await MCPRoutingWaiter.cleanup(runID: runID)
     }
 
@@ -398,16 +411,14 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             policyClearer: { _ in await policyRecorder.recordClear() },
             committedRouteConfirmer: { _ in false }
         )
-        await XCTAssertTrue(lease.acquire())
+        let acquired = await lease.acquire()
+        XCTAssertTrue(acquired)
         await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
 
-        let clock = ContinuousClock()
-        let start = clock.now
-        await XCTAssertFalse(lease.releaseWhenRouted(timeoutMs: 40))
-        let elapsed = start.duration(to: clock.now)
-        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(30))
-        XCTAssertLessThan(elapsed, .milliseconds(100))
-        await XCTAssertEqual(policyRecorder.clearCount, 1)
+        let didRoute = await lease.releaseWhenRouted(timeoutMs: 10)
+        XCTAssertFalse(didRoute)
+        let clearCount = await policyRecorder.clearCount
+        XCTAssertEqual(clearCount, 1)
         await MCPRoutingWaiter.cleanup(runID: runID)
     }
 

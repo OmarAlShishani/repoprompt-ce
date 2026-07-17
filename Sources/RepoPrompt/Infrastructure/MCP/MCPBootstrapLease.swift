@@ -22,9 +22,9 @@ typealias MCPBootstrapRoutingProgressReporter = @MainActor @Sendable (
 actor MCPBootstrapRoutingProgressLifecycle {
     private let reporter: MCPBootstrapRoutingProgressReporter
     private var childConnectionObserved = false
-    private var terminalOutcome: MCPRoutingWaitOutcome?
+    private var waitOutcomeFence: MCPRoutingWaitOutcome?
+    private var authoritativeOutcome: MCPRoutingWaitOutcome?
     private var deliveryTask: Task<Void, Never>?
-    private var didFinish = false
 
     init(reporter: @escaping MCPBootstrapRoutingProgressReporter) {
         self.reporter = reporter
@@ -34,31 +34,39 @@ actor MCPBootstrapRoutingProgressLifecycle {
     }
 
     func recordChildConnectionObserved() {
-        guard terminalOutcome == nil, !childConnectionObserved else { return }
+        guard waitOutcomeFence == nil, authoritativeOutcome == nil, !childConnectionObserved else { return }
         childConnectionObserved = true
         enqueue([.childConnectionObserved, .waitingForRouting])
     }
 
-    func recordTerminal(_ outcome: MCPRoutingWaitOutcome) {
-        guard terminalOutcome == nil else { return }
-        terminalOutcome = outcome
+    /// Fences late waiter callbacks without claiming authority over the lease's final outcome.
+    func fenceAfterWaitOutcome(_ outcome: MCPRoutingWaitOutcome) {
+        guard waitOutcomeFence == nil else { return }
+        waitOutcomeFence = outcome
     }
 
     func finish(with outcome: MCPRoutingWaitOutcome) async {
-        recordTerminal(outcome)
-        guard !didFinish else {
+        guard authoritativeOutcome == nil else {
             await deliveryTask?.value
             return
         }
-        didFinish = true
+        let fence = waitOutcomeFence
+        waitOutcomeFence = fence ?? outcome
+        authoritativeOutcome = outcome
 
-        let finalOutcome = terminalOutcome ?? outcome
-        if finalOutcome == .timedOutAfterConnection, !childConnectionObserved {
+        let needsObservedBackfill = !childConnectionObserved && (
+            outcome == .timedOutAfterConnection
+                || outcome == .routed && (
+                    fence == .timedOutBeforeConnection
+                        || fence == .timedOutAfterConnection
+                )
+        )
+        if needsObservedBackfill {
             childConnectionObserved = true
             enqueue([.childConnectionObserved, .waitingForRouting])
         }
 
-        switch finalOutcome {
+        switch outcome {
         case .routed:
             enqueue([.routingConfirmed])
         case .timedOutBeforeConnection:

@@ -2845,36 +2845,105 @@ actor ServerNetworkManager {
         return resolved.runID
     }
 
-    /// Rechecks committed route authority after a waiter deadline. The actor-owned
-    /// application identity is sampled before the MainActor hop and revalidated afterward.
+    /// Rechecks committed route authority after a waiter deadline.
+    ///
+    /// The MainActor forward mapping deterministically identifies the candidate connection.
+    /// Actor-owned application, policy identity, expected window/tab, and connection liveness
+    /// are then sampled on both sides of a second MainActor mapping validation.
     func isRunRouteAuthoritativelyCommitted(
         runID: UUID,
         windowID: Int,
         tabID: UUID?
     ) async -> Bool {
-        guard pendingPolicyApplicationIDByRunID[runID] == nil,
-              windowIDByRunID[runID] == windowID,
-              let connectionID = runIDByConnectionID.first(where: { $0.value == runID })?.key,
-              connections[connectionID] != nil
+        let connectionID = await MainActor.run { () -> UUID? in
+            guard let window = WindowStatesManager.shared.window(withID: windowID),
+                  let connectionID = window.mcpServer.connectionIDByRunID[runID],
+                  window.mcpServer.hasCurrentRunRouteMapping(
+                      runID: runID,
+                      connectionID: connectionID,
+                      expectedTabID: tabID
+                  )
+            else { return nil }
+            return connectionID
+        }
+        guard let connectionID,
+              let actorSnapshot = authoritativeRunRouteActorSnapshot(
+                  runID: runID,
+                  connectionID: connectionID,
+                  windowID: windowID,
+                  tabID: tabID
+              )
         else { return false }
 
-        let committed = await MainActor.run {
+        let mappingIsStillCurrent = await MainActor.run {
             guard let window = WindowStatesManager.shared.window(withID: windowID) else {
                 return false
             }
-            return window.mcpServer.isAuthoritativelyCommittedRunRoute(
+            return window.mcpServer.hasCurrentRunRouteMapping(
                 runID: runID,
                 connectionID: connectionID,
                 expectedTabID: tabID
             )
         }
-        guard committed,
-              pendingPolicyApplicationIDByRunID[runID] == nil,
-              windowIDByRunID[runID] == windowID,
-              runIDByConnectionID[connectionID] == runID,
-              connections[connectionID] != nil
+        guard mappingIsStillCurrent,
+              let revalidatedActorSnapshot = authoritativeRunRouteActorSnapshot(
+                  runID: runID,
+                  connectionID: connectionID,
+                  windowID: windowID,
+                  tabID: tabID
+              ),
+              revalidatedActorSnapshot == actorSnapshot
         else { return false }
         return true
+    }
+
+    private struct AuthoritativeRunRouteActorSnapshot: Equatable {
+        let pendingRunApplicationID: UUID?
+        let pendingConnectionApplicationID: UUID?
+        let mappedRunID: UUID?
+        let runWindowID: Int?
+        let connectionWindowID: Int?
+        let policyWindowID: Int?
+        let policyTabID: UUID?
+        let isRunAdmitted: Bool
+        let connectionLifecycleGeneration: UInt64?
+        let connectionIdentity: ObjectIdentifier?
+        let connectionIsBeingRemoved: Bool
+    }
+
+    private func authoritativeRunRouteActorSnapshot(
+        runID: UUID,
+        connectionID: UUID,
+        windowID: Int,
+        tabID: UUID?
+    ) -> AuthoritativeRunRouteActorSnapshot? {
+        let connection = connections[connectionID]
+        let snapshot = AuthoritativeRunRouteActorSnapshot(
+            pendingRunApplicationID: pendingPolicyApplicationIDByRunID[runID],
+            pendingConnectionApplicationID: pendingPolicyApplicationIDByConnectionID[connectionID],
+            mappedRunID: runIDByConnectionID[connectionID],
+            runWindowID: windowIDByRunID[runID],
+            connectionWindowID: connectionWindowMap[connectionID],
+            policyWindowID: runPolicyStateByRunID[runID]?.windowID,
+            policyTabID: runPolicyStateByRunID[runID]?.tabID,
+            isRunAdmitted: admittedPolicyRunIDs.contains(runID),
+            connectionLifecycleGeneration: connectionLifecycleGenerationByID[connectionID],
+            connectionIdentity: connection.map { ObjectIdentifier($0 as AnyObject) },
+            connectionIsBeingRemoved: connectionsBeingRemoved.contains(connectionID)
+        )
+        guard snapshot.pendingRunApplicationID == nil,
+              snapshot.pendingConnectionApplicationID == nil,
+              snapshot.mappedRunID == runID,
+              snapshot.runWindowID == windowID,
+              snapshot.connectionWindowID == windowID,
+              snapshot.policyWindowID == windowID,
+              snapshot.policyTabID == tabID,
+              snapshot.isRunAdmitted,
+              snapshot.connectionLifecycleGeneration != nil,
+              snapshot.connectionIdentity != nil,
+              !snapshot.connectionIsBeingRemoved
+        else { return nil }
+        return snapshot
     }
 
     func toolTrackingRunIDForCompletion(

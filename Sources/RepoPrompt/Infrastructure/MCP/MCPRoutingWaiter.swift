@@ -1,6 +1,22 @@
 import Foundation
 import OSLog
 
+struct MCPRoutingWaitClock {
+    let now: @Sendable () -> Duration
+    let sleep: @Sendable (Duration) async throws -> Void
+
+    static func continuous() -> MCPRoutingWaitClock {
+        let clock = ContinuousClock()
+        let origin = clock.now
+        return MCPRoutingWaitClock(
+            now: { origin.duration(to: clock.now) },
+            sleep: { duration in
+                try await clock.sleep(for: duration)
+            }
+        )
+    }
+}
+
 enum MCPRoutingWaitFailure: Equatable {
     case signalled
     case cleanedUp
@@ -44,7 +60,18 @@ actor MCPRoutingWaiter {
     static let shared = MCPRoutingWaiter()
 
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "RoutingWaiter")
-    private let clock = ContinuousClock()
+    private let clock: MCPRoutingWaitClock
+    private let beforeWaiterEnrollment: (@Sendable () async -> Void)?
+
+    /// The shared production waiter uses ``ContinuousClock``. Manual timing and enrollment gates
+    /// are accepted only by explicitly constructed waiters used by deterministic tests.
+    init(
+        clock: MCPRoutingWaitClock = .continuous(),
+        beforeWaiterEnrollment: (@Sendable () async -> Void)? = nil
+    ) {
+        self.clock = clock
+        self.beforeWaiterEnrollment = beforeWaiterEnrollment
+    }
 
     /// Terminal cache entries are bounded independently from routing-policy TTLs. Observation
     /// never refreshes this TTL, so late signals cannot retain run state without bound.
@@ -75,7 +102,7 @@ actor MCPRoutingWaiter {
         var connectionObservationContinuations: [ConnectionObservationContinuation] = []
         var expiryTask: Task<Void, Never>?
         var terminalOutcome: MCPRoutingWaitOutcome?
-        var firstConnectionObservation: ContinuousClock.Instant?
+        var firstConnectionObservation: Duration?
     }
 
     private var waitersByRunID: [UUID: WaitState] = [:]
@@ -138,48 +165,43 @@ actor MCPRoutingWaiter {
         initialPhase: DeadlinePhase,
         progressLifecycle: MCPBootstrapRoutingProgressLifecycle?
     ) async -> MCPRoutingWaitOutcome {
-        if let state = waitersByRunID[runID],
-           let outcome = state.terminalOutcome
-        {
-            if state.firstConnectionObservation != nil {
-                await progressLifecycle?.recordChildConnectionObserved()
-            }
-            await progressLifecycle?.recordTerminal(outcome)
-            return outcome
+        if Task.isCancelled {
+            await progressLifecycle?.fenceAfterWaitOutcome(.cancelled)
+            return .cancelled
         }
-        guard let state = waitersByRunID[runID] else {
-            await progressLifecycle?.recordTerminal(.failed(.notRegistered))
+
+        var didBackfillObservedConnection = false
+        while let state = waitersByRunID[runID] {
+            if let outcome = state.terminalOutcome {
+                if state.firstConnectionObservation != nil {
+                    await progressLifecycle?.recordChildConnectionObserved()
+                }
+                await progressLifecycle?.fenceAfterWaitOutcome(outcome)
+                return outcome
+            }
+            guard state.firstConnectionObservation != nil, !didBackfillObservedConnection else { break }
+            await progressLifecycle?.recordChildConnectionObserved()
+            didBackfillObservedConnection = true
+            if Task.isCancelled {
+                await progressLifecycle?.fenceAfterWaitOutcome(.cancelled)
+                return .cancelled
+            }
+        }
+        guard waitersByRunID[runID] != nil else {
+            await progressLifecycle?.fenceAfterWaitOutcome(.failed(.notRegistered))
             log.warning("waitForRoutingOutcome: unregistered runID \(runID.uuidString)")
             return .failed(.notRegistered)
         }
-        if state.firstConnectionObservation != nil {
-            await progressLifecycle?.recordChildConnectionObserved()
-        }
-        if let current = waitersByRunID[runID],
-           let outcome = current.terminalOutcome
-        {
-            if current.firstConnectionObservation != nil {
-                await progressLifecycle?.recordChildConnectionObserved()
-            }
-            await progressLifecycle?.recordTerminal(outcome)
-            return outcome
-        }
 
         let waiterID = UUID()
-        let firstObservation = state.firstConnectionObservation
-        let deadline: Duration?
-        let phase: DeadlinePhase
-        if let adaptiveGrace, let firstObservation {
-            let elapsed = firstObservation.duration(to: clock.now)
-            deadline = max(.zero, adaptiveGrace - elapsed)
-            phase = .afterConnection
-        } else {
-            deadline = initialTimeout.map { max(.zero, $0) }
-            phase = initialPhase
-        }
+        await beforeWaiterEnrollment?()
 
         let outcome = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
+            await withCheckedContinuation { (continuation: CheckedContinuation<MCPRoutingWaitOutcome, Never>) in
+                if Task.isCancelled {
+                    continuation.resume(returning: .cancelled)
+                    return
+                }
                 guard var current = waitersByRunID[runID] else {
                     continuation.resume(returning: .failed(.cleanedUp))
                     return
@@ -187,6 +209,21 @@ actor MCPRoutingWaiter {
                 if let outcome = current.terminalOutcome {
                     continuation.resume(returning: outcome)
                     return
+                }
+
+                // Recompute from actor-current state at the exact enrollment boundary. Any
+                // observation delivered while an earlier await was suspended must replace the
+                // absence deadline with one grace window measured from the sticky first sighting.
+                let firstObservation = current.firstConnectionObservation
+                let deadline: Duration?
+                let phase: DeadlinePhase
+                if let adaptiveGrace, let firstObservation {
+                    let elapsed = clock.now() - firstObservation
+                    deadline = max(.zero, adaptiveGrace - elapsed)
+                    phase = .afterConnection
+                } else {
+                    deadline = initialTimeout.map { max(.zero, $0) }
+                    phase = initialPhase
                 }
 
                 let generation: UInt64 = 1
@@ -216,7 +253,7 @@ actor MCPRoutingWaiter {
         } onCancel: {
             Task { await self.handleCancellation(runID: runID, waiterID: waiterID) }
         }
-        await progressLifecycle?.recordTerminal(outcome)
+        await progressLifecycle?.fenceAfterWaitOutcome(outcome)
         return outcome
     }
 
@@ -257,7 +294,7 @@ actor MCPRoutingWaiter {
               state.firstConnectionObservation == nil
         else { return false }
 
-        state.firstConnectionObservation = clock.now
+        state.firstConnectionObservation = clock.now()
         let observers = state.connectionObservationContinuations
         state.connectionObservationContinuations = []
         let progressLifecycles = state.continuations.compactMap(\.progressLifecycle)
@@ -329,7 +366,7 @@ actor MCPRoutingWaiter {
             if state.firstConnectionObservation != nil {
                 await waiter.progressLifecycle?.recordChildConnectionObserved()
             }
-            await waiter.progressLifecycle?.recordTerminal(outcome)
+            await waiter.progressLifecycle?.fenceAfterWaitOutcome(outcome)
             waiter.timeoutTask?.cancel()
             waiter.continuation.resume(returning: outcome)
         }
@@ -344,9 +381,10 @@ actor MCPRoutingWaiter {
         phase: DeadlinePhase,
         after duration: Duration
     ) -> Task<Void, Never> {
-        Task { [weak self] in
+        let sleep = clock.sleep
+        return Task { [weak self] in
             do {
-                try await Task.sleep(for: duration)
+                try await sleep(duration)
                 await self?.handleDeadline(
                     runID: runID,
                     waiterID: waiterID,
@@ -376,10 +414,17 @@ actor MCPRoutingWaiter {
         let outcome: MCPRoutingWaitOutcome = switch phase {
         case .afterConnection:
             .timedOutAfterConnection
-        case .absolute, .beforeConnection:
+        case .absolute:
+            state.firstConnectionObservation == nil
+                ? .timedOutBeforeConnection
+                : .timedOutAfterConnection
+        case .beforeConnection:
             .timedOutBeforeConnection
         }
-        await waiter.progressLifecycle?.recordTerminal(outcome)
+        if state.firstConnectionObservation != nil {
+            await waiter.progressLifecycle?.recordChildConnectionObserved()
+        }
+        await waiter.progressLifecycle?.fenceAfterWaitOutcome(outcome)
         waiter.continuation.resume(returning: outcome)
     }
 
@@ -389,7 +434,7 @@ actor MCPRoutingWaiter {
         else { return }
         let waiter = state.continuations.remove(at: index)
         waitersByRunID[runID] = state
-        await waiter.progressLifecycle?.recordTerminal(.cancelled)
+        await waiter.progressLifecycle?.fenceAfterWaitOutcome(.cancelled)
         waiter.timeoutTask?.cancel()
         waiter.continuation.resume(returning: .cancelled)
     }
@@ -404,9 +449,10 @@ actor MCPRoutingWaiter {
     }
 
     private func scheduleExpiry(runID: UUID) -> Task<Void, Never> {
-        Task { [weak self] in
+        let sleep = clock.sleep
+        return Task { [weak self] in
             do {
-                try await Task.sleep(for: Self.terminalStateTTL)
+                try await sleep(Self.terminalStateTTL)
                 await self?.handleExpiry(runID: runID)
             } catch {
                 // Explicit cleanup.

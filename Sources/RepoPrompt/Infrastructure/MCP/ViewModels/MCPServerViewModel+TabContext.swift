@@ -957,16 +957,18 @@ extension MCPServerViewModel {
         return Array(Set(runIDs)).sorted { $0.uuidString < $1.uuidString }
     }
 
-    /// Returns true only for a committed, bidirectional run mapping. Pending-policy tokens
-    /// are deliberately excluded so a staged route cannot survive timeout cleanup.
+    /// Returns true only for the current bidirectional run mapping.
+    ///
+    /// Pending-policy mapping tokens identify rollback/replacement generations; they do not own
+    /// application commit authority. ServerNetworkManager composes this mapping with its
+    /// actor-owned application, policy, window/tab, and live-connection state.
     @MainActor
-    func isAuthoritativelyCommittedRunRoute(
+    func hasCurrentRunRouteMapping(
         runID: UUID,
         connectionID: UUID,
         expectedTabID: UUID?
     ) -> Bool {
-        guard pendingPolicyRunIDMappingTokenIDByRunID[runID] == nil,
-              connectionIDByRunID[runID] == connectionID,
+        guard connectionIDByRunID[runID] == connectionID,
               connectionIDToRunID[connectionID] == runID
         else { return false }
 

@@ -698,6 +698,8 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 initialTab,
                 inWorkspaceID: activeWorkspace.id
             ))
+            window.workspaceManager.beginApplyingTabContext(forTabID: tabID)
+            defer { window.workspaceManager.endApplyingTabContext(forTabID: tabID) }
 
             let committedPrompt = "Committed prompt"
             let committedSelection = StoredSelection(selectedPaths: [selectedFile.path])

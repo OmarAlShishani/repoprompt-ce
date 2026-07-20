@@ -14,6 +14,8 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
     case childConnectionTermination = "child_connection_termination"
     case childConnectionTerminationJoin = "child_connection_termination_join"
     case runFinalization = "run_finalization"
+    case selectionReplyRendering = "selection_reply_rendering"
+    case reviewSelectionAuthorization = "review_selection_authorization"
     case modelResolution = "model_resolution"
     case payloadPackaging = "payload_packaging"
     case sessionCreationAndPersist = "session_creation_and_persist"
@@ -38,7 +40,10 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
              .childConnectionTerminationJoin,
              .runFinalization:
             "discovering"
-        case .modelResolution,
+        case .selectionReplyRendering:
+            "processing"
+        case .reviewSelectionAuthorization,
+             .modelResolution,
              .payloadPackaging,
              .sessionCreationAndPersist,
              .messageSend,
@@ -77,6 +82,10 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
             "child MCP connection termination join"
         case .runFinalization:
             "Context Builder run finalization"
+        case .selectionReplyRendering:
+            "selection reply rendering"
+        case .reviewSelectionAuthorization:
+            "review selection authorization"
         case .modelResolution:
             "follow-up model resolution"
         case .payloadPackaging:
@@ -118,6 +127,8 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
             10
         case .runFinalization:
             5
+        case .selectionReplyRendering, .reviewSelectionAuthorization:
+            30
         case .modelResolution:
             2
         case .payloadPackaging:

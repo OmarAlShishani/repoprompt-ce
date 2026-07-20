@@ -470,7 +470,7 @@ private enum RegisteredLanguageStore {
                 stableLanguageID: .php,
                 displayName: "PHP",
                 makeLanguage: { wrapGrammarLanguage(tree_sitter_php()) },
-                grammarRevision: "9d7d6f649297ee01639e759795793cc57698031b",
+                grammarRevision: "5b5627faaa290d89eb3d01b9bf47c3bb9e797dea",
                 queryText: phpCodeMapQuery
             )
         case .ruby:

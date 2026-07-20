@@ -34,7 +34,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/alex-pinkus/tree-sitter-swift", revision: "31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-c-sharp.git", revision: "cac6d5fb595f5811a076336682d5d595ac1c9e85"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-cpp", revision: "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02"),
-    .package(url: "https://github.com/provencher/tree-sitter-php", revision: "9d7d6f649297ee01639e759795793cc57698031b"),
+    .package(url: "https://github.com/tree-sitter/tree-sitter-php.git", revision: "5b5627faaa290d89eb3d01b9bf47c3bb9e797dea"),
     .package(url: "https://github.com/jamesrochabrun/SwiftAnthropic", revision: "b7d030cd7453f314c780f5492385f73d704cbd5d"),
     .package(url: "https://github.com/provencher/SwiftOpenAI", revision: "1211782eb337e7968124448a20d9260df1952012"),
     // First upstream revision compatible with SwiftTreeSitter 0.10's cursor API.

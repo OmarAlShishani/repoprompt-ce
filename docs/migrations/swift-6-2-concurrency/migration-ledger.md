@@ -13,6 +13,7 @@ Updated: 2026-07-20
 | Boundary | Commit / state | Language/checking | Evidence |
 | --- | --- | --- | --- |
 | Dependency/grammar upgrade and broad parser-lock removal | `3b330db9fdfad6c23e715c84d47877995214f1c7` | Swift 5 | Exact SwiftTreeSitter 0.10/runtime 0.25.10 and grammar revisions; scanner shim retained after clean-link proof. |
+| Official-source cleanup (Item 8 partial) | This change | Swift 6 unchanged | PHP now resolves from the official v0.24.2 source with updated cache identity; the wrapper URL migration remains blocked by Neon’s released dependency identity. |
 | `RepoPromptRegexCore` | extraction `6feead2fcfbbd53bc9d4b9d0255401ec51bfd374`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; eight owner tests and Swift 5 app-consumer linkage pass. |
 | `RepoPromptCodeMapCore` / owner tests | extraction `22bfff1c5904d5f02c0a881055142c94f4783a84`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; 16 owner tests, mixed-mode app tests, and both Swift 5 product builds pass. |
 
@@ -71,6 +72,13 @@ No new escape hatch or source annotation was added for Item 6. The four target l
 - Swift 5 consumer products: RepoPrompt ticket `6c091ce4…`; repoprompt-mcp ticket `afed7b28…`; both built successfully.
 - Phase boundary: full root ticket `a5f3c831…` passed in 9m28s; full provider ticket `11ad3aad…` passed; lint ticket `ce6cd2f4…`, 23 generator contract tests, and source/license guardrails passed.
 - Package default remains `swiftLanguageModes: [.v5]`; `Package.resolved` and all source files are unchanged.
+
+## Item 8 official-source cleanup evidence
+
+- Official `tree-sitter/tree-sitter-php` tag `v0.24.2` resolves to `5b5627faaa290d89eb3d01b9bf47c3bb9e797dea`. The previously resolved fork revision descends from that commit and changes only `.github/workflows/lint.yml`, so `Package.swift`, headers, parsers, scanners, and queries are byte-identical. The manifest pin, resolved pin, PHP grammar/cache revision, owner-test registration, license attribution, inventory, and guardrail now use the official source.
+- Official `tree-sitter/swift-tree-sitter` tag `0.10.0` resolves to the existing `f97df585296977d8fcaf644cbde567151d1367b8` commit and identical tree. The wrapper URL was not changed because pinned Neon `07a325403534f4759c814aff0a58ac69144a524c` and every published Neon tag through `0.6.0` still declare the legacy `ChimeHQ/SwiftTreeSitter` package identity. A clean resolver probe with the official root URL produced separate `swift-tree-sitter` and `swifttreesitter` packages; a mirror probe failed because Neon names the legacy identity. No released official combination can currently preserve the required APIs and one wrapper/runtime identity without a fork, branch pin, mirror, vendoring, or unrelated modernization.
+- Target-local Swift 6 settings and behavior are unchanged. `TreeSitterScannerSupport` and generated-Xcode behavior remain untouched for Items 9–10.
+- Validation: CodeMap owner suite ticket `0be39f86…` passed all 16 tests, including the 14-language golden corpus and registry/cache-identity assertions; RepoPrompt build ticket `b6074b7f…` and MCP build ticket `89085163…` passed; format ticket `f72a1851…` changed no files; strict lint ticket `595357fc…` passed.
 
 ## Generated-Xcode status
 

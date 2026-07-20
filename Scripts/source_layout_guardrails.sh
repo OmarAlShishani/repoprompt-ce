@@ -127,7 +127,7 @@ expected_packages = {
     "tree-sitter-swift": ("https://github.com/alex-pinkus/tree-sitter-swift", "31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5", "TreeSitterSwift"),
     "tree-sitter-c-sharp": ("https://github.com/tree-sitter/tree-sitter-c-sharp.git", "cac6d5fb595f5811a076336682d5d595ac1c9e85", "TreeSitterCSharp"),
     "tree-sitter-cpp": ("https://github.com/tree-sitter/tree-sitter-cpp", "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02", "TreeSitterCPP"),
-    "tree-sitter-php": ("https://github.com/provencher/tree-sitter-php", "9d7d6f649297ee01639e759795793cc57698031b", "TreeSitterPHP"),
+    "tree-sitter-php": ("https://github.com/tree-sitter/tree-sitter-php.git", "5b5627faaa290d89eb3d01b9bf47c3bb9e797dea", "TreeSitterPHP"),
 }
 errors = []
 manifest_text = Path("Package.swift").read_text()

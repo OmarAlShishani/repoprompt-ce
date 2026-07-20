@@ -423,8 +423,8 @@ final class CodeMapArtifactKeyTests: XCTestCase {
                 "f975a621f4e7f532fe322e13c4f79495e0a7b2e7", typeScriptCodeMapQuery
             ),
             .php: (
-                .php, "https://github.com/provencher/tree-sitter-php",
-                "9d7d6f649297ee01639e759795793cc57698031b", phpCodeMapQuery
+                .php, "https://github.com/tree-sitter/tree-sitter-php.git",
+                "5b5627faaa290d89eb3d01b9bf47c3bb9e797dea", phpCodeMapQuery
             ),
             .ruby: (
                 .ruby, "https://github.com/tree-sitter/tree-sitter-ruby",

@@ -20,7 +20,7 @@ pins. This directory maps the resolved components to their copied licenses.
 | Swift | <https://github.com/alex-pinkus/tree-sitter-swift> | `31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5` | `TreeSitterSwift` | [`LICENSE-tree-sitter-swift.txt`](LICENSE-tree-sitter-swift.txt) |
 | C# | <https://github.com/tree-sitter/tree-sitter-c-sharp.git> | `cac6d5fb595f5811a076336682d5d595ac1c9e85` | `TreeSitterCSharp` | [`LICENSE-tree-sitter-c-sharp.txt`](LICENSE-tree-sitter-c-sharp.txt) |
 | C++ | <https://github.com/tree-sitter/tree-sitter-cpp> | `f41e1a044c8a84ea9fa8577fdd2eab92ec96de02` | `TreeSitterCPP` | [`LICENSE-tree-sitter-max-brunsfeld-2014.txt`](LICENSE-tree-sitter-max-brunsfeld-2014.txt) |
-| PHP | <https://github.com/provencher/tree-sitter-php> | `9d7d6f649297ee01639e759795793cc57698031b` | `TreeSitterPHP` | [`LICENSE-tree-sitter-php.txt`](LICENSE-tree-sitter-php.txt) |
+| PHP | <https://github.com/tree-sitter/tree-sitter-php.git> | `5b5627faaa290d89eb3d01b9bf47c3bb9e797dea` | `TreeSitterPHP` | [`LICENSE-tree-sitter-php.txt`](LICENSE-tree-sitter-php.txt) |
 
 The C, Go, JavaScript, and C++ snapshots contain identical MIT license text,
 so they intentionally share one copy.

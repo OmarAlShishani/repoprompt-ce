@@ -1,6 +1,6 @@
 import CoreServices
 import Darwin
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class GitWorktreeCreationReceiptTests: XCTestCase {
@@ -1850,39 +1850,20 @@ private actor MutationTokenBox {
 }
 
 #if DEBUG
-    private actor ReceiptMutationLockGate {
-        private var entered = false
-        private var released = false
-        private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Receipt mutation lock fence (shared `TestReleaseFence` with legacy names).
+    private final class ReceiptMutationLockGate: @unchecked Sendable {
+        private let fence = TestReleaseFence(name: "receipt mutation lock gate")
 
         func enterAndWaitForRelease() async {
-            entered = true
-            let waiters = enteredWaiters
-            enteredWaiters.removeAll()
-            for waiter in waiters {
-                waiter.resume()
-            }
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
-            }
+            await fence.enterAndWait()
         }
 
-        func waitUntilEntered() async {
-            guard !entered else { return }
-            await withCheckedContinuation { continuation in
-                enteredWaiters.append(continuation)
-            }
+        func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+            _ = await fence.waitUntilEntered(timeout: timeout)
         }
 
         func release() {
-            released = true
-            let waiters = releaseWaiters
-            releaseWaiters.removeAll()
-            for waiter in waiters {
-                waiter.resume()
-            }
+            fence.release()
         }
     }
 #endif
@@ -1904,19 +1885,8 @@ private struct ReceiptFixture {
             .appendingPathComponent("GitWorktreeCreationReceiptTests-\(UUID().uuidString)", isDirectory: true)
         root = sandbox.appendingPathComponent("repo", isDirectory: true)
         worktrees = sandbox.appendingPathComponent("worktrees", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try ImmutableGitRepositoryTemplate.copy(.gitWorktreeReceiptBase, to: root)
         try FileManager.default.createDirectory(at: worktrees, withIntermediateDirectories: true)
-        try git(["init"])
-        try git(["config", "user.name", "RepoPrompt Test"])
-        try git(["config", "user.email", "repoprompt@example.test"])
-        try git(["config", "commit.gpgSign", "false"])
-        try write("Tracked.swift", "let value = 1\n")
-        try write(".gitignore", "secret.txt\nnested/ignored.txt\n")
-        try write(".worktreeinclude", "secret.txt\nnested/ignored.txt\n")
-        try write("secret.txt", "ephemeral secret\n")
-        try write("nested/ignored.txt", "nested ephemeral secret\n")
-        try git(["add", "Tracked.swift", ".gitignore", ".worktreeinclude"])
-        try git(["commit", "-m", "base"])
     }
 
     func initializationContext(

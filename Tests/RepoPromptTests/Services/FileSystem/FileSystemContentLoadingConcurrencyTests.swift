@@ -1,5 +1,5 @@
 import CoreServices
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
@@ -506,7 +506,10 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             }
         }
         let reachedLimit = await enteredCount.waitUntilValue(atLeast: limit)
-        try? await Task.sleep(nanoseconds: 100_000_000)
+        let saturatedSnapshot = await waitForProcessContentReadWorkerLimiterSnapshot {
+            $0.activePermitCount == limit &&
+                $0.queuedWaiterCount >= readCount - limit
+        }
         let enteredBeforeRelease = await enteredCount.value()
         await gate.release()
         for task in tasks {
@@ -514,6 +517,8 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
 
         XCTAssertTrue(reachedLimit)
+        XCTAssertEqual(saturatedSnapshot.activePermitCount, limit)
+        XCTAssertGreaterThanOrEqual(saturatedSnapshot.queuedWaiterCount, readCount - limit)
         XCTAssertEqual(enteredBeforeRelease, limit)
         await service.setContentReadChunkHandlerForTesting(nil)
     }
@@ -1042,10 +1047,11 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             XCTAssertEqual(afterError.foregroundActivityCount, 0)
 
             let started = AsyncSignal()
+            let cancellationGate = AsyncCancellationGate()
             let cancelled = Task {
                 try await limiter.withForegroundActivity(kind: .interactiveRead) {
                     await started.mark()
-                    try await Task.sleep(for: .seconds(60))
+                    try await cancellationGate.waitUntilCancelled()
                 }
             }
             let didStart = await started.waitUntilMarked()
@@ -1130,15 +1136,38 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             timeoutNanoseconds: UInt64 = 1_000_000_000,
             predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
         ) async -> ContentReadAsyncLimiter.Snapshot {
+            await waitForLimiterSnapshot(
+                timeoutNanoseconds: timeoutNanoseconds,
+                snapshotProvider: { await limiter.snapshotForTesting() },
+                predicate: predicate
+            )
+        }
+
+        private func waitForProcessContentReadWorkerLimiterSnapshot(
+            timeoutNanoseconds: UInt64 = 1_000_000_000,
+            predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
+        ) async -> ContentReadAsyncLimiter.Snapshot {
+            await waitForLimiterSnapshot(
+                timeoutNanoseconds: timeoutNanoseconds,
+                snapshotProvider: { await FileSystemService.contentReadWorkerLimiterSnapshotForTesting() },
+                predicate: predicate
+            )
+        }
+
+        private func waitForLimiterSnapshot(
+            timeoutNanoseconds: UInt64,
+            snapshotProvider: () async -> ContentReadAsyncLimiter.Snapshot,
+            predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
+        ) async -> ContentReadAsyncLimiter.Snapshot {
             let interval: UInt64 = 10_000_000
             var waited: UInt64 = 0
             while waited < timeoutNanoseconds {
-                let snapshot = await limiter.snapshotForTesting()
+                let snapshot = await snapshotProvider()
                 if predicate(snapshot) { return snapshot }
                 try? await Task.sleep(nanoseconds: interval)
                 waited += interval
             }
-            return await limiter.snapshotForTesting()
+            return await snapshotProvider()
         }
 
         private func saturateContentReadWorkers(
@@ -1275,41 +1304,36 @@ private enum ForegroundActivityTestError: Error {
     case expected
 }
 
-private actor AsyncGate {
-    private var started = false
-    private var released = false
-    private var startWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+/// Content-loading concurrency fence (shared `TestReleaseFence` with legacy names).
+private final class AsyncGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "file system content loading async gate")
 
     func markStartedAndWaitForRelease() async {
-        started = true
-        startWaiters.forEach { $0.resume() }
-        startWaiters.removeAll()
-        guard !released else { return }
-        await withCheckedContinuation { continuation in
-            releaseWaiters.append(continuation)
-        }
+        await fence.enterAndWaitIgnoringCancellationUntilRelease()
     }
 
-    func waitUntilStarted() async {
-        guard !started else { return }
-        await withCheckedContinuation { continuation in
-            startWaiters.append(continuation)
-        }
+    func waitUntilStarted(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
     func release() {
-        released = true
-        releaseWaiters.forEach { $0.resume() }
-        releaseWaiters.removeAll()
+        fence.release()
     }
 }
 
 private actor AsyncCounter {
+    private struct Waiter {
+        let target: Int
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
     private var count = 0
+    private var waiters: [UUID: Waiter] = [:]
+    private var cancelledWaiterIDs: Set<UUID> = []
 
     func incrementAndValue() -> Int {
         count += 1
+        resumeSatisfiedWaiters()
         return count
     }
 
@@ -1318,13 +1342,43 @@ private actor AsyncCounter {
     }
 
     func waitUntilValue(atLeast target: Int, timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-        let interval: UInt64 = 10_000_000
-        var waited: UInt64 = 0
-        while count < target, waited < timeoutNanoseconds {
-            try? await Task.sleep(nanoseconds: interval)
-            waited += interval
+        guard count < target else { return true }
+        let waiterID = UUID()
+        // Sticky cancel handled via cancelledWaiterIDs so cancel-before-register cannot hang.
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard count < target, !Task.isCancelled, cancelledWaiterIDs.remove(waiterID) == nil else {
+                    continuation.resume(returning: count >= target)
+                    return
+                }
+                waiters[waiterID] = Waiter(target: target, continuation: continuation)
+                Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    await self.finishWaiter(waiterID)
+                }
+            }
+        } onCancel: {
+            Task { await self.finishWaiter(waiterID, fromCancel: true) }
         }
-        return count >= target
+    }
+
+    private func resumeSatisfiedWaiters() {
+        let readyIDs = waiters.compactMap { id, waiter in
+            waiter.target <= count ? id : nil
+        }
+        for id in readyIDs {
+            waiters.removeValue(forKey: id)?.continuation.resume(returning: true)
+        }
+    }
+
+    private func finishWaiter(_ waiterID: UUID, fromCancel: Bool = false) {
+        if let waiter = waiters.removeValue(forKey: waiterID) {
+            waiter.continuation.resume(returning: count >= waiter.target)
+            return
+        }
+        if fromCancel {
+            cancelledWaiterIDs.insert(waiterID)
+        }
     }
 }
 
@@ -1342,9 +1396,15 @@ private actor AsyncValueRecorder {
 
 private actor AsyncSignal {
     private var marked = false
+    private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var cancelledWaiterIDs: Set<UUID> = []
 
     func mark() {
+        guard !marked else { return }
         marked = true
+        let continuations = Array(waiters.values)
+        waiters.removeAll()
+        continuations.forEach { $0.resume(returning: true) }
     }
 
     func isMarked() -> Bool {
@@ -1352,12 +1412,34 @@ private actor AsyncSignal {
     }
 
     func waitUntilMarked(timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-        let interval: UInt64 = 10_000_000
-        var waited: UInt64 = 0
-        while !marked, waited < timeoutNanoseconds {
-            try? await Task.sleep(nanoseconds: interval)
-            waited += interval
+        guard !marked else { return true }
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !marked, !Task.isCancelled, cancelledWaiterIDs.remove(waiterID) == nil else {
+                    continuation.resume(returning: marked)
+                    return
+                }
+                waiters[waiterID] = continuation
+                Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    await self.finishWaiter(waiterID)
+                }
+            }
+        } onCancel: {
+            Task { await self.finishWaiter(waiterID, fromCancel: true) }
         }
-        return marked
+    }
+
+    private func finishWaiter(_ waiterID: UUID, fromCancel: Bool = false) {
+        if let continuation = waiters.removeValue(forKey: waiterID) {
+            continuation.resume(returning: marked)
+            return
+        }
+        if fromCancel {
+            cancelledWaiterIDs.insert(waiterID)
+        }
     }
 }
+
+private typealias AsyncCancellationGate = TestCancellationGate

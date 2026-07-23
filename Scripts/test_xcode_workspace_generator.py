@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 
@@ -96,6 +97,29 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertIn("not mutate `Vendor/`", readme)
         self.assertIn("RepoPromptMCP", readme)
 
+    def test_manifest_preserves_thin_app_target_topology(self) -> None:
+        products = {product["name"]: product for product in self.manifest["products"]}
+        targets = {target["name"]: target for target in self.manifest["targets"]}
+
+        self.assertEqual(products["RepoPrompt"]["targets"], ["RepoPrompt"])
+        self.assertEqual(targets["RepoPrompt"]["type"], "executable")
+        self.assertEqual(targets["RepoPrompt"]["path"], "Sources/RepoPromptExecutable")
+        self.assertEqual(generator._by_name_dependencies(targets["RepoPrompt"]), ["RepoPromptApp"])
+        self.assertEqual(len(targets["RepoPrompt"]["dependencies"]), 1)
+
+        self.assertEqual(targets["RepoPromptApp"]["type"], "regular")
+        self.assertEqual(targets["RepoPromptApp"]["path"], "Sources/RepoPrompt")
+        self.assertEqual(
+            set(generator._by_name_dependencies(targets["RepoPromptTests"])),
+            {"RepoPromptApp", "RepoPromptCodeMapCore", "RepoPromptMCP", "RepoPromptShared"},
+        )
+        self.assertNotIn("RepoPrompt", generator._by_name_dependencies(targets["RepoPromptTests"]))
+
+    def test_generation_metadata_records_internal_app_target(self) -> None:
+        metadata = json.loads(self.outputs[Path("generation.json")])
+        self.assertIn("RepoPrompt", metadata["package"]["targets"])
+        self.assertIn("RepoPromptApp", metadata["package"]["targets"])
+
     def test_project_has_exactly_three_convenience_targets(self) -> None:
         project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()
         self.assertEqual(project.count("isa = PBXLegacyTarget;"), 3)
@@ -155,6 +179,39 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         path = Path(generator.PROJECT_NAME) / f"xcshareddata/xcschemes/{generator.MCP_SCHEME}.xcscheme"
         self.assertIn(".build/debug/repoprompt-mcp", self.outputs[path].decode())
 
+    def test_xcodebuild_list_uses_expected_command(self) -> None:
+        payload = {
+            "workspace": {
+                "schemes": [
+                    generator.APP_SCHEME,
+                    generator.MCP_SCHEME,
+                    generator.TEST_SCHEME,
+                    "RepoPrompt",
+                ],
+            },
+        }
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with patch.object(generator.subprocess, "run", return_value=completed) as run:
+            generator.validate_xcodebuild_list(Path("/tmp/generated-xcode"))
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "xcodebuild",
+                "-list",
+                "-json",
+                "-workspace",
+                "/tmp/generated-xcode/RepoPromptCE.xcworkspace",
+            ],
+        )
+        self.assertNotIn("env", run.call_args.kwargs)
+
     def test_check_detects_corruption(self) -> None:
         temporary, destination = self.generate_in_temporary_directory()
         self.addCleanup(temporary.cleanup)
@@ -207,12 +264,90 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptShared'"):
             generator.validate_manifest(missing_target, generator.REPO_ROOT)
 
+        missing_app_target = deepcopy(self.manifest)
+        missing_app_target["targets"] = [
+            target for target in missing_app_target["targets"] if target["name"] != "RepoPromptApp"
+        ]
+        with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptApp'"):
+            generator.validate_manifest(missing_app_target, generator.REPO_ROOT)
+
+        fat_executable = deepcopy(self.manifest)
+        for target in fat_executable["targets"]:
+            if target["name"] == "RepoPrompt":
+                target["path"] = "Sources/RepoPrompt"
+        with self.assertRaisesRegex(generator.GeneratorError, "thin Sources/RepoPromptExecutable"):
+            generator.validate_manifest(fat_executable, generator.REPO_ROOT)
+
+        wrong_executable_dependency = deepcopy(self.manifest)
+        for target in wrong_executable_dependency["targets"]:
+            if target["name"] == "RepoPrompt":
+                target["dependencies"] = [{"byName": ["RepoPromptShared", None]}]
+        with self.assertRaisesRegex(generator.GeneratorError, "depend only on 'RepoPromptApp'"):
+            generator.validate_manifest(wrong_executable_dependency, generator.REPO_ROOT)
+
+        old_test_dependency = deepcopy(self.manifest)
+        for target in old_test_dependency["targets"]:
+            if target["name"] == "RepoPromptTests":
+                target["dependencies"] = [
+                    {"byName": ["RepoPrompt", None]},
+                    {"byName": ["RepoPromptMCP", None]},
+                    {"byName": ["RepoPromptShared", None]},
+                ]
+        with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptTests must depend"):
+            generator.validate_manifest(old_test_dependency, generator.REPO_ROOT)
+
+        duplicate_bridging_header_owner = deepcopy(self.manifest)
+        target_map = {
+            target["name"]: target for target in duplicate_bridging_header_owner["targets"]
+        }
+        target_map["RepoPrompt"]["settings"] = target_map["RepoPromptApp"]["settings"]
+        with self.assertRaisesRegex(generator.GeneratorError, "must not own"):
+            generator.validate_manifest(duplicate_bridging_header_owner, generator.REPO_ROOT)
+
+        missing_bridging_header_owner = deepcopy(self.manifest)
+        target_map = {
+            target["name"]: target for target in missing_bridging_header_owner["targets"]
+        }
+        target_map["RepoPromptApp"]["settings"] = []
+        with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptApp must own"):
+            generator.validate_manifest(missing_bridging_header_owner, generator.REPO_ROOT)
+
         bad_resources = deepcopy(self.manifest)
         for target in bad_resources["targets"]:
-            if target["name"] == "RepoPromptTests":
+            if target["name"] == "RepoPromptCodeMapCoreTests":
                 target["resources"] = []
-        with self.assertRaisesRegex(generator.GeneratorError, "CodeMap/Fixtures"):
+        with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptCodeMapCoreTests"):
             generator.validate_manifest(bad_resources, generator.REPO_ROOT)
+
+        moved_resources = deepcopy(bad_resources)
+        moved_resources["targets"].append({
+            "name": "RepoPromptWorkspaceTests",
+            "type": "test",
+            "resources": [
+                {"path": "Fixtures", "rule": {"copy": {}}},
+                {"path": "Goldens", "rule": {"copy": {}}},
+            ],
+        })
+        with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptCodeMapCoreTests"):
+            generator.validate_manifest(moved_resources, generator.REPO_ROOT)
+
+        duplicate_resources = deepcopy(self.manifest)
+        duplicate_resources["targets"].append({
+            "name": "RepoPromptWorkspaceTests",
+            "type": "test",
+            "resources": [
+                {"path": "Fixtures", "rule": {"copy": {}}},
+                {"path": "Goldens", "rule": {"copy": {}}},
+            ],
+        })
+        with self.assertRaisesRegex(generator.GeneratorError, "sole SwiftPM test target"):
+            generator.validate_manifest(duplicate_resources, generator.REPO_ROOT)
+
+        extra_resources = deepcopy(self.manifest)
+        for target in extra_resources["targets"]:
+            if target["name"] == "RepoPromptCodeMapCoreTests":
+                target["resources"].append({"path": "Extra/Fixtures", "rule": {"copy": {}}})
+        generator.validate_manifest(extra_resources, generator.REPO_ROOT)
 
     def test_generation_does_not_modify_package_authority(self) -> None:
         before = {name: digest(generator.REPO_ROOT / name) for name in ("Package.swift", "Package.resolved")}

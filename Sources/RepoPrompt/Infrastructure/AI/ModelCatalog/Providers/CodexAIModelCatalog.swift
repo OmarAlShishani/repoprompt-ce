@@ -285,11 +285,10 @@ enum CodexDynamicModelMapper {
         if lower == "codex" { return "Codex" }
         if lower == "openai" { return "OpenAI" }
         if lower == "xhigh" { return "XHigh" }
+        if lower == "ultra" { return "Ultra" }
         if lower == "low" { return "Low" }
         if lower == "medium" { return "Medium" }
         if lower == "high" { return "High" }
-        if lower == "max" { return "Max" }
-        if lower == "ultra" { return "Ultra" }
         if lower == "minimal" { return "Minimal" }
         if lower == "none" { return "None" }
         if isONumberToken(lower) { return lower.uppercased() }
@@ -442,9 +441,10 @@ enum CodexAIModelCatalog {
     private static func shouldBackfillRecommendedModels(_ models: [AIModel]) -> Bool {
         let identities = Set(models.compactMap { codexOptionIdentity(for: $0) })
         let requiredIdentityGroups: [[String]] = [
-            ["gpt-5.5-low"],
-            ["gpt-5.5-medium"],
-            ["gpt-5.5-high"]
+            ["gpt-5.6-sol-low"],
+            ["gpt-5.6-sol-medium"],
+            ["gpt-5.6-sol-high"],
+            ["gpt-5.3-codex", "gpt-5.3-codex-medium"]
         ]
         return requiredIdentityGroups.contains { group in
             !group.contains { identities.contains($0) }
@@ -455,14 +455,23 @@ enum CodexAIModelCatalog {
         switch model {
         case let .codexCustom(name):
             let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return normalized.isEmpty ? nil : normalized
+            return normalized.isEmpty ? nil : canonicalCodexOptionIdentity(normalized)
         default:
             let rawValue = model.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let prefix = "codex_cli_"
             guard rawValue.lowercased().hasPrefix(prefix) else { return nil }
             let identity = String(rawValue.dropFirst(prefix.count)).lowercased()
-            return identity.isEmpty ? nil : identity
+            return identity.isEmpty ? nil : canonicalCodexOptionIdentity(identity)
         }
+    }
+
+    private static func canonicalCodexOptionIdentity(_ raw: String) -> String {
+        let specifier = CodexModelSpecifier(raw: raw)
+        guard let base = specifier.baseModel?.lowercased(), base == "gpt-5.6" else {
+            return raw
+        }
+        guard let effort = specifier.reasoningEffort else { return "gpt-5.6-sol" }
+        return "gpt-5.6-sol-\(effort.rawValue)"
     }
 
     private static func synthesizedFastAIModels(from models: [AIModel]) -> [AIModel] {

@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class WorkspaceCodemapArtifactBindingTests: XCTestCase {
@@ -169,7 +170,7 @@ final class WorkspaceCodemapArtifactBindingTests: XCTestCase {
     func testBindingAcceptsOnlyProofBoundCleanGitBlobCompletion() async throws {
         let fixture = try await makeCleanFixture(
             name: #function,
-            text: "struct Clean {}"
+            text: SwiftFixtureSource.emptyStruct("Clean", trailingNewline: false)
         )
         let completion = try XCTUnwrap(WorkspaceCodemapArtifactCompletion.cleanGitBlob(
             token: fixture.token,
@@ -185,24 +186,24 @@ final class WorkspaceCodemapArtifactBindingTests: XCTestCase {
     func testCleanCompletionFactoryRejectsUnrelatedVerifiedAssociations() async throws {
         let expected = try await makeCleanFixture(
             name: "\(#function)-expected",
-            text: "struct Expected {}"
+            text: SwiftFixtureSource.emptyStruct("Expected", trailingNewline: false)
         )
         let wrongNamespace = try await makeCleanFixture(
             name: "\(#function)-namespace",
-            text: "struct Expected {}"
+            text: SwiftFixtureSource.emptyStruct("Expected", trailingNewline: false)
         )
         let wrongFormat = try await makeCleanFixture(
             name: "\(#function)-format",
-            text: "struct Expected {}",
+            text: SwiftFixtureSource.emptyStruct("Expected", trailingNewline: false),
             format: .sha256
         )
         let wrongOID = try await makeCleanFixture(
             name: "\(#function)-oid",
-            text: "struct OtherOID {}"
+            text: SwiftFixtureSource.emptyStruct("OtherOID", trailingNewline: false)
         )
         let wrongPipeline = try await makeCleanFixture(
             name: "\(#function)-pipeline",
-            text: "struct Expected {}",
+            text: SwiftFixtureSource.emptyStruct("Expected", trailingNewline: false),
             language: .python
         )
 
@@ -490,7 +491,7 @@ final class WorkspaceCodemapArtifactBindingTests: XCTestCase {
 
     private func makeWorktreeFixture(
         name: String,
-        text: String = "struct Example {}",
+        text: String = SwiftFixtureSource.emptyStruct("Example", trailingNewline: false),
         loadedRootRelativePath: String = "",
         rootID: UUID = UUID(),
         rootLifetimeID: UUID = UUID()
@@ -503,8 +504,8 @@ final class WorkspaceCodemapArtifactBindingTests: XCTestCase {
             name: name,
             files: [
                 repositoryPath: text,
-                "Sources/Other.swift": "struct Other {}",
-                "Sources/Auxiliary.swift": "struct Auxiliary {}"
+                "Sources/Other.swift": SwiftFixtureSource.emptyStruct("Other", trailingNewline: false),
+                "Sources/Auxiliary.swift": SwiftFixtureSource.emptyStruct("Auxiliary", trailingNewline: false)
             ],
             loadedRootRelativePath: loadedRootRelativePath,
             rootID: rootID,

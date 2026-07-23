@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
@@ -9,9 +9,9 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         let selectedA = root.appendingPathComponent("A.swift")
         let selectedB = root.appendingPathComponent("B.swift")
         let manual = root.appendingPathComponent("Manual.swift")
-        try write("struct A {}", to: selectedA)
-        try write("struct B {}", to: selectedB)
-        try write("struct Manual {}", to: manual)
+        try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: selectedA)
+        try write(SwiftFixtureSource.emptyStruct("B", trailingNewline: false), to: selectedB)
+        try write(SwiftFixtureSource.emptyStruct("Manual", trailingNewline: false), to: manual)
 
         let store = WorkspaceFileContextStore()
         let loaded = try await store.loadRoot(path: root.path)
@@ -54,7 +54,7 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         let root = try makeRoot(named: #function)
         defer { try? FileManager.default.removeItem(at: root) }
         let file = root.appendingPathComponent("Selected.swift")
-        try write("struct Selected {}", to: file)
+        try write(SwiftFixtureSource.emptyStruct("Selected", trailingNewline: false), to: file)
 
         let store = WorkspaceFileContextStore()
         let loaded = try await store.loadRoot(path: root.path)
@@ -109,7 +109,7 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         XCTAssertTrue(removed.mutated)
     }
 
-    func testStoredSelectionPersistsManualPathsButDiscardsLegacyInferredPathKey() throws {
+    func testStoredSelectionIgnoresLegacyInferredPathsAndWritesCompatibilityAlias() throws {
         let legacyJSON = try XCTUnwrap(
             """
             {
@@ -128,16 +128,26 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         XCTAssertFalse(decoded.codemapAutoEnabled)
 
         let encoded = try JSONEncoder().encode(decoded)
-        let encodedText = try XCTUnwrap(String(data: encoded, encoding: .utf8))
         let encodedObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         )
-        XCTAssertFalse(encodedText.contains("autoCodemapPaths"))
-        XCTAssertFalse(encodedText.contains("/workspace/Legacy.swift"))
         XCTAssertEqual(
             encodedObject["manualCodemapPaths"] as? [String],
             ["/workspace/Manual.swift"]
         )
+        XCTAssertEqual(encodedObject["autoCodemapPaths"] as? [String], [])
+    }
+
+    func testStoredSelectionEncodingRemainsReadableByLegacyDecoder() throws {
+        let currentManual = StoredSelection(
+            selectedPaths: ["/workspace/Source.swift"],
+            manualCodemapPaths: ["/workspace/Manual.swift"],
+            codemapAutoEnabled: false
+        )
+
+        let manualEncoded = try JSONEncoder().encode(currentManual)
+        let legacyManual = try JSONDecoder().decode(LegacyStoredSelection.self, from: manualEncoded)
+        XCTAssertTrue(legacyManual.autoCodemapPaths.isEmpty)
     }
 
     func testSelectionProductionPathContainsNoLegacyRelationshipCalls() throws {
@@ -192,4 +202,11 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         )
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
+}
+
+private struct LegacyStoredSelection: Codable {
+    let selectedPaths: [String]
+    let autoCodemapPaths: [String]
+    let slices: [String: [LineRange]]
+    let codemapAutoEnabled: Bool
 }

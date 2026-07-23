@@ -1,5 +1,6 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
@@ -27,14 +28,14 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testCleanManifestBaselineRequiresExactCapabilityAuthorityAndCurrentNamespace() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Sources/Clean.swift": "struct Clean {}"]
+            files: ["Sources/Clean.swift": SwiftFixtureSource.emptyStruct("Clean", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
 
         let clean = try await makeCleanReady(
             fixture: fixture,
             path: "Sources/Clean.swift",
-            text: "struct Clean {}",
+            text: SwiftFixtureSource.emptyStruct("Clean", trailingNewline: false),
             fileID: uuid("10000000-0000-0000-0000-000000000001")
         )
         let manifest = try makeManifest(fixture: fixture, records: [clean.record])
@@ -78,14 +79,14 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testDirtyPendingAndReadyShadowCleanUntilExplicitManifestRevalidation() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Sources/Shadow.swift": "struct Shadow {}"]
+            files: ["Sources/Shadow.swift": SwiftFixtureSource.emptyStruct("Shadow", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let fileID = uuid("20000000-0000-0000-0000-000000000001")
         let clean = try await makeCleanReady(
             fixture: fixture,
             path: "Sources/Shadow.swift",
-            text: "struct Shadow {}",
+            text: SwiftFixtureSource.emptyStruct("Shadow", trailingNewline: false),
             fileID: fileID
         )
         let manifest = try makeManifest(fixture: fixture, records: [clean.record])
@@ -150,8 +151,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "Old.swift": "struct Old {}",
-                "Destination.swift": "struct Destination {}"
+                "Old.swift": SwiftFixtureSource.emptyStruct("Old", trailingNewline: false),
+                "Destination.swift": SwiftFixtureSource.emptyStruct("Destination", trailingNewline: false)
             ]
         )
         defer { fixture.cleanup() }
@@ -205,7 +206,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testCheckoutAndAuthorityInvalidationFencePendingCompletionAndPermitExplicitRebind() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Authority.swift": "struct Authority {}"]
+            files: ["Authority.swift": SwiftFixtureSource.emptyStruct("Authority", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let ready = try await makeWorktreeReady(
@@ -250,7 +251,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testStaleCompletionMatrixDropsReplacedInvalidatedAndUnloadedRequests() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Stale.swift": "struct Stale {}"]
+            files: ["Stale.swift": SwiftFixtureSource.emptyStruct("Stale", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let fileID = uuid("50000000-0000-0000-0000-000000000001")
@@ -315,12 +316,12 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testRootUnloadIsIsolatedAndSameArtifactCanBeLeasedByTwoRoots() async throws {
         let sharedArtifactRootOwner = try await makeRootFixture(
             name: #function + "-one",
-            files: ["Shared.swift": "struct Shared {}"]
+            files: ["Shared.swift": SwiftFixtureSource.emptyStruct("Shared", trailingNewline: false)]
         )
         defer { sharedArtifactRootOwner.cleanup() }
         let second = try await makeRootFixture(
             name: #function + "-two",
-            files: ["Shared.swift": "struct Shared {}"],
+            files: ["Shared.swift": SwiftFixtureSource.emptyStruct("Shared", trailingNewline: false)],
             overlay: sharedArtifactRootOwner.overlay,
             artifactStore: sharedArtifactRootOwner.artifactStore
         )
@@ -377,7 +378,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testFrozenBundleLeaseSurvivesEvictionAndRootUnloadThenReleasesOnBundleLifecycle() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Lease.swift": "struct Lease {}"]
+            files: ["Lease.swift": SwiftFixtureSource.emptyStruct("Lease", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let ready = try await makeWorktreeReady(
@@ -441,7 +442,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testFrozenBundleConcurrentCloseAndReadIsLinearizableAndReleasesExactlyOnce() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Concurrent.swift": "struct Concurrent {}"]
+            files: ["Concurrent.swift": SwiftFixtureSource.emptyStruct("Concurrent", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let ready = try await makeWorktreeReady(
@@ -501,7 +502,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testFrozenBundleRemainsInternallyConsistentAcrossReplacement() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Frozen.swift": "struct Frozen {}"]
+            files: ["Frozen.swift": SwiftFixtureSource.emptyStruct("Frozen", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let fileID = uuid("80000000-0000-0000-0000-000000000001")
@@ -553,9 +554,9 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "Ready.swift": "struct Ready {}",
-                "Pending.swift": "struct Pending {}",
-                "Unavailable.swift": "struct Unavailable {}"
+                "Ready.swift": SwiftFixtureSource.emptyStruct("Ready", trailingNewline: false),
+                "Pending.swift": SwiftFixtureSource.emptyStruct("Pending", trailingNewline: false),
+                "Unavailable.swift": SwiftFixtureSource.emptyStruct("Unavailable", trailingNewline: false)
             ]
         )
         defer { fixture.cleanup() }
@@ -624,8 +625,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "First.swift": "struct First {}",
-                "Second.swift": "struct Second {}"
+                "First.swift": SwiftFixtureSource.emptyStruct("First", trailingNewline: false),
+                "Second.swift": SwiftFixtureSource.emptyStruct("Second", trailingNewline: false)
             ],
             policy: policy
         )
@@ -691,7 +692,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["FIFO.swift": "struct FIFO {}"],
+            files: ["FIFO.swift": SwiftFixtureSource.emptyStruct("FIFO", trailingNewline: false)],
             policy: policy
         )
         defer { fixture.cleanup() }
@@ -754,7 +755,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     }
 
     func testSnapshotsAndBundlesDoNotExposePhysicalRootOrSourceBytes() async throws {
-        let secretSource = "struct SourceBodyMustNotLeak_7F47C9 {}"
+        let secretSource = SwiftFixtureSource.emptyStruct("SourceBodyMustNotLeak_7F47C9", trailingNewline: false)
         let fixture = try await makeRootFixture(
             name: #function,
             files: ["Nested/Leak.swift": secretSource]
@@ -805,7 +806,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testTerminalCompletionBecomesUnavailableAndNeverEmitsGraphContribution() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Terminal.swift": "struct Terminal {}"]
+            files: ["Terminal.swift": SwiftFixtureSource.emptyStruct("Terminal", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let terminal = try await makeWorktreeReady(
@@ -836,8 +837,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function + "-validation",
             files: [
-                "Target.swift": "struct Target {}",
-                "Other.swift": "struct Other {}"
+                "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false),
+                "Other.swift": SwiftFixtureSource.emptyStruct("Other", trailingNewline: false)
             ]
         )
         defer { fixture.cleanup() }
@@ -898,8 +899,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let busyFixture = try await makeRootFixture(
             name: #function + "-busy",
             files: [
-                "Blocker.swift": "struct Blocker {}",
-                "Retry.swift": "struct Retry {}"
+                "Blocker.swift": SwiftFixtureSource.emptyStruct("Blocker", trailingNewline: false),
+                "Retry.swift": SwiftFixtureSource.emptyStruct("Retry", trailingNewline: false)
             ],
             policy: busyPolicy
         )
@@ -947,13 +948,13 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testManifestGenerationIsMonotonicAndExactDuplicateIsNonMutating() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Manifest.swift": "struct Manifest {}"]
+            files: ["Manifest.swift": SwiftFixtureSource.emptyStruct("Manifest", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let clean = try await makeCleanReady(
             fixture: fixture,
             path: "Manifest.swift",
-            text: "struct Manifest {}",
+            text: SwiftFixtureSource.emptyStruct("Manifest", trailingNewline: false),
             fileID: uuid("B1000000-0000-0000-0000-000000000001")
         )
         let generationTwo = try makeManifest(
@@ -1044,7 +1045,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let recordFixture = try await makeRootFixture(
             name: #function + "-records",
-            files: ["A.swift": "struct A {}", "B.swift": "struct B {}"],
+            files: ["A.swift": SwiftFixtureSource.emptyStruct("A", trailingNewline: false), "B.swift": SwiftFixtureSource.emptyStruct("B", trailingNewline: false)],
             policy: recordLimitedPolicy,
             overlay: recordOverlay
         )
@@ -1052,13 +1053,13 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let recordA = try await makeCleanReady(
             fixture: recordFixture,
             path: "A.swift",
-            text: "struct A {}",
+            text: SwiftFixtureSource.emptyStruct("A", trailingNewline: false),
             fileID: uuid("B2200000-0000-0000-0000-000000000001")
         )
         let recordB = try await makeCleanReady(
             fixture: recordFixture,
             path: "B.swift",
-            text: "struct B {}",
+            text: SwiftFixtureSource.emptyStruct("B", trailingNewline: false),
             fileID: uuid("B2200000-0000-0000-0000-000000000002")
         )
         let currentManifest = try makeManifest(
@@ -1149,14 +1150,14 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let byteFixture = try await makeRootFixture(
             name: #function + "-bytes",
-            files: ["Byte.swift": "struct Byte {}"],
+            files: ["Byte.swift": SwiftFixtureSource.emptyStruct("Byte", trailingNewline: false)],
             policy: byteLimitedPolicy
         )
         defer { byteFixture.cleanup() }
         let byteEntry = try await makeCleanReady(
             fixture: byteFixture,
             path: "Byte.swift",
-            text: "struct Byte {}",
+            text: SwiftFixtureSource.emptyStruct("Byte", trailingNewline: false),
             fileID: uuid("B2200000-0000-0000-0000-000000000003")
         )
         try await assertEqualValue(
@@ -1186,20 +1187,20 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let entryFixture = try await makeRootFixture(
             name: #function + "-entries",
-            files: ["C.swift": "struct C {}", "D.swift": "struct D {}"],
+            files: ["C.swift": SwiftFixtureSource.emptyStruct("C", trailingNewline: false), "D.swift": SwiftFixtureSource.emptyStruct("D", trailingNewline: false)],
             policy: entryLimitedPolicy
         )
         defer { entryFixture.cleanup() }
         let entryC = try await makeCleanReady(
             fixture: entryFixture,
             path: "C.swift",
-            text: "struct C {}",
+            text: SwiftFixtureSource.emptyStruct("C", trailingNewline: false),
             fileID: uuid("B2200000-0000-0000-0000-000000000004")
         )
         let entryD = try await makeCleanReady(
             fixture: entryFixture,
             path: "D.swift",
-            text: "struct D {}",
+            text: SwiftFixtureSource.emptyStruct("D", trailingNewline: false),
             fileID: uuid("B2200000-0000-0000-0000-000000000005")
         )
         try await assertEqualValue(
@@ -1218,13 +1219,13 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testManifestLoadsAreFencedByEveryOverlayInvalidationAndFreshRevalidation() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Fence.swift": "struct Fence {}"]
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let clean = try await makeCleanReady(
             fixture: fixture,
             path: "Fence.swift",
-            text: "struct Fence {}",
+            text: SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false),
             fileID: uuid("B2000000-0000-0000-0000-000000000001")
         )
         let manifest = try makeManifest(fixture: fixture, records: [clean.record])
@@ -1299,7 +1300,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Fence.swift": "struct Fence {}"],
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)],
             overlay: overlay
         )
         defer { fixture.cleanup() }
@@ -1307,7 +1308,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let clean = try await makeCleanReady(
             fixture: fixture,
             path: "Fence.swift",
-            text: "struct Fence {}",
+            text: SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false),
             fileID: uuid("B2000000-0000-0000-0000-000000000002")
         )
         let manifest = try makeManifest(fixture: fixture, records: [clean.record])
@@ -1359,7 +1360,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testManifestAdoptionTicketCurrentRequiresExactLiveRootGeneration() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Fence.swift": "struct Fence {}"]
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
 
@@ -1405,7 +1406,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let overlay = WorkspaceCodemapLiveOverlay(initialManifestInvalidationGeneration: .max)
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Fence.swift": "struct Fence {}"],
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)],
             overlay: overlay
         )
         defer { fixture.cleanup() }
@@ -1432,7 +1433,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let overlay = WorkspaceCodemapLiveOverlay(initialContributionGeneration: .max)
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Fence.swift": "struct Fence {}"],
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)],
             overlay: overlay
         )
         defer { fixture.cleanup() }
@@ -1467,14 +1468,14 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Capacity.swift": "struct Capacity {}"],
+            files: ["Capacity.swift": SwiftFixtureSource.emptyStruct("Capacity", trailingNewline: false)],
             policy: policy
         )
         defer { fixture.cleanup() }
         let clean = try await makeCleanReady(
             fixture: fixture,
             path: "Capacity.swift",
-            text: "struct Capacity {}",
+            text: SwiftFixtureSource.emptyStruct("Capacity", trailingNewline: false),
             fileID: uuid("B2100000-0000-0000-0000-000000000001")
         )
         let manifest = try makeManifest(fixture: fixture, records: [clean.record])
@@ -1519,7 +1520,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "Swift.swift": "struct SwiftValue {}",
+                "Swift.swift": SwiftFixtureSource.emptyStruct("SwiftValue", trailingNewline: false),
                 "TypeScript.ts": "export const value = 1"
             ]
         )
@@ -1535,7 +1536,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let swift = try await makeCleanReady(
             fixture: fixture,
             path: "Swift.swift",
-            text: "struct SwiftValue {}",
+            text: SwiftFixtureSource.emptyStruct("SwiftValue", trailingNewline: false),
             fileID: uuid("B2150000-0000-0000-0000-000000000001")
         )
         let typeScript = try await makeCleanReady(
@@ -1602,8 +1603,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "Obsolete.swift": "struct Obsolete {}",
-                "Terminal.swift": "struct Terminal {}"
+                "Obsolete.swift": SwiftFixtureSource.emptyStruct("Obsolete", trailingNewline: false),
+                "Terminal.swift": SwiftFixtureSource.emptyStruct("Terminal", trailingNewline: false)
             ]
         )
         defer { fixture.cleanup() }
@@ -1611,7 +1612,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let obsolete = try await makeCleanReady(
             fixture: fixture,
             path: "Obsolete.swift",
-            text: "struct Obsolete {}",
+            text: SwiftFixtureSource.emptyStruct("Obsolete", trailingNewline: false),
             fileID: uuid("B2200000-0000-0000-0000-000000000001")
         )
         try await assertEqualValue(
@@ -1643,7 +1644,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let terminalReady = try await makeCleanReady(
             fixture: fixture,
             path: "Terminal.swift",
-            text: "struct Terminal {}",
+            text: SwiftFixtureSource.emptyStruct("Terminal", trailingNewline: false),
             fileID: uuid("B2200000-0000-0000-0000-000000000002")
         )
         try await assertEqualValue(
@@ -1708,8 +1709,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "Same.swift": "struct Same {}",
-                "Other.swift": "struct Other {}"
+                "Same.swift": SwiftFixtureSource.emptyStruct("Same", trailingNewline: false),
+                "Other.swift": SwiftFixtureSource.emptyStruct("Other", trailingNewline: false)
             ],
             policy: policy
         )
@@ -1817,8 +1818,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
             let fixture = try await makeRootFixture(
                 name: #function + (terminalState ? "-unavailable" : "-cancelled"),
                 files: [
-                    "Hidden.swift": "struct Hidden {}",
-                    "Unrelated.swift": "struct Unrelated {}"
+                    "Hidden.swift": SwiftFixtureSource.emptyStruct("Hidden", trailingNewline: false),
+                    "Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated", trailingNewline: false)
                 ],
                 policy: policy
             )
@@ -1829,7 +1830,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
             let clean = try await makeCleanReady(
                 fixture: fixture,
                 path: "Hidden.swift",
-                text: "struct Hidden {}",
+                text: SwiftFixtureSource.emptyStruct("Hidden", trailingNewline: false),
                 fileID: fileID
             )
             try await assertEqualValue(
@@ -1905,10 +1906,10 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "A.swift": "struct A {}",
-                "B.swift": "struct B {}",
-                "C.swift": "struct C {}",
-                "D.swift": "struct D {}"
+                "A.swift": SwiftFixtureSource.emptyStruct("A", trailingNewline: false),
+                "B.swift": SwiftFixtureSource.emptyStruct("B", trailingNewline: false),
+                "C.swift": SwiftFixtureSource.emptyStruct("C", trailingNewline: false),
+                "D.swift": SwiftFixtureSource.emptyStruct("D", trailingNewline: false)
             ],
             policy: policy
         )
@@ -1978,7 +1979,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Owner.swift": "struct Owner {}"],
+            files: ["Owner.swift": SwiftFixtureSource.emptyStruct("Owner", trailingNewline: false)],
             policy: policy
         )
         defer { fixture.cleanup() }
@@ -1999,7 +2000,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let second = try await makeRootFixture(
             name: #function + "-second",
-            files: ["SecondOwner.swift": "struct SecondOwner {}"],
+            files: ["SecondOwner.swift": SwiftFixtureSource.emptyStruct("SecondOwner", trailingNewline: false)],
             policy: policy,
             overlay: fixture.overlay,
             artifactStore: fixture.artifactStore
@@ -2053,9 +2054,9 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "Hot.swift": "struct Hot {}",
-                "Cold.swift": "struct Cold {}",
-                "New.swift": "struct New {}"
+                "Hot.swift": SwiftFixtureSource.emptyStruct("Hot", trailingNewline: false),
+                "Cold.swift": SwiftFixtureSource.emptyStruct("Cold", trailingNewline: false),
+                "New.swift": SwiftFixtureSource.emptyStruct("New", trailingNewline: false)
             ],
             policy: policy,
             overlay: overlay
@@ -2126,9 +2127,9 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "A.swift": "struct A {}",
-                "B.swift": "struct B {}",
-                "C.swift": "struct C {}"
+                "A.swift": SwiftFixtureSource.emptyStruct("A", trailingNewline: false),
+                "B.swift": SwiftFixtureSource.emptyStruct("B", trailingNewline: false),
+                "C.swift": SwiftFixtureSource.emptyStruct("C", trailingNewline: false)
             ],
             policy: policy,
             overlay: overlay
@@ -2212,7 +2213,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let overlay = WorkspaceCodemapLiveOverlay(policy: policy)
         let first = try await makeRootFixture(
             name: #function + "-first",
-            files: ["First.swift": "struct First {}"],
+            files: ["First.swift": SwiftFixtureSource.emptyStruct("First", trailingNewline: false)],
             policy: policy,
             overlay: overlay
         )
@@ -2220,8 +2221,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let second = try await makeRootFixture(
             name: #function + "-second",
             files: [
-                "Second.swift": "struct Second {}",
-                "Third.swift": "struct Third {}"
+                "Second.swift": SwiftFixtureSource.emptyStruct("Second", trailingNewline: false),
+                "Third.swift": SwiftFixtureSource.emptyStruct("Third", trailingNewline: false)
             ],
             policy: policy,
             overlay: overlay,
@@ -2274,7 +2275,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testGraphSnapshotsRequireConsumeTimeCurrentness() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Graph.swift": "struct Graph {}"]
+            files: ["Graph.swift": SwiftFixtureSource.emptyStruct("Graph", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let fileID = uuid("B5000000-0000-0000-0000-000000000001")
@@ -2357,8 +2358,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let fixture = try await makeRootFixture(
             name: #function,
             files: [
-                "Fence.swift": "struct Fence {}",
-                "Other.swift": "struct Other {}"
+                "Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false),
+                "Other.swift": SwiftFixtureSource.emptyStruct("Other", trailingNewline: false)
             ]
         )
         defer { fixture.cleanup() }
@@ -2378,7 +2379,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
 
         let differentLifetime = try await makeRootFixture(
             name: #function + "-lifetime",
-            files: ["Fence.swift": "struct Fence {}"],
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)],
             rootID: fixture.rootEpoch.rootID,
             rootLifetimeID: UUID()
         )
@@ -2416,7 +2417,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
 
         let foreignAuthority = try await WorkspaceCodemapAuthorityTestFixture.make(
             name: #function + "-authority",
-            files: ["Fence.swift": "struct Fence {}"],
+            files: ["Fence.swift": SwiftFixtureSource.emptyStruct("Fence", trailingNewline: false)],
             rootID: fixture.rootEpoch.rootID,
             rootLifetimeID: fixture.rootEpoch.rootLifetimeID
         )
@@ -2546,7 +2547,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     func testExactDuplicateCompletionRequiresCurrentTicketAndClosesDuplicateLease() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
-            files: ["Duplicate.swift": "struct Duplicate {}"]
+            files: ["Duplicate.swift": SwiftFixtureSource.emptyStruct("Duplicate", trailingNewline: false)]
         )
         defer { fixture.cleanup() }
         let ready = try await makeWorktreeReady(
@@ -2598,8 +2599,8 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
             name: #function,
             files: [
                 "NoSymbols.swift": "let value = 1",
-                "Decode.swift": "struct Decode {}",
-                "Parse.swift": "struct Parse {}"
+                "Decode.swift": SwiftFixtureSource.emptyStruct("Decode", trailingNewline: false),
+                "Parse.swift": SwiftFixtureSource.emptyStruct("Parse", trailingNewline: false)
             ]
         )
         defer { fixture.cleanup() }
@@ -3115,30 +3116,27 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     }
 }
 
-private actor OverlayFirstCommitGate {
-    private var firstCommitEntered = false
-    private var firstCommitReleased = false
+/// First-commit-only fence: parks only on the first `enter()`.
+private final class OverlayFirstCommitGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "overlay first commit gate")
+    private let lock = NSLock()
     private var commitCount = 0
-    private var continuation: CheckedContinuation<Void, Never>?
 
     func enter() async {
-        commitCount += 1
-        guard commitCount == 1 else { return }
-        firstCommitEntered = true
-        if firstCommitReleased { return }
-        await withCheckedContinuation { continuation = $0 }
+        let shouldPark = lock.withLock { () -> Bool in
+            commitCount += 1
+            return commitCount == 1
+        }
+        guard shouldPark else { return }
+        await fence.enterAndWait()
     }
 
-    func waitUntilFirstCommit() async {
-        while !firstCommitEntered {
-            await Task.yield()
-        }
+    func waitUntilFirstCommit(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
     func releaseFirstCommit() {
-        firstCommitReleased = true
-        continuation?.resume()
-        continuation = nil
+        fence.release()
     }
 }
 

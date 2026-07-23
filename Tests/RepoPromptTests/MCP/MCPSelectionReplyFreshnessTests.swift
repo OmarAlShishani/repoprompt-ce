@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -50,13 +50,263 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         }
     }
 
+    func testSupportedMissingCodemapDiagnosticsArePending() async {
+        let file = makeFileRecord(relativePath: "Sources/Pending.swift")
+        let issue = WorkspaceCodemapOperationIssue.coordinationUnavailable
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .pending([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+
+        let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
+            for: [file],
+            presentation: presentation
+        ) { file in
+            file.standardizedRelativePath
+        }
+
+        XCTAssertEqual(diagnostics.pendingPaths, ["Sources/Pending.swift"])
+        XCTAssertEqual(diagnostics.unmappedPaths, [])
+    }
+
+    func testUnsupportedMissingCodemapDiagnosticsRemainUnmapped() async {
+        let file = makeFileRecord(relativePath: "README.txt")
+
+        let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
+            for: [file],
+            presentation: .empty
+        ) { file in
+            file.standardizedRelativePath
+        }
+
+        XCTAssertEqual(diagnostics.pendingPaths, [])
+        XCTAssertEqual(diagnostics.unmappedPaths, ["README.txt"])
+    }
+
+    func testWorkspaceContextCodeStructureUsesUsageAwareAutoDiagnostics() async throws {
+        let root = try makeTemporaryRoot(name: "WorkspaceCodeDiagnostics")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let tabID = UUID()
+        let (window, _) = await makeWindow(root: root, tabID: tabID, selection: StoredSelection())
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let selectedFile = makeFileRecord(relativePath: "Sources/Selected.swift")
+        let requestedCodemapFile = makeFileRecord(relativePath: "Sources/Requested.swift")
+        let selectedEntry = MCPServerViewModel.SelectionReplyAssembler.SelectedEntry(
+            entry: ResolvedPromptFileEntry(file: selectedFile)
+        )
+        let issue = WorkspaceCodemapOperationIssue.coordinationUnavailable
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .pending([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+        let collections = MCPServerViewModel.SelectionReplyAssembler.SelectionCollections(
+            selected: [selectedEntry],
+            codemap: [],
+            requestedCodemapFiles: [requestedCodemapFile],
+            codemapAutoEnabled: true,
+            codeMapUsage: .auto,
+            invalid: [],
+            codemapPresentation: presentation
+        )
+
+        let builder = MCPServerViewModel.CodeStructureBuilder(
+            owner: window.mcpServer,
+            lookupContext: .visibleWorkspace
+        )
+        let maybeDTO = await builder.build(for: collections)
+        let dto = try XCTUnwrap(maybeDTO)
+
+        XCTAssertEqual(dto.pendingPaths, ["Sources/Requested.swift"])
+        XCTAssertNil(dto.unmappedPaths)
+    }
+
+    func testTerminalCodemapDispositionOverridesPendingRegardlessOfIssueOrder() async {
+        let file = makeFileRecord(relativePath: "Sources/Terminal.swift")
+        let ticket = makeCodemapTicket(fileID: file.id, rootID: file.rootID)
+        let pending = WorkspaceCodemapOperationIssue.pending(fileID: file.id, ticket: ticket)
+        let terminal = WorkspaceCodemapOperationIssue.unavailable(
+            fileID: file.id,
+            reason: .unsupportedFileType
+        )
+
+        for issues in [[terminal, pending], [pending, terminal]] {
+            let presentation = WorkspaceCodemapOperationPresentation(
+                orderedEntries: [],
+                coverage: .pending(issues),
+                issues: issues,
+                publicationReceipt: nil
+            )
+            let diagnostics = await MCPServerViewModel.SelectionReplyAssembler.missingCodemapDiagnostics(
+                for: [file],
+                presentation: presentation
+            ) { file in
+                file.standardizedRelativePath
+            }
+
+            XCTAssertEqual(diagnostics.pendingPaths, [], "Issue order: \(issues)")
+            XCTAssertEqual(diagnostics.unmappedPaths, ["Sources/Terminal.swift"], "Issue order: \(issues)")
+        }
+    }
+
+    func testAutoUnsupportedNoTargetPresentationDoesNotMarkCodemapIncomplete() async throws {
+        let root = try makeTemporaryRoot(name: "AutoUnsupportedNoTarget")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let readme = root.appendingPathComponent("README.txt")
+        try write("plain text\n", to: readme)
+
+        let tabID = UUID()
+        let selection = StoredSelection(
+            selectedPaths: [readme.path],
+            codemapAutoEnabled: true
+        )
+        let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+
+        let issue = WorkspaceCodemapOperationIssue.automatic(.unavailable(.noReadySources))
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .pending([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+        let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+            codemapPresentation: presentation,
+            from: selection,
+            includeBlocks: true,
+            display: .relative,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertFalse(
+            reply.tokenAccounting?.incompleteComponents?.contains("codemap_presentation") == true,
+            String(describing: reply.tokenAccounting?.incompleteComponents)
+        )
+        XCTAssertTrue(reply.codeStructure?.pendingPaths?.isEmpty ?? true)
+        XCTAssertTrue(reply.codeStructure?.unmappedPaths?.isEmpty ?? true)
+    }
+
+    func testBorrowedAutoReplyReportsPendingAutomaticTargetCodemap() async throws {
+        let root = try makeTemporaryRoot(name: "AutoPendingTarget")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let source = root.appendingPathComponent("Source.swift")
+        let target = root.appendingPathComponent("Target.swift")
+        try write(SwiftFixtureSource.emptyStruct("Source"), to: source)
+        try write(SwiftFixtureSource.emptyStruct("Target"), to: target)
+
+        let tabID = UUID()
+        let selection = StoredSelection(
+            selectedPaths: [source.path],
+            codemapAutoEnabled: true
+        )
+        let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+        let maybeTargetRecord = await window.promptManager.workspaceFileContextStore.file(
+            rootID: loadedRoot.id,
+            relativePath: "Target.swift"
+        )
+        let targetRecord = try XCTUnwrap(maybeTargetRecord)
+        let rootEpoch = makeRootEpoch(rootID: targetRecord.rootID)
+        let issue = WorkspaceCodemapOperationIssue.automatic(.pending([
+            .candidateDemand(
+                rootEpoch: rootEpoch,
+                fileID: targetRecord.id,
+                ticket: makeCodemapTicket(fileID: targetRecord.id, rootID: targetRecord.rootID)
+            )
+        ]))
+        let presentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .pending([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+
+        let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+            codemapPresentation: presentation,
+            from: selection,
+            includeBlocks: true,
+            display: .full,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertTrue(
+            reply.tokenAccounting?.incompleteComponents?.contains("codemap_presentation") == true,
+            String(describing: reply.tokenAccounting?.incompleteComponents)
+        )
+        XCTAssertEqual(reply.codeStructure?.pendingPaths, [target.standardizedFileURL.path])
+        XCTAssertTrue(reply.codeStructure?.unmappedPaths?.isEmpty ?? true)
+    }
+
+    func testActiveVisibleSelectionMarksMissingCachedFileTokensIncomplete() async throws {
+        let root = try makeTemporaryRoot(name: "ActiveVisibleIncomplete")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let oldFile = root.appendingPathComponent("Old.swift")
+        let newFile = root.appendingPathComponent("New.swift")
+        try write(SwiftFixtureSource.emptyStruct("OldTokenBaseline"), to: oldFile)
+        try write(SwiftFixtureSource.emptyStruct("NewVisibleSelection"), to: newFile)
+
+        let tabID = UUID()
+        let oldSelection = StoredSelection(selectedPaths: [oldFile.path])
+        let newSelection = StoredSelection(selectedPaths: [newFile.path])
+        let (window, workspaceID) = await makeWindow(root: root, tabID: tabID, selection: oldSelection)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+        await window.promptManager.tokenCountingViewModel.forceImmediateRecount()
+
+        var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+        liveTab.selection = newSelection
+        XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
+        let context = makeContext(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: newSelection
+        )
+        let activeResolution = MCPServerViewModel.ResolvedTabContextSnapshot(
+            snapshot: context,
+            usesActiveTabCompatibility: true
+        )
+
+        let reply = await window.mcpServer.buildCurrentSelectionReply(
+            includeBlocks: false,
+            display: .full,
+            resolvedContext: activeResolution,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertEqual(reply.files?.map(\.path), [newFile.path])
+        XCTAssertEqual(reply.tokenAccounting?.source, "active_tab_published")
+        XCTAssertEqual(reply.tokenAccounting?.status, "incomplete")
+        XCTAssertTrue(reply.tokenAccounting?.refreshPending == true)
+        XCTAssertTrue(reply.tokenAccounting?.incompleteComponents?.contains("files") == true)
+        XCTAssertEqual(reply.totalTokens, 0)
+        let formatted = ToolOutputFormatter.formatSelectionReplyToString(reply)
+        XCTAssertTrue(formatted.contains("- Total tokens: pending (Auto view)"), formatted)
+        XCTAssertFalse(formatted.contains("- Total tokens: 0 (Auto view)"), formatted)
+    }
+
     func testMutationReplyRereadsLiveTabSelectionAfterProviderStabilization() async throws {
         let root = try makeTemporaryRoot(name: "MutationReply")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let staleFile = root.appendingPathComponent("Stale.swift")
         let freshFile = root.appendingPathComponent("Fresh.swift")
-        try write("struct Stale {}\n", to: staleFile)
-        try write("struct Fresh {}\n", to: freshFile)
+        try write(SwiftFixtureSource.emptyStruct("Stale"), to: staleFile)
+        try write(SwiftFixtureSource.emptyStruct("Fresh"), to: freshFile)
 
         let tabID = UUID()
         let staleSelection = StoredSelection(selectedPaths: [staleFile.path])
@@ -100,8 +350,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let staleFile = root.appendingPathComponent("Stale.swift")
         let freshFile = root.appendingPathComponent("Fresh.swift")
-        try write("struct Stale {}\n", to: staleFile)
-        try write("struct Fresh {}\n", to: freshFile)
+        try write(SwiftFixtureSource.emptyStruct("Stale"), to: staleFile)
+        try write(SwiftFixtureSource.emptyStruct("Fresh"), to: freshFile)
 
         let tabID = UUID()
         let staleSelection = StoredSelection(selectedPaths: [staleFile.path])
@@ -148,8 +398,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let staleFile = root.appendingPathComponent("Stale.swift")
         let freshFile = root.appendingPathComponent("Fresh.swift")
-        try write("struct Stale {}\n", to: staleFile)
-        try write("struct Fresh {}\n", to: freshFile)
+        try write(SwiftFixtureSource.emptyStruct("Stale"), to: staleFile)
+        try write(SwiftFixtureSource.emptyStruct("Fresh"), to: freshFile)
 
         let tabID = UUID()
         let staleSelection = StoredSelection(selectedPaths: [staleFile.path])
@@ -195,11 +445,11 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let slicedFile = root.appendingPathComponent("FreshSlice.swift")
         let codemapFile = root.appendingPathComponent("FreshCodemap.swift")
         let laterFile = root.appendingPathComponent("Later.swift")
-        try write("struct Stale {}\n", to: staleFile)
-        try write("struct FreshFull {}\n", to: fullFile)
-        try write("struct FreshSlice {}\n", to: slicedFile)
-        try write("struct FreshCodemap {}\n", to: codemapFile)
-        try write("struct Later {}\n", to: laterFile)
+        try write(SwiftFixtureSource.emptyStruct("Stale"), to: staleFile)
+        try write(SwiftFixtureSource.emptyStruct("FreshFull"), to: fullFile)
+        try write(SwiftFixtureSource.emptyStruct("FreshSlice"), to: slicedFile)
+        try write(SwiftFixtureSource.emptyStruct("FreshCodemap"), to: codemapFile)
+        try write(SwiftFixtureSource.emptyStruct("Later"), to: laterFile)
 
         let tabID = UUID()
         let staleSelection = StoredSelection(
@@ -373,9 +623,9 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
         }
-        try write("struct WorkspacePlaceholder {}\n", to: workspaceRoot.appendingPathComponent("Placeholder.swift"))
+        try write(SwiftFixtureSource.emptyStruct("WorkspacePlaceholder"), to: workspaceRoot.appendingPathComponent("Placeholder.swift"))
         let worktreeFile = worktreeRoot.appendingPathComponent("WorktreeOnly.swift")
-        try write("struct WorktreeOnly {}\n", to: worktreeFile)
+        try write(SwiftFixtureSource.emptyStruct("WorktreeOnly"), to: worktreeFile)
 
         let tabID = UUID()
         let logicalFile = workspaceRoot.appendingPathComponent(worktreeFile.lastPathComponent)
@@ -485,19 +735,19 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             try? FileManager.default.removeItem(at: firstWorktreeRoot.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: secondWorktreeRoot.deletingLastPathComponent())
         }
-        try write("struct FirstLogicalPlaceholder {}\n", to: firstLogicalRoot.appendingPathComponent("Placeholder.swift"))
-        try write("struct SecondLogicalPlaceholder {}\n", to: secondLogicalRoot.appendingPathComponent("Placeholder.swift"))
+        try write(SwiftFixtureSource.emptyStruct("FirstLogicalPlaceholder"), to: firstLogicalRoot.appendingPathComponent("Placeholder.swift"))
+        try write(SwiftFixtureSource.emptyStruct("SecondLogicalPlaceholder"), to: secondLogicalRoot.appendingPathComponent("Placeholder.swift"))
         let firstRelativePath = "Sources/First.swift"
         let secondRelativePath = "Sources/Second.swift"
-        try write("struct FirstWorktreeOnly {}\n", to: firstWorktreeRoot.appendingPathComponent(firstRelativePath))
-        try write("struct SecondWorktreeOnly {}\n", to: secondWorktreeRoot.appendingPathComponent(secondRelativePath))
+        try write(SwiftFixtureSource.emptyStruct("FirstWorktreeOnly"), to: firstWorktreeRoot.appendingPathComponent(firstRelativePath))
+        try write(SwiftFixtureSource.emptyStruct("SecondWorktreeOnly"), to: secondWorktreeRoot.appendingPathComponent(secondRelativePath))
 
         let tabID = UUID()
         let logicalSelection = StoredSelection(selectedPaths: [
             firstLogicalRoot.appendingPathComponent(firstRelativePath).path,
             secondLogicalRoot.appendingPathComponent(secondRelativePath).path
         ])
-        let (window, workspaceID) = await makeWindow(
+        let (window, _) = await makeWindow(
             roots: [firstLogicalRoot, secondLogicalRoot],
             tabID: tabID,
             selection: logicalSelection
@@ -599,7 +849,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let root = try makeTemporaryRoot(name: "ActiveTokenCache")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
             let fileURL = root.appendingPathComponent("Cached.swift")
-            try write("struct ActiveCachedTokenType {}\n", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("ActiveCachedTokenType"), to: fileURL)
 
             let tabID = UUID()
             let selection = StoredSelection(selectedPaths: [fileURL.path])
@@ -678,13 +928,13 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let root = try makeTemporaryRoot(name: "BoundTokenCache")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
             let fileURL = root.appendingPathComponent("Bound.swift")
-            try write("struct BoundCachedTokenType {}\n", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("BoundCachedTokenType"), to: fileURL)
 
             let tabID = UUID()
             let selection = StoredSelection(selectedPaths: [fileURL.path])
             let (window, workspaceID) = await makeWindow(root: root, tabID: tabID, selection: selection)
             defer { WindowStatesManager.shared.unregisterWindowState(window) }
-            let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
                 in: window,
                 path: root.path
             )
@@ -757,12 +1007,15 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             XCTAssertEqual(resolvedFirstReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedFirstReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedFirstReply.tokenAccounting?.refreshPending == true)
+            XCTAssertFalse(resolvedFirstReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(resolvedSecondReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedSecondReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedSecondReply.tokenAccounting?.refreshPending == true)
+            XCTAssertFalse(resolvedSecondReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(resolvedWorkspaceReply.tokenAccounting?.source, "bound_tab_cached_state")
             XCTAssertEqual(resolvedWorkspaceReply.tokenAccounting?.status, "incomplete")
             XCTAssertTrue(resolvedWorkspaceReply.tokenAccounting?.refreshPending == true)
+            XCTAssertFalse(resolvedWorkspaceReply.tokenAccounting?.incompleteComponents?.contains("files") == true)
             XCTAssertEqual(window.mcpServer.virtualTokenRefreshStartCountForTesting(), baselineStarts + 1)
             let refreshStartCount = await refreshGate.startCount()
             // Identical bound selection and workspace token requests share one signature,
@@ -773,11 +1026,72 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             window.mcpServer.setBeforeVirtualTokenRefreshForTesting(nil)
         }
 
+        func testBoundReplyUsesPublishedFileTokensWhileCodemapPresentationIsPending() async throws {
+            let root = try makeTemporaryRoot(name: "BoundPublishedPendingCodemap")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            let source = root.appendingPathComponent("Source.swift")
+            let target = root.appendingPathComponent("Target.swift")
+            try write("struct SourceForPublishedTokens { func selected() {} }\n", to: source)
+            try write("struct TargetForPendingCodemap { func related() {} }\n", to: target)
+
+            let tabID = UUID()
+            let selection = StoredSelection(
+                selectedPaths: [source.path],
+                codemapAutoEnabled: true
+            )
+            let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: root.path
+            )
+            await window.promptManager.tokenCountingViewModel.forceImmediateRecount()
+            let targetRecordCandidate = await window.promptManager.workspaceFileContextStore.file(
+                rootID: loadedRoot.id,
+                relativePath: "Target.swift"
+            )
+            let targetRecord = try XCTUnwrap(targetRecordCandidate)
+            let rootEpoch = makeRootEpoch(rootID: targetRecord.rootID)
+            let issue = WorkspaceCodemapOperationIssue.automatic(.pending([
+                .candidateDemand(
+                    rootEpoch: rootEpoch,
+                    fileID: targetRecord.id,
+                    ticket: makeCodemapTicket(fileID: targetRecord.id, rootID: targetRecord.rootID)
+                )
+            ]))
+            let presentation = WorkspaceCodemapOperationPresentation(
+                orderedEntries: [],
+                coverage: .pending([issue]),
+                issues: [issue],
+                publicationReceipt: nil
+            )
+            let baselineStarts = window.mcpServer.virtualTokenRefreshStartCountForTesting()
+
+            let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+                codemapPresentation: presentation,
+                from: selection,
+                includeBlocks: false,
+                display: .full,
+                lookupContext: .visibleWorkspace
+            )
+
+            XCTAssertEqual(reply.files?.map(\.path), [source.path])
+            XCTAssertGreaterThan(reply.totalTokens ?? 0, 0)
+            XCTAssertEqual(reply.summary?.fullCount, 1)
+            XCTAssertGreaterThan(reply.summary?.fullTokens ?? 0, 0)
+            XCTAssertEqual(reply.tokenAccounting?.source, "bound_tab_cached_state")
+            XCTAssertEqual(reply.tokenAccounting?.status, "incomplete")
+            XCTAssertTrue(reply.tokenAccounting?.refreshPending == false)
+            XCTAssertFalse(reply.tokenAccounting?.incompleteComponents?.contains("files") == true)
+            XCTAssertTrue(reply.tokenAccounting?.incompleteComponents?.contains("codemap_presentation") == true)
+            XCTAssertEqual(window.mcpServer.virtualTokenRefreshStartCountForTesting(), baselineStarts)
+        }
+
         func testBoundMCPTokenRefreshesForDistinctSignaturesDoNotCancelEachOther() async throws {
             let root = try makeTemporaryRoot(name: "BoundTokenSignatures")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
             let fileURL = root.appendingPathComponent("Bound.swift")
-            try write("struct BoundDistinctSignatureType {}\n", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("BoundDistinctSignatureType"), to: fileURL)
 
             let tabID = UUID()
             let selection = StoredSelection(selectedPaths: [fileURL.path])
@@ -851,6 +1165,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             }
             XCTAssertEqual(window.mcpServer.virtualTokenRefreshTaskCountForTesting(), 0)
 
+            let startsBeforeCacheHits = window.mcpServer.virtualTokenRefreshStartCountForTesting()
             let firstCachedReply = await window.mcpServer.buildCurrentSelectionReply(
                 includeBlocks: false,
                 display: .relative,
@@ -864,7 +1179,12 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 lookupContext: .visibleWorkspace
             )
             XCTAssertEqual(firstCachedReply.tokenAccounting?.source, "bound_tab_cache")
+            XCTAssertEqual(firstCachedReply.tokenAccounting?.status, "stale")
+            XCTAssertTrue(firstCachedReply.tokenAccounting?.refreshPending == true)
             XCTAssertEqual(secondCachedReply.tokenAccounting?.source, "bound_tab_cache")
+            XCTAssertEqual(secondCachedReply.tokenAccounting?.status, "stale")
+            XCTAssertTrue(secondCachedReply.tokenAccounting?.refreshPending == true)
+            XCTAssertEqual(window.mcpServer.virtualTokenRefreshStartCountForTesting(), startsBeforeCacheHits + 2)
         }
     #endif
 
@@ -878,8 +1198,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             }
             let logicalFile = workspaceRoot.appendingPathComponent("Shared.swift")
             let physicalFile = worktreeRoot.appendingPathComponent("Shared.swift")
-            try write("struct Canonical {}\n", to: logicalFile)
-            try write("struct Worktree {}\n", to: physicalFile)
+            try write(SwiftFixtureSource.emptyStruct("Canonical"), to: logicalFile)
+            try write(SwiftFixtureSource.emptyStruct("Worktree"), to: physicalFile)
 
             let tabID = UUID()
             let sessionID = UUID()
@@ -988,8 +1308,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
             }
             let logicalFile = workspaceRoot.appendingPathComponent("Shared.swift")
-            try write("struct Canonical {}\n", to: logicalFile)
-            try write("struct Worktree {}\n", to: worktreeRoot.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("Canonical"), to: logicalFile)
+            try write(SwiftFixtureSource.emptyStruct("Worktree"), to: worktreeRoot.appendingPathComponent("Shared.swift"))
 
             let tabID = UUID()
             let sessionID = UUID()
@@ -1146,10 +1466,10 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 try? FileManager.default.removeItem(at: worktreeA.deletingLastPathComponent())
                 try? FileManager.default.removeItem(at: worktreeB.deletingLastPathComponent())
             }
-            try write("struct CanonicalA {}\n", to: workspaceRoot.appendingPathComponent("Shared.swift"))
-            try write("struct CanonicalB {}\n", to: replacementWorkspaceRoot.appendingPathComponent("Shared.swift"))
-            try write("struct WorktreeA {}\n", to: worktreeA.appendingPathComponent("Shared.swift"))
-            try write("struct WorktreeB {}\n", to: worktreeB.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("CanonicalA"), to: workspaceRoot.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("CanonicalB"), to: replacementWorkspaceRoot.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("WorktreeA"), to: worktreeA.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("WorktreeB"), to: worktreeB.appendingPathComponent("Shared.swift"))
 
             let tabID = UUID()
             let sessionID = UUID()
@@ -1294,7 +1614,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             let afterWorktreeDeletion = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
             XCTAssertEqual(afterWorktreeDeletion, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
             try FileManager.default.createDirectory(at: worktreeB, withIntermediateDirectories: true)
-            try write("struct WorktreeBRestored {}\n", to: worktreeB.appendingPathComponent("Shared.swift"))
+            try write(SwiftFixtureSource.emptyStruct("WorktreeBRestored"), to: worktreeB.appendingPathComponent("Shared.swift"))
             let afterWorktreeRestore = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
             XCTAssertEqual(
                 afterWorktreeRestore.translateInputPath(workspaceRoot.appendingPathComponent("Shared.swift").path),
@@ -1372,8 +1692,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
         }
-        try write("struct WorkspaceFile {}\n", to: workspaceRoot.appendingPathComponent("WorkspaceFile.swift"))
-        try write("struct WorktreeFile {}\n", to: worktreeRoot.appendingPathComponent("WorktreeFile.swift"))
+        try write(SwiftFixtureSource.emptyStruct("WorkspaceFile"), to: workspaceRoot.appendingPathComponent("WorkspaceFile.swift"))
+        try write(SwiftFixtureSource.emptyStruct("WorktreeFile"), to: worktreeRoot.appendingPathComponent("WorktreeFile.swift"))
 
         let tabID = UUID()
         let sessionID = UUID()
@@ -1387,10 +1707,13 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             in: window,
             path: workspaceRoot.path
         )
-        _ = try await window.workspaceFileContextStore.loadRoot(
+        let loadedSessionWorktreeRoot = try await window.workspaceFileContextStore.loadRoot(
             path: worktreeRoot.path,
             kind: .sessionWorktree
         )
+        addTeardownBlock {
+            await window.workspaceFileContextStore.unloadRoot(id: loadedSessionWorktreeRoot.id)
+        }
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: nil,
             clientName: "selection-reply-compatibility-test",
@@ -1526,6 +1849,39 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let root = parent.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root.standardizedFileURL
+    }
+
+    private func makeFileRecord(
+        relativePath: String,
+        rootID: UUID = UUID()
+    ) -> WorkspaceFileRecord {
+        WorkspaceFileRecord(
+            rootID: rootID,
+            name: URL(fileURLWithPath: relativePath).lastPathComponent,
+            relativePath: relativePath,
+            fullPath: "/workspace/project/\(relativePath)",
+            parentFolderID: nil
+        )
+    }
+
+    private func makeRootEpoch(rootID: UUID = UUID()) -> WorkspaceCodemapRootEpoch {
+        WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: UUID())
+    }
+
+    private func makeCodemapTicket(
+        fileID: UUID,
+        rootID: UUID = UUID()
+    ) -> WorkspaceCodemapArtifactDemandTicket {
+        WorkspaceCodemapArtifactDemandTicket(
+            retainID: UUID(),
+            requestID: UUID(),
+            rootEpoch: makeRootEpoch(rootID: rootID),
+            fileID: fileID,
+            requestGeneration: 1,
+            catalogGeneration: 1,
+            pathGeneration: 1,
+            ingressGeneration: 1
+        )
     }
 
     private func write(_ content: String, to url: URL) throws {

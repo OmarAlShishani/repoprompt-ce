@@ -1,5 +1,6 @@
+import Combine
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -77,6 +78,34 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(rows[1].gitContext, contextB)
         XCTAssertEqual(rows[1].gitContext?.breadcrumbText, "Repo / B / feature/b")
         XCTAssertTrue(rows[1].gitContext?.isMain == true)
+    }
+
+    func testWorkspaceManagerChangesDoNotRefreshRootRows() async {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let rootB = makeProjection(name: "B", path: "/tmp/B")
+        var projections = [rootA]
+        let rootChanges = PassthroughSubject<Void, Never>()
+        let manager = makeWorkspaceManager()
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { projections },
+            rootChanges: rootChanges.eraseToAnyPublisher(),
+            workspaceManager: manager,
+            windowID: -1
+        )
+        XCTAssertEqual(store.rootRows.map(\.id), [rootA.id])
+
+        projections = [rootB]
+        let metadataWorkspace = WorkspaceModel(name: "Manager Metadata Only", repoPaths: [])
+        manager.workspaces = [metadataWorkspace]
+        manager.activeWorkspace = metadataWorkspace
+        await waitUntil { store.workspaceLabel.hasPrefix("Manager Metadata") }
+
+        XCTAssertEqual(store.rootRows.map(\.id), [rootA.id])
+
+        rootChanges.send(())
+        await waitUntil { store.rootRows.map(\.id) == [rootB.id] }
+
+        XCTAssertEqual(store.rootRows.map(\.id), [rootB.id])
     }
 
     // MARK: - Root context actions
@@ -310,6 +339,74 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertNil(indicator.missingWorktreePath)
     }
 
+    func testWorktreeDisplayLabelHumanizesAppManagedAgentNames() {
+        let cases: [(raw: String, expected: String)] = [
+            ("rp-agent-1a98df1a-agent", "1a98df1a"),
+            ("rp-agent-1a98df1a-fix-login", "fix-login"),
+            ("rp-agent-1a98df1a-fix-login-abcdef12", "fix-login"),
+            ("rp-agent-1a98df1a-fix-login-abcdef12-2", "fix-login"),
+            ("rp/agent/1a98df1a-fix-login", "fix-login"),
+            ("team-feature-worktree", "team-feature-worktree")
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                GitWorktreeDisplayLabelHumanizer.displayLabel(for: testCase.raw),
+                testCase.expected,
+                testCase.raw
+            )
+        }
+    }
+
+    func testIndicatorHumanizesMachineFallbackWhileKeepingRawNameAccessible() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(
+                visualLabel: nil,
+                visualColorHex: nil,
+                worktreeName: "rp-agent-1a98df1a-agent",
+                branch: nil
+            ),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#112233"),
+            isAvailable: true
+        )
+
+        XCTAssertEqual(indicator.label, "1a98df1a")
+        XCTAssertEqual(indicator.rawLabel, "rp-agent-1a98df1a-agent")
+        XCTAssertEqual(indicator.capsuleText, "WT 1a98df1a")
+        XCTAssertTrue(indicator.tooltipText.contains("rp-agent-1a98df1a-agent"))
+        XCTAssertTrue(indicator.accessibilityText.contains("rp-agent-1a98df1a-agent"))
+    }
+
+    func testWorktreeVisualIdentitySeedPrefersMeaningfulSessionNameThenHumanizedWorktreeFallback() {
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: "  Implement login polish for sidebar  ",
+                worktreeName: "rp-agent-1a98df1a-agent",
+                branch: nil,
+                isMain: false
+            ),
+            "Implement login polish"
+        )
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: "New Chat",
+                worktreeName: "rp-agent-1a98df1a-fix-login-abcdef12-3",
+                branch: nil,
+                isMain: false
+            ),
+            "fix-login"
+        )
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: nil,
+                worktreeName: nil,
+                branch: "rp/agent/1a98df1a-agent",
+                isMain: false
+            ),
+            "1a98df1a"
+        )
+    }
+
     private func makeSummary(
         visualLabel: String? = "feature-x",
         visualColorHex: String? = "#123456",
@@ -361,6 +458,41 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
             isAvailable: true
         )
+    }
+
+    private func makeWorkspaceManager() -> WorkspaceManagerViewModel {
+        let fileManager = WorkspaceFilesViewModel()
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -1,
+            settingsManager: WindowSettingsManager(windowID: -1)
+        )
+        return WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTFail("Timed out waiting for condition")
     }
 
     private func makeProjection(

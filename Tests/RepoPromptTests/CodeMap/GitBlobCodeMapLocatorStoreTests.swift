@@ -1,7 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
@@ -136,7 +137,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
 
         for format in [GitObjectFormat.sha1, .sha256] {
             let association = try await makeVerifiedAssociation(
-                text: "struct Located {}",
+                text: SwiftFixtureSource.emptyStruct("Located", trailingNewline: false),
                 namespace: namespace,
                 format: format,
                 pipeline: pipeline,
@@ -164,12 +165,12 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let root = try makeSecureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let pipeline = try pipelineIdentity(.swift)
-        let rawBytes = Data("struct Proven {}".utf8)
-        let source = try makeCleanSource(rawBytes: rawBytes, format: .sha1)
+        let rawBytes = Data(SwiftFixtureSource.emptyStruct("Proven", trailingNewline: false).utf8)
+        let source = try await makeCleanSource(rawBytes: rawBytes, format: .sha1)
         guard case let .cleanGitBlob(repositoryNamespace, blobOID) = source.provenance else {
             return XCTFail("expected clean Git blob provenance")
         }
-        let key = makeArtifactKey(text: "struct Proven {}", pipeline: pipeline)
+        let key = makeArtifactKey(text: SwiftFixtureSource.emptyStruct("Proven", trailingNewline: false), pipeline: pipeline)
         let identity = GitBlobCodeMapLocatorIdentity(
             repositoryNamespace: repositoryNamespace,
             blobOID: blobOID,
@@ -201,7 +202,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             XCTAssertEqual($0 as? VerifiedGitBlobCodeMapLocatorAssociationError, .rawByteCountMismatch)
         }
 
-        let wrongDigestKey = makeArtifactKey(text: "struct Pr0ven {}", pipeline: pipeline)
+        let wrongDigestKey = makeArtifactKey(text: SwiftFixtureSource.emptyStruct("Pr0ven", trailingNewline: false), pipeline: pipeline)
         XCTAssertEqual(wrongDigestKey.rawByteCount, key.rawByteCount)
         XCTAssertThrowsError(try VerifiedGitBlobCodeMapLocatorAssociation.verify(
             source: source,
@@ -229,7 +230,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
 
         let worktreeFixture = try await WorkspaceCodemapAuthorityTestFixture.make(
             name: #function,
-            files: ["Sources/Proven.swift": "struct Proven {}"]
+            files: ["Sources/Proven.swift": SwiftFixtureSource.emptyStruct("Proven", trailingNewline: false)]
         )
         let worktreeSource = try await worktreeFixture.validatedWorktreeSource(
             loadedRootRelativePath: "Sources/Proven.swift"
@@ -289,7 +290,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             XCTAssertEqual($0 as? VerifiedGitBlobCodeMapLocatorAssociationError, .gitBlobOIDMismatch)
         }
 
-        let otherKey = makeArtifactKey(text: "struct Other {}", pipeline: pipeline)
+        let otherKey = makeArtifactKey(text: SwiftFixtureSource.emptyStruct("Other", trailingNewline: false), pipeline: pipeline)
         _ = try await artifactStore.insert(key: otherKey, deterministicOutcome: .readyNoSymbols)
         let otherHandle = try await requireHandle(artifactStore, key: otherKey)
         XCTAssertThrowsError(try VerifiedGitBlobCodeMapLocatorAssociation.verify(
@@ -339,7 +340,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let store = try GitBlobCodeMapLocatorStore(rootURL: root)
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let association = try await makeVerifiedAssociation(
-            text: "struct Valid {}",
+            text: SwiftFixtureSource.emptyStruct("Valid", trailingNewline: false),
             namespace: namespace,
             format: .sha1,
             pipeline: swiftPipeline,
@@ -449,7 +450,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let pipeline = try pipelineIdentity(.swift)
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let association = try await makeVerifiedAssociation(
-            text: "struct Concurrent {}",
+            text: SwiftFixtureSource.emptyStruct("Concurrent", trailingNewline: false),
             namespace: makeNamespace(commonDirectory: commonDirectory),
             format: .sha1,
             pipeline: pipeline,
@@ -467,7 +468,8 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         )
         let reader = try GitBlobCodeMapLocatorStore(rootURL: root)
         let task = Task { try await writer.write(association: association) }
-        await gate.waitUntilEntered()
+        let gateEntered = await gate.waitUntilEntered()
+        XCTAssertTrue(gateEntered)
         let readDuringPublish = try await reader.read(identity: identity)
         await gate.release()
         let publishResult = try await task.value
@@ -496,7 +498,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let pipeline = try pipelineIdentity(.swift)
         let artifactStore = try CodeMapArtifactStore(rootURL: artifactRoot)
         let association = try await makeVerifiedAssociation(
-            text: "struct ReplacedRoot {}",
+            text: SwiftFixtureSource.emptyStruct("ReplacedRoot", trailingNewline: false),
             namespace: makeNamespace(commonDirectory: commonDirectory),
             format: .sha1,
             pipeline: pipeline,
@@ -539,7 +541,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         )
         let artifactStore = try CodeMapArtifactStore(rootURL: artifactRoot)
         var associations: [VerifiedGitBlobCodeMapLocatorAssociation] = []
-        for text in ["struct First {}", "struct Second {}"] {
+        for text in [SwiftFixtureSource.emptyStruct("First", trailingNewline: false), SwiftFixtureSource.emptyStruct("Second", trailingNewline: false)] {
             try await associations.append(makeVerifiedAssociation(
                 text: text,
                 namespace: namespace,
@@ -713,7 +715,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let pipeline = try pipelineIdentity(.swift)
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let association = try await makeVerifiedAssociation(
-            text: "struct Race {}",
+            text: SwiftFixtureSource.emptyStruct("Race", trailingNewline: false),
             namespace: makeNamespace(commonDirectory: commonDirectory),
             format: .sha1,
             pipeline: pipeline,
@@ -733,7 +735,8 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             )
         )
         let truncateTask = Task { try await truncateReader.read(identity: identity) }
-        await truncateGate.waitUntilEntered()
+        let truncateEntered = await truncateGate.waitUntilEntered()
+        XCTAssertTrue(truncateEntered)
         let handle = try FileHandle(forWritingTo: recordURL)
         try handle.truncate(atOffset: 0)
         try handle.close()
@@ -753,7 +756,8 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
             )
         )
         let replaceTask = Task { try await replaceReader.read(identity: identity) }
-        await replaceGate.waitUntilEntered()
+        let replaceEntered = await replaceGate.waitUntilEntered()
+        XCTAssertTrue(replaceEntered)
         let replacement = recordURL.deletingLastPathComponent().appendingPathComponent("replacement")
         try original.write(to: replacement)
         XCTAssertEqual(chmod(replacement.path, 0o600), 0)
@@ -773,7 +777,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         let pipeline = try pipelineIdentity(.swift)
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let association = try await makeVerifiedAssociation(
-            text: "struct Secure {}",
+            text: SwiftFixtureSource.emptyStruct("Secure", trailingNewline: false),
             namespace: makeNamespace(commonDirectory: commonDirectory),
             format: .sha1,
             pipeline: pipeline,
@@ -899,7 +903,7 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
         artifactStore: CodeMapArtifactStore
     ) async throws -> VerifiedGitBlobCodeMapLocatorAssociation {
         let rawBytes = Data(text.utf8)
-        let source = try makeCleanSource(rawBytes: rawBytes, format: format)
+        let source = try await makeCleanSource(rawBytes: rawBytes, format: format)
         guard case let .cleanGitBlob(repositoryNamespace, blobOID) = source.provenance else {
             throw WorkspaceCodemapProvenanceTestSupportError.capabilityUnavailable
         }
@@ -922,8 +926,8 @@ final class GitBlobCodeMapLocatorStoreTests: XCTestCase {
     private func makeCleanSource(
         rawBytes: Data,
         format: GitObjectFormat
-    ) throws -> CodeMapSourceSnapshot {
-        try WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
+    ) async throws -> CodeMapSourceSnapshot {
+        try await WorkspaceCodemapValidatedSnapshotTestSupport.cleanSource(
             bytes: rawBytes,
             objectFormat: format
         )
@@ -1063,28 +1067,4 @@ private actor GitBlobLocatorAsyncBarrier {
     }
 }
 
-private actor GitBlobLocatorAsyncGate {
-    private var entered = false
-    private var released = false
-    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-
-    func enterAndWait() async {
-        entered = true
-        entryWaiters.forEach { $0.resume() }
-        entryWaiters.removeAll()
-        guard !released else { return }
-        await withCheckedContinuation { releaseWaiters.append($0) }
-    }
-
-    func waitUntilEntered() async {
-        guard !entered else { return }
-        await withCheckedContinuation { entryWaiters.append($0) }
-    }
-
-    func release() {
-        released = true
-        releaseWaiters.forEach { $0.resume() }
-        releaseWaiters.removeAll()
-    }
-}
+private typealias GitBlobLocatorAsyncGate = TestReleaseFence

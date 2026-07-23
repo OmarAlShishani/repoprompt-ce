@@ -459,6 +459,12 @@ extension AgentModeViewModel {
         var requiresColdTeardownOnCancel: Bool = false
     }
 
+    enum CodexNativeStartupDisposition: Equatable {
+        case fresh
+        case resumed
+        case resumeFellBackToFresh
+    }
+
     struct CodexResumeTimeoutState: Equatable {
         var conversationID: String?
         var rolloutPath: String?
@@ -692,6 +698,7 @@ extension AgentModeViewModel {
         /// completing or needing approval still gets a visible signal.
         let hiddenThreadDescendantAttentionCount: Int
         let threadActivityDate: Date?
+        let searchFields: AgentSessionSearchFields
 
         init(
             id: UUID,
@@ -711,7 +718,8 @@ extension AgentModeViewModel {
             isThreadCollapsed: Bool = false,
             hiddenThreadDescendantCount: Int = 0,
             hiddenThreadDescendantAttentionCount: Int = 0,
-            threadActivityDate: Date? = nil
+            threadActivityDate: Date? = nil,
+            searchFields: AgentSessionSearchFields = .empty
         ) {
             self.id = id
             self.tabID = tabID
@@ -731,6 +739,7 @@ extension AgentModeViewModel {
             self.hiddenThreadDescendantCount = hiddenThreadDescendantCount
             self.hiddenThreadDescendantAttentionCount = hiddenThreadDescendantAttentionCount
             self.threadActivityDate = threadActivityDate
+            self.searchFields = searchFields
         }
     }
 
@@ -748,7 +757,7 @@ extension AgentModeViewModel {
         let analyticsSnapshot: AgentTranscriptAnalyticsSnapshot
         let sanitizedActivityCount: Int
         let performanceSnapshot: AgentTranscriptPerformanceSnapshot
-        let rawToolResultPayloadRenderRevision: Int
+        let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
     }
 
     enum DerivedTranscriptRefreshReason: String {

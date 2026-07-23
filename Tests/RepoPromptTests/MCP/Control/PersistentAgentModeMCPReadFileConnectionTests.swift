@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -490,6 +490,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             editedLines.insert(contentsOf: (1 ... 25).map { "middle-insert-\($0)" }, at: 3039)
             editedLines.removeSubrange(5064 ..< 5084)
             let physicalURL = try fixture.worktreeLargeFileURL
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree()
             let replacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SessionWorktree6500.swift.atomic-\(UUID().uuidString)")
             try (editedLines.joined(separator: "\n") + "\n").write(
@@ -560,6 +561,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillCommitHandlerForTesting(nil)
                 Task { await staleCommitGate.release() }
             }
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree()
             let staleReplacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SessionWorktree6500.swift.stale-\(UUID().uuidString)")
             let staleReplacementText = try String(contentsOf: physicalURL, encoding: .utf8)
@@ -683,6 +685,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try Self.assertSuccessfulResponse(fullSet, id: 4)
 
             let physicalURL = try fixture.worktreeSearchCreatedFileURL
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree(
+                qualifyCachedSearchContent: true
+            )
             var originalLines = (1 ... 29).map { "search-line-\($0)" }
             originalLines[3] = "WATCHER_BEGIN_ANCHOR_9F3A7C"
             originalLines[14] = "WATCHER_MIDDLE_ANCHOR_9F3A7C"
@@ -753,6 +758,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             editedLines.insert(contentsOf: (1 ... 4).map { "top-insert-\($0)" }, at: 0)
             editedLines.insert(contentsOf: (1 ... 3).map { "middle-insert-\($0)" }, at: 13)
             editedLines.removeSubrange(26 ... 27)
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree(
+                qualifyCachedSearchContent: true
+            )
             let replacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SearchCreated.swift.atomic-\(UUID().uuidString)")
             try (editedLines.joined(separator: "\n") + "\n").write(
@@ -1198,14 +1206,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 await gate.markStartedAndWaitForRelease()
             }
             fixture.window.mcpServer.setReadFileAutoSelectionFinalRevalidationHandlerForTesting {
-                guard var tab = fixture.window.workspaceManager.composeTab(with: Fixture.tabID) else {
-                    return XCTFail("Missing canonical tab during final certificate revalidation")
+                do {
+                    try await self.persistCertificateBoundaryFinalSelectionAdvance(fixture: fixture)
+                } catch {
+                    XCTFail("Failed final certificate revalidation selection advance: \(error)")
                 }
-                tab.selection = StoredSelection(selectedPaths: [fixture.fileURL.path, fixture.liveFileURL.path])
-                XCTAssertTrue(fixture.window.workspaceManager.updateComposeTabStoredOnly(
-                    tab,
-                    inWorkspaceID: fixture.workspaceID
-                ))
             }
             defer {
                 fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting(nil)
@@ -1220,18 +1225,79 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             await gate.release()
             await assertReadFileAutoSelectionSettled(fixture: fixture)
-            let certificate = try XCTUnwrap(fixture.readFileAutoSelectionCoverageCertificate())
-            XCTAssertEqual(certificate.selectionRevision, fixture.canonicalSelectionRevision())
+            let certificate = try XCTUnwrap(
+                fixture.readFileAutoSelectionCoverageCertificate(),
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+            XCTAssertEqual(
+                certificate.selectionRevision,
+                fixture.canonicalSelectionRevision(),
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
             XCTAssertEqual(
                 fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection.selectedPaths,
-                [fixture.fileURL.path, fixture.liveFileURL.path]
+                [fixture.fileURL.path, fixture.liveFileURL.path],
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
             )
 
             _ = try await readFile(fixture: fixture, id: 5, path: fixture.fileURL.path)
             await assertReadFileAutoSelectionSettled(fixture: fixture)
             let final = try fixture.readFileAutoSelectionContextSnapshot()
-            XCTAssertEqual(final.coverageCertificateHitCount, 1)
-            XCTAssertEqual(final.authoritativeFallbackCount, 1)
+            XCTAssertEqual(
+                final.coverageCertificateHitCount,
+                1,
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+            XCTAssertEqual(
+                final.authoritativeFallbackCount,
+                1,
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+        }
+
+        func persistCertificateBoundaryFinalSelectionAdvance(fixture: Fixture) async throws {
+            let identity = WorkspaceSelectionIdentity(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            let currentSelection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(for: identity)?.selection,
+                "Missing canonical tab during final certificate revalidation"
+            )
+            let advancedSelection = StoredSelection(
+                selectedPaths: [fixture.fileURL.path, fixture.liveFileURL.path],
+                manualCodemapPaths: currentSelection.manualCodemapPaths,
+                slices: [:],
+                codemapAutoEnabled: currentSelection.codemapAutoEnabled
+            )
+            let persisted = await fixture.window.selectionCoordinator.persistSelection(
+                advancedSelection,
+                for: identity,
+                source: .mcpTabContext,
+                mirrorToUIIfActive: false,
+                expectedCurrentSelection: currentSelection
+            )
+            XCTAssertEqual(
+                persisted,
+                advancedSelection,
+                "Final certificate revalidation selection advance did not persist through the canonical coordinator. \(readFileAutoSelectionBoundaryFailureContext(fixture: fixture))"
+            )
+        }
+
+        func readFileAutoSelectionBoundaryFailureContext(fixture: Fixture) -> String {
+            let identity = WorkspaceSelectionIdentity(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            let diagnostics = fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
+            let contextSnapshot = (try? fixture.readFileAutoSelectionContextSnapshot()).map(String.init(describing:))
+                ?? "<unavailable>"
+            let certificate = (try? fixture.readFileAutoSelectionCoverageCertificate()).map(String.init(describing:))
+                ?? "<nil>"
+            let canonicalSelection = fixture.window.workspaceManager.composeTab(for: identity)?.selection
+            let boundSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
+            let boundRevision = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selectionRevision
+            return "readFileAutoSelectionBoundary diagnostics=\(diagnostics) context=\(contextSnapshot) certificate=\(certificate) canonicalRevision=\(fixture.canonicalSelectionRevision()) canonicalSelection=\(String(describing: canonicalSelection)) boundSelection=\(String(describing: boundSelection)) boundRevision=\(String(describing: boundRevision))"
         }
 
         func assertWorktreeCoverageCertificateFailClosed(fixture: Fixture) async throws {
@@ -3164,6 +3230,29 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
         }
 
+        func useOnlySyntheticWatcherIngressForInstalledWorktree(
+            qualifyCachedSearchContent: Bool = false
+        ) async throws {
+            let rootID = try installedWorktreeRootID
+            let store = window.workspaceFileContextStore
+            let maybeService = await store.fileSystemServiceForTesting(rootID: rootID)
+            let service = try XCTUnwrap(maybeService)
+            await service.stopWatchingForChanges()
+            let attachedPublisherIngress = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(
+                rootID: rootID
+            )
+            guard attachedPublisherIngress else {
+                throw ClientFixtureError.syntheticWatcherPublisherIngressUnavailable(rootID)
+            }
+            let watcherIsActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            guard !watcherIsActive else {
+                throw ClientFixtureError.syntheticWatcherStillActive(rootID)
+            }
+            if qualifyCachedSearchContent {
+                try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: rootID, true)
+            }
+        }
+
         var auxiliaryRootPath: String {
             get throws {
                 try XCTUnwrap(auxiliaryRootURL).path
@@ -3816,6 +3905,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         case handoverPolicyApplicationFailed(String)
         case liveFixtureTooShort(Int)
         case presentationStateMismatch(String)
+        case syntheticWatcherPublisherIngressUnavailable(UUID)
+        case syntheticWatcherStillActive(UUID)
     }
 
     private struct RetainedConnectionSnapshot: Equatable {
@@ -3946,6 +4037,49 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
     }
 
+    private final class SocketPairResponseWaiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<String, Error>?
+
+        init(_ continuation: CheckedContinuation<String, Error>) {
+            self.continuation = continuation
+        }
+
+        func resume(returning value: String) {
+            take()?.resume(returning: value)
+        }
+
+        func resume(throwing error: Error) {
+            take()?.resume(throwing: error)
+        }
+
+        private func take() -> CheckedContinuation<String, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            defer { continuation = nil }
+            return continuation
+        }
+    }
+
+    private final class SocketPairResponseWaiterHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var waiter: SocketPairResponseWaiter?
+
+        func install(_ waiter: SocketPairResponseWaiter) {
+            lock.lock()
+            self.waiter = waiter
+            lock.unlock()
+        }
+
+        func resume(throwing error: Error) {
+            lock.lock()
+            let waiter = waiter
+            self.waiter = nil
+            lock.unlock()
+            waiter?.resume(throwing: error)
+        }
+    }
+
     private final class SocketPairJSONRPCClient: @unchecked Sendable {
         enum ClientError: Error {
             case closed
@@ -3958,6 +4092,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var fd: Int32
         private var buffer = Data()
         private var nonMatchingFrames: [String] = []
+        private let responseTimeout: TimeInterval = 10
 
         init(fd: Int32) {
             self.fd = fd
@@ -4002,37 +4137,58 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         private func response(matching expectedID: Int) async throws -> String {
-            try await withCheckedThrowingContinuation { continuation in
-                queue.async {
-                    do {
-                        while true {
-                            let line = try self.readLine()
-                            let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
-                            guard let object else { throw ClientError.invalidResponse }
-                            if let rawID = object["id"] {
-                                guard let responseID = (rawID as? NSNumber)?.intValue else {
-                                    throw ClientError.invalidResponse
-                                }
-                                guard responseID == expectedID else {
-                                    throw ClientError.invalidResponse
-                                }
-                                guard let rawJSON = String(data: line, encoding: .utf8) else {
-                                    throw ClientError.invalidResponse
-                                }
-                                continuation.resume(returning: rawJSON)
-                                return
-                            }
-                            guard object["method"] as? String != nil,
-                                  let rawJSON = String(data: line, encoding: .utf8)
-                            else {
-                                throw ClientError.invalidResponse
-                            }
-                            self.nonMatchingFrames.append(rawJSON)
+            let waitState = SocketResponseWaitState()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    guard waitState.install(continuation) else { return }
+                    let deadline = Date().addingTimeInterval(responseTimeout)
+                    queue.async {
+                        let result: Result<String, Error>
+                        do {
+                            result = try .success(self.readResponse(
+                                matching: expectedID,
+                                deadline: deadline,
+                                isCancelled: { waitState.isCancelled }
+                            ))
+                        } catch {
+                            result = .failure(error)
                         }
-                    } catch {
-                        continuation.resume(throwing: error)
+                        waitState.resume(with: result)
                     }
                 }
+            } onCancel: {
+                waitState.cancel()
+            }
+        }
+
+        private func readResponse(
+            matching expectedID: Int,
+            deadline: Date,
+            isCancelled: () -> Bool
+        ) throws -> String {
+            while true {
+                if isCancelled() { throw CancellationError() }
+                let line = try readLine(deadline: deadline, isCancelled: isCancelled)
+                let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
+                guard let object else { throw ClientError.invalidResponse }
+                if let rawID = object["id"] {
+                    guard let responseID = (rawID as? NSNumber)?.intValue else {
+                        throw ClientError.invalidResponse
+                    }
+                    guard responseID == expectedID else {
+                        throw ClientError.invalidResponse
+                    }
+                    guard let rawJSON = String(data: line, encoding: .utf8) else {
+                        throw ClientError.invalidResponse
+                    }
+                    return rawJSON
+                }
+                guard object["method"] as? String != nil,
+                      let rawJSON = String(data: line, encoding: .utf8)
+                else {
+                    throw ClientError.invalidResponse
+                }
+                nonMatchingFrames.append(rawJSON)
             }
         }
 
@@ -4052,8 +4208,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
         }
 
-        private func readLine() throws -> Data {
+        private func readLine(deadline: Date, isCancelled: () -> Bool) throws -> Data {
             while true {
+                if isCancelled() { throw CancellationError() }
                 if let newline = buffer.firstIndex(of: 0x0A) {
                     let line = Data(buffer[..<newline])
                     buffer.removeSubrange(buffer.startIndex ... newline)
@@ -4061,8 +4218,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
                 guard fd >= 0 else { throw ClientError.closed }
                 var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-                let pollResult = Darwin.poll(&descriptor, 1, 10000)
-                if pollResult == 0 { throw ClientError.timedOut }
+                let remainingMilliseconds = Int32(deadline.timeIntervalSinceNow * 1000)
+                if remainingMilliseconds <= 0 { throw ClientError.timedOut }
+                let pollResult = Darwin.poll(&descriptor, 1, min(100, remainingMilliseconds))
+                if pollResult == 0 { continue }
                 if pollResult < 0 {
                     if errno == EINTR { continue }
                     throw ClientError.posix(operation: "poll", code: errno)
@@ -4085,6 +4244,56 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 if errno == EINTR { continue }
                 throw ClientError.posix(operation: "read", code: errno)
             }
+        }
+    }
+
+    private final class SocketResponseWaitState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<String, Error>?
+        private var cancelled = false
+        private var completed = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            let result = cancelled
+            lock.unlock()
+            return result
+        }
+
+        func install(_ continuation: CheckedContinuation<String, Error>) -> Bool {
+            lock.lock()
+            if cancelled || completed {
+                lock.unlock()
+                continuation.resume(throwing: CancellationError())
+                return false
+            }
+            self.continuation = continuation
+            lock.unlock()
+            return true
+        }
+
+        func cancel() {
+            let continuation = takeContinuation(cancelled: true)
+            continuation?.resume(throwing: CancellationError())
+        }
+
+        func resume(with result: Result<String, Error>) {
+            guard let continuation = takeContinuation(cancelled: false) else { return }
+            continuation.resume(with: result)
+        }
+
+        private func takeContinuation(cancelled: Bool) -> CheckedContinuation<String, Error>? {
+            lock.lock()
+            if completed {
+                lock.unlock()
+                return nil
+            }
+            self.cancelled = self.cancelled || cancelled
+            completed = true
+            let continuation = continuation
+            self.continuation = nil
+            lock.unlock()
+            return continuation
         }
     }
 #endif

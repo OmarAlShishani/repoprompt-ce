@@ -1,8 +1,9 @@
-#if DEBUG
+#if DEBUG && RPCE_BENCHMARK_TESTS
     import CryptoKit
     import Darwin
     import Foundation
-    @testable import RepoPrompt
+    @testable import RepoPromptApp
+    @testable import RepoPromptCodeMapCore
 
     enum WorkspaceCodeMapPhase4BenchmarkMetric: String, CaseIterable {
         case canonicalBatchClassification

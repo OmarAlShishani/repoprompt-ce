@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 import Ontology
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 
@@ -15,7 +15,7 @@ import XCTest
                     MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.entries.count, 26, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.entries.count, 27, caseLabel)
                 XCTAssertEqual(
                     Set(MCPToolDurationInventory.entries.map(\.toolName)).count,
                     MCPToolDurationInventory.entries.count,
@@ -80,7 +80,12 @@ import XCTest
                     ],
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 11, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 12, caseLabel)
+                XCTAssertEqual(
+                    MCPToolDurationInventory.detachAndSettleToolNames,
+                    [MCPWindowToolName.getCodeStructure],
+                    caseLabel
+                )
                 XCTAssertTrue(
                     MCPToolDurationInventory.entries.allSatisfy {
                         !$0.expectedActiveDuration.isEmpty
@@ -106,12 +111,26 @@ import XCTest
                     MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds,
                     caseLabel
                 )
+                let getCodeStructure = try XCTUnwrap(MCPToolDurationInventory.entries.first {
+                    $0.toolName == MCPWindowToolName.getCodeStructure
+                }, caseLabel)
+                XCTAssertEqual(getCodeStructure.semanticWaitMaximumSeconds, 10, caseLabel)
+                XCTAssertTrue(
+                    getCodeStructure.qualification.contains("competing grace expiry resolves atomically"),
+                    caseLabel
+                )
+                XCTAssertTrue(
+                    getCodeStructure.qualification.contains("already-admitted same-window calls"),
+                    caseLabel
+                )
+                XCTAssertFalse(getCodeStructure.qualification.contains("bounded +1"), caseLabel)
                 let manageWorkspaces = try XCTUnwrap(MCPToolDurationInventory.entries.first {
                     $0.toolName == MCPGlobalToolName.manageWorkspaces
                 }, caseLabel)
                 XCTAssertEqual(manageWorkspaces.contractKind, .workspaceLifecycleCancellable, caseLabel)
                 XCTAssertNil(manageWorkspaces.executionDeadlineSeconds, caseLabel)
                 XCTAssertNil(manageWorkspaces.cleanupGraceSeconds, caseLabel)
+                XCTAssertNil(manageWorkspaces.cleanupDisposition, caseLabel)
                 XCTAssertEqual(
                     manageWorkspaces.conditionalExecutionOverrides,
                     [
@@ -119,19 +138,22 @@ import XCTest
                             action: "switch",
                             condition: "always",
                             executionDeadlineSeconds: Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds),
-                            cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
+                            cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds),
+                            cleanupDisposition: .forceDisconnect
                         ),
                         .init(
                             action: "create",
                             condition: "switch_to_created != false (handler default)",
                             executionDeadlineSeconds: Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds),
-                            cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
+                            cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds),
+                            cleanupDisposition: .forceDisconnect
                         ),
                         .init(
                             action: "delete",
                             condition: "close_window == true",
                             executionDeadlineSeconds: Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds),
-                            cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
+                            cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds),
+                            cleanupDisposition: .forceDisconnect
                         )
                     ],
                     caseLabel
@@ -213,8 +235,21 @@ import XCTest
                     ],
                     caseLabel
                 )
+                XCTAssertEqual(
+                    payload["detach_and_settle_tools"] as? [String],
+                    [MCPWindowToolName.getCodeStructure],
+                    caseLabel
+                )
                 let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], caseLabel)
-                XCTAssertEqual(tools.count, 26, caseLabel)
+                XCTAssertEqual(tools.count, 27, caseLabel)
+                let getCodeStructure = try XCTUnwrap(tools.first {
+                    $0["tool"] as? String == MCPWindowToolName.getCodeStructure
+                }, caseLabel)
+                XCTAssertEqual(
+                    getCodeStructure["cleanup_disposition"] as? String,
+                    MCPToolExecutionCleanupDisposition.detachAndSettle.rawValue,
+                    caseLabel
+                )
                 let manageWorkspaces = try XCTUnwrap(tools.first {
                     $0["tool"] as? String == MCPGlobalToolName.manageWorkspaces
                 }, caseLabel)
@@ -237,6 +272,11 @@ import XCTest
                 XCTAssertEqual(
                     conditionalOverrides.map { $0["condition"] as? String },
                     ["always", "switch_to_created != false (handler default)", "close_window == true"],
+                    caseLabel
+                )
+                XCTAssertEqual(
+                    conditionalOverrides.map { $0["cleanup_disposition"] as? String },
+                    ["force_disconnect", "force_disconnect", "force_disconnect"],
                     caseLabel
                 )
 

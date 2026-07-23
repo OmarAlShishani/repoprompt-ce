@@ -1,18 +1,8 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
-final class AgentContextExportResolverTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
+final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSeamTestSupport {
     func testDisplayFileCountUsesExplicitSelectionAndExcludesAutoCodemaps() {
         let selection = StoredSelection(
             selectedPaths: ["A.swift", "B.swift", "C.swift", "D.swift", "E.swift"],
@@ -49,7 +39,8 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.fullFileCount, 1)
         XCTAssertEqual(summary.slicedFileCount, 1)
         XCTAssertEqual(summary.sliceRangeCount, 2)
-        XCTAssertEqual(summary.headlineText, "2 files · 1 sliced · 2 ranges")
+        XCTAssertEqual(summary.compactText, "2 files")
+        XCTAssertEqual(summary.headlineText, "2 files · 2 slices")
     }
 
     func testSelectionSummaryIncludesLegacySliceOnlyKey() {
@@ -64,7 +55,8 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.fullFileCount, 0)
         XCTAssertEqual(summary.slicedFileCount, 1)
         XCTAssertEqual(summary.sliceRangeCount, 1)
-        XCTAssertEqual(summary.headlineText, "1 file · 1 sliced · 1 range")
+        XCTAssertEqual(summary.compactText, "1 file")
+        XCTAssertEqual(summary.headlineText, "1 file · 1 slice")
     }
 
     func testSelectionSummaryDeduplicatesSelectedPathWithSlices() {
@@ -94,6 +86,7 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.fullFileCount, 0)
         XCTAssertEqual(summary.slicedFileCount, 0)
         XCTAssertEqual(summary.sliceRangeCount, 0)
+        XCTAssertEqual(summary.compactText, "0 files")
         XCTAssertEqual(summary.headlineText, "0 files")
     }
 
@@ -105,7 +98,9 @@ final class AgentContextExportResolverTests: XCTestCase {
             for: StoredSelection(selectedPaths: ["One.swift", "Two.swift"], codemapAutoEnabled: false)
         )
 
+        XCTAssertEqual(singular.compactText, "1 file")
         XCTAssertEqual(singular.headlineText, "1 file")
+        XCTAssertEqual(plural.compactText, "2 files")
         XCTAssertEqual(plural.headlineText, "2 files")
     }
 
@@ -127,10 +122,11 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.fullFileCount, 0)
         XCTAssertEqual(summary.slicedFileCount, 1)
         XCTAssertEqual(summary.sliceRangeCount, 3)
-        XCTAssertEqual(summary.headlineText, "1 file · 1 sliced · 3 ranges")
+        XCTAssertEqual(summary.compactText, "1 file")
+        XCTAssertEqual(summary.headlineText, "1 file · 3 slices")
     }
 
-    func testNonGitAutomaticExportPreservesSelectedRowsWithoutRuntimeOrLegacyFallback() async throws {
+    func testNonGitAutomaticExportBatchesSelectedPathLookupsWithoutRuntimeFallback() async throws {
         #if DEBUG
             let root = try makeTemporaryRoot(name: "AgentExportNonGitAuto")
             let explicitFileCount = 7
@@ -207,7 +203,46 @@ final class AgentContextExportResolverTests: XCTestCase {
                 explicitFileCount
             )
             XCTAssertEqual(snapshotBuildCount, 1)
+            XCTAssertLessThan(snapshotBuildCount, explicitFileCount)
             XCTAssertEqual(capture.droppedSampleCount, 0)
+        #endif
+    }
+
+    func testSelectedFilesModelWithoutCodemapsDoesNotEnumerateWholeRoots() async throws {
+        #if DEBUG
+            let root = try makeTemporaryRoot(name: "AgentExportNoBroadEnumeration")
+            let selectedURL = root.appendingPathComponent("Sources/Feature/Selected.swift")
+            try write(SwiftFixtureSource.emptyStruct("Selected", trailingNewline: false), to: selectedURL)
+            for index in 0 ..< 80 {
+                try write(
+                    "struct Bystander\(index) {}",
+                    to: root.appendingPathComponent("Sources/Generated/Level\(index % 8)/Nested\(index)/Bystander\(index).swift")
+                )
+            }
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            await store.resetFilesInRootRequestCountForTesting()
+            let source = AgentContextExportSource(
+                tabID: UUID(),
+                promptText: "Review",
+                selection: StoredSelection(selectedPaths: [selectedURL.path], codemapAutoEnabled: false),
+                selectedMetaPromptIDs: [],
+                tabName: "Agent Tab",
+                activeAgentSessionID: nil,
+                worktreeBindings: []
+            )
+
+            let model = await AgentContextExportResolver.resolveModel(
+                source: source,
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .none
+            )
+
+            XCTAssertEqual(model.rows.map(\.displayPath), ["Sources/Feature/Selected.swift"])
+            let filesInRootRequestCount = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(filesInRootRequestCount, 0)
         #endif
     }
 
@@ -228,7 +263,9 @@ final class AgentContextExportResolverTests: XCTestCase {
 
         let row = try XCTUnwrap(model.rows.first)
         XCTAssertEqual(model.rows.count, 1)
+        XCTAssertFalse(try XCTUnwrap(model.lookupContext.bindingProjection).isFullyMaterialized)
         XCTAssertEqual(row.displayPath, "Sources/App.swift")
+        XCTAssertEqual(row.directContentPath, fixture.worktreeRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path)
 
         let previewText = await AgentContextExportResolver.loadRowContent(
             for: row,
@@ -263,12 +300,90 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertFalse(clipboard.contains("let origin = \"base\""), clipboard)
     }
 
+    func testBoundWorktreeAutoCodemapDoesNotUseMetadataOnlyFastPathWhenAutoCodemapEnabled() async throws {
+        let fixture = try await makeBoundFixture()
+        let source = makeSource(
+            logicalRoot: fixture.logicalRoot,
+            worktreeRoot: fixture.worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/App.swift"], codemapAutoEnabled: true)
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: fixture.store,
+            filePathDisplay: .relative,
+            codeMapUsage: .auto
+        )
+
+        XCTAssertEqual(model.lookupContext.bindingProjection?.isFullyMaterialized, true)
+        XCTAssertEqual(model.rows.first?.displayPath, "Sources/App.swift")
+        XCTAssertTrue(model.rows.allSatisfy { $0.directContentPath == nil })
+    }
+
+    func testMetadataOnlyWorktreeExportDoesNotDirectReadSymlinkEscapingRoot() async throws {
+        let fixture = try await makeBoundFixture()
+        let externalRoot = try makeTemporaryRoot(name: "AgentExportExternal")
+        let externalFile = externalRoot.appendingPathComponent("Secret.swift")
+        let symlink = fixture.worktreeRoot.appendingPathComponent("Sources/Linked.swift")
+        try write("let secret = true\n", to: externalFile)
+        try FileManager.default.createSymbolicLink(
+            at: symlink,
+            withDestinationURL: externalFile
+        )
+        let source = makeSource(
+            logicalRoot: fixture.logicalRoot,
+            worktreeRoot: fixture.worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/Linked.swift"], codemapAutoEnabled: false)
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: fixture.store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+
+        XCTAssertFalse(model.lookupContext.bindingProjection?.isFullyMaterialized == false)
+        XCTAssertTrue(model.rows.allSatisfy { $0.directContentPath == nil })
+        if let row = model.rows.first {
+            let previewText = await AgentContextExportResolver.loadRowContent(
+                for: row,
+                model: model,
+                store: fixture.store,
+                purpose: .preview
+            )
+            XCTAssertNotEqual(previewText, "let secret = true\n")
+        }
+    }
+
+    func testEmptyBoundExportSkipsWorktreeProjection() async throws {
+        let fixture = try await makeBoundFixture()
+        let source = makeSource(
+            logicalRoot: fixture.logicalRoot,
+            worktreeRoot: fixture.worktreeRoot,
+            selection: StoredSelection(codemapAutoEnabled: false)
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: fixture.store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+
+        XCTAssertTrue(model.rows.isEmpty)
+        XCTAssertTrue(model.missingPaths.isEmpty)
+        XCTAssertTrue(model.invalidPaths.isEmpty)
+        XCTAssertNil(model.lookupContext.bindingProjection)
+        XCTAssertEqual(model.lookupContext.rootScope, .visibleWorkspace)
+    }
+
     func testWorktreeSelectedCodemapUsesFrozenLogicalPresentationWithoutPhysicalLeak() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         defer { repositoryFixture.cleanup() }
         let logicalRoot = try repositoryFixture.makeRepository(
             named: "agent-export-logical",
-            files: ["App.swift": "struct LogicalBase {}\n"]
+            files: ["App.swift": SwiftFixtureSource.emptyStruct("LogicalBase")]
         )
         let worktreeRoot = try repositoryFixture.makeRepository(
             named: "agent-export-physical-secret",
@@ -345,7 +460,7 @@ final class AgentContextExportResolverTests: XCTestCase {
 
     func testSelectedUnavailableCodemapPreservesFullRowAndReportsIncompleteCoverage() async throws {
         let root = try makeTemporaryRoot(name: "AgentExportSelectedUnavailable")
-        try write("struct SelectedUnavailable {}\n", to: root.appendingPathComponent("Sources/App.swift"))
+        try write(SwiftFixtureSource.emptyStruct("SelectedUnavailable"), to: root.appendingPathComponent("Sources/App.swift"))
         let runtimeAccessCount = AgentExportLockedCounter()
         let store = WorkspaceFileContextStore(codemapRuntimeProvider: {
             runtimeAccessCount.increment()
@@ -377,12 +492,12 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(runtimeAccessCount.value, 0)
     }
 
-    func testRevokedCodemapLifetimeOmitsStaleTargetBeforeModelPublication() async throws {
+    func testRevokedCodemapLifetimeOmitsUnavailableTargetAndReportsLogicalMissingPath() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         defer { repositoryFixture.cleanup() }
         let logicalRoot = try repositoryFixture.makeRepository(
             named: "agent-export-revoked-logical",
-            files: ["Sources/Target.swift": "struct LogicalTarget {}\n"]
+            files: ["Sources/Target.swift": SwiftFixtureSource.emptyStruct("LogicalTarget")]
         )
         let worktreeRoot = try repositoryFixture.makeRepository(
             named: "agent-export-revoked-worktree",
@@ -403,6 +518,15 @@ final class AgentContextExportResolverTests: XCTestCase {
         let physicalRootID = try XCTUnwrap(boundRoots.first {
             $0.standardizedFullPath == worktreeRoot.standardizedFileURL.path
         }?.id)
+        let targetLookup = await store.lookupPath(
+            worktreeRoot.appendingPathComponent("Sources/Target.swift").path,
+            rootScope: lookupContext.rootScope
+        )
+        let target = try XCTUnwrap(targetLookup?.file)
+        let ready = try await readyArtifactDemand(store: store, forFileID: target.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
         let revalidationCount = AgentExportLockedCounter()
         let coordinator = WorkspaceCodemapPresentationCoordinator(
             store: store,
@@ -414,6 +538,7 @@ final class AgentContextExportResolverTests: XCTestCase {
                 revalidationCount.increment()
                 if revalidationCount.value == 1 {
                     await store.unloadRoot(id: physicalRootID)
+                    try? FileManager.default.removeItem(at: worktreeRoot)
                 }
             }
         )
@@ -426,12 +551,175 @@ final class AgentContextExportResolverTests: XCTestCase {
             presentationCoordinator: coordinator
         )
 
-        XCTAssertEqual(model.rows.map(\.kind), [.full])
+        XCTAssertTrue(model.rows.isEmpty)
+        XCTAssertEqual(model.missingPaths, ["Sources/Target.swift"])
+        XCTAssertFalse(model.missingPaths.contains { $0.contains(worktreeRoot.path) })
         XCTAssertTrue(model.codemapPresentation.orderedEntries.isEmpty)
         guard case .unavailable = model.codemapCoverage else {
             return XCTFail("Revoked complete export must publish typed incomplete coverage")
         }
-        XCTAssertGreaterThanOrEqual(revalidationCount.value, 1)
+        XCTAssertEqual(revalidationCount.value, 1)
+    }
+
+    func testRevokedCodemapReloadFallsBackToFreshAuthoritativeFullContent() async throws {
+        let canonicalSentinel = "canonicalCodemapReloadSentinel"
+        let revokedSentinel = "revokedCodemapReloadSentinel"
+        let freshSentinel = "freshCodemapReloadSentinel"
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let logicalRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-reload-logical",
+            files: ["Sources/Target.swift": "struct \(canonicalSentinel) {}\n"]
+        )
+        let worktreeRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-reload-worktree",
+            files: ["Sources/Target.swift": "struct \(revokedSentinel) { func revoked() {} }\n"]
+        )
+        let targetURL = worktreeRoot.appendingPathComponent("Sources/Target.swift")
+        let store = try makeIsolatedCodemapStore(name: #function)
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let source = makeSource(
+            logicalRoot: logicalRoot,
+            worktreeRoot: worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/Target.swift"], codemapAutoEnabled: false)
+        )
+        let lookupContext = await AgentContextExportResolver.lookupContext(source: source, store: store)
+        let boundRoots = await store.rootRefs(scope: lookupContext.rootScope)
+        let physicalRoot = try XCTUnwrap(boundRoots.first {
+            $0.standardizedFullPath == worktreeRoot.standardizedFileURL.path
+        })
+        let targetLookup = await store.lookupPath(targetURL.path, rootScope: lookupContext.rootScope)
+        let target = try XCTUnwrap(targetLookup?.file)
+        let ready = try await readyArtifactDemand(store: store, forFileID: target.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
+        let revalidationCount = AgentExportLockedCounter()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 20,
+                maximumTotalWait: .seconds(10)
+            ),
+            beforePublicationRevalidation: { _ in
+                revalidationCount.increment()
+                guard revalidationCount.value == 1 else { return }
+                await store.unloadRoot(id: physicalRoot.id)
+                try? FileManager.default.removeItem(at: worktreeRoot.appendingPathComponent(".git"))
+                try? "struct \(freshSentinel) { func current() {} }\n".write(
+                    to: targetURL,
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .selected,
+            presentationCoordinator: coordinator
+        )
+
+        let row = try XCTUnwrap(model.rows.first)
+        XCTAssertEqual(row.kind, .full)
+        XCTAssertNotEqual(row.rootID, physicalRoot.id)
+        guard case .unavailable = model.codemapCoverage else {
+            return XCTFail("Unavailable replacement codemap must retain typed unavailable coverage")
+        }
+        let preview = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            model: model,
+            store: store,
+            purpose: .preview
+        )
+        XCTAssertTrue(preview?.contains(freshSentinel) == true, preview ?? "")
+        XCTAssertFalse(preview?.contains(revokedSentinel) == true, preview ?? "")
+        XCTAssertFalse(preview?.contains(canonicalSentinel) == true, preview ?? "")
+        XCTAssertFalse(row.displayPath.contains(worktreeRoot.path), row.displayPath)
+        XCTAssertEqual(revalidationCount.value, 1)
+    }
+
+    func testRevokedCodemapClipboardPublishesFreshBoundBytesOnly() async throws {
+        let canonicalSentinel = "canonicalClipboardRevocationSentinel"
+        let revokedSentinel = "revokedClipboardRevocationSentinel"
+        let freshSentinel = "freshClipboardRevocationSentinel"
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let logicalRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-clipboard-logical",
+            files: ["Sources/Target.swift": "struct \(canonicalSentinel) {}\n"]
+        )
+        let worktreeRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-clipboard-worktree",
+            files: ["Sources/Target.swift": "struct \(revokedSentinel) { func revoked() {} }\n"]
+        )
+        let targetURL = worktreeRoot.appendingPathComponent("Sources/Target.swift")
+        let store = try makeIsolatedCodemapStore(name: #function)
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let source = makeSource(
+            logicalRoot: logicalRoot,
+            worktreeRoot: worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/Target.swift"], codemapAutoEnabled: false)
+        )
+        let lookupContext = await AgentContextExportResolver.lookupContext(source: source, store: store)
+        let boundRoots = await store.rootRefs(scope: lookupContext.rootScope)
+        let physicalRoot = try XCTUnwrap(boundRoots.first {
+            $0.standardizedFullPath == worktreeRoot.standardizedFileURL.path
+        })
+        let targetLookup = await store.lookupPath(targetURL.path, rootScope: lookupContext.rootScope)
+        let target = try XCTUnwrap(targetLookup?.file)
+        let ready = try await readyArtifactDemand(store: store, forFileID: target.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
+        let revalidationCount = AgentExportLockedCounter()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 20,
+                maximumTotalWait: .seconds(10)
+            ),
+            beforePublicationRevalidation: { _ in
+                revalidationCount.increment()
+                guard revalidationCount.value == 1 else { return }
+                await store.unloadRoot(id: physicalRoot.id)
+                try? FileManager.default.removeItem(at: worktreeRoot.appendingPathComponent(".git"))
+                try? "struct \(freshSentinel) { func current() {} }\n".write(
+                    to: targetURL,
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+        )
+
+        let clipboard = await AgentContextExportResolver.buildClipboardContent(
+            AgentContextClipboardRequest(
+                cfg: makeConfig(gitInclusion: .none, codeMapUsage: .selected),
+                source: source,
+                store: store,
+                lookupContext: lookupContext,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: true,
+                showCodeMapMarkers: true,
+                metaInstructions: [],
+                includeDatetimeInUserInstructions: false,
+                promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+                disabledPromptSections: [],
+                duplicateUserInstructionsAtTop: false,
+                reviewGitContext: .automaticOnly(),
+                completeGitDiffProvider: { "" }
+            ),
+            presentationCoordinator: coordinator
+        )
+
+        XCTAssertTrue(clipboard.contains(freshSentinel), clipboard)
+        XCTAssertFalse(clipboard.contains(revokedSentinel), clipboard)
+        XCTAssertFalse(clipboard.contains(canonicalSentinel), clipboard)
+        XCTAssertFalse(clipboard.contains(worktreeRoot.path), clipboard)
+        XCTAssertFalse(clipboard.contains(worktreeRoot.lastPathComponent), clipboard)
+        XCTAssertEqual(revalidationCount.value, 1)
     }
 
     func testBoundExportFailsClosedWhenPhysicalWorktreeCannotBeLoaded() async throws {
@@ -455,7 +743,10 @@ final class AgentContextExportResolverTests: XCTestCase {
             filePathDisplay: .relative,
             codeMapUsage: .none
         )
-        XCTAssertEqual(model.lookupContext.bindingProjection?.physicalRootPaths, Set([unloadablePhysicalRoot.standardizedFileURL.path]))
+        XCTAssertEqual(
+            model.lookupContext,
+            AgentWorkspaceLookupContextResolver.failClosedLookupContext
+        )
         XCTAssertTrue(model.rows.isEmpty)
         XCTAssertEqual(model.missingPaths, ["Sources/App.swift"])
         XCTAssertFalse(model.missingPaths.contains { $0.contains(unloadablePhysicalRoot.path) })
@@ -579,8 +870,8 @@ final class AgentContextExportResolverTests: XCTestCase {
         let secondRoot = secondParent.appendingPathComponent("repo")
         let firstFile = firstRoot.appendingPathComponent("Sources/App.swift")
         let secondFile = secondRoot.appendingPathComponent("Sources/App.swift")
-        try write("struct FirstDuplicateRoot {}\n", to: firstFile)
-        try write("struct SecondDuplicateRoot {}\n", to: secondFile)
+        try write(SwiftFixtureSource.emptyStruct("FirstDuplicateRoot"), to: firstFile)
+        try write(SwiftFixtureSource.emptyStruct("SecondDuplicateRoot"), to: secondFile)
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: firstRoot.path)
         _ = try await store.loadRoot(path: secondRoot.path)
@@ -1015,6 +1306,46 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertFalse(previewResult?.contains("Preview truncated") ?? true)
     }
 
+    func testEmptyDirectFilePreviewReturnsEmptyContent() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportPreviewEmpty")
+        try write("", to: root.appendingPathComponent("Sources/Empty.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: ["Sources/Empty.swift"], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+        let row = try XCTUnwrap(model.rows.first)
+
+        let previewResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            model: model,
+            store: store,
+            purpose: .preview
+        )
+        let copyResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            model: model,
+            store: store,
+            purpose: .copy
+        )
+
+        XCTAssertEqual(previewResult, "")
+        XCTAssertEqual(copyResult, "")
+    }
+
     private func makeBoundFixture() async throws -> (logicalRoot: URL, worktreeRoot: URL, store: WorkspaceFileContextStore) {
         let logicalRoot = try makeTemporaryRoot(name: "AgentExportLogical")
         let worktreeRoot = try makeTemporaryRoot(name: "AgentExportWorktree")
@@ -1127,12 +1458,7 @@ final class AgentContextExportResolverTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {

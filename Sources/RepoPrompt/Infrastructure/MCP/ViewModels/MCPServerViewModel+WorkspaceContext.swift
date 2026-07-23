@@ -104,11 +104,7 @@ extension MCPServerViewModel {
         var codeStructDTO: ToolResultDTOs.SelectedCodeStructureDTO? = nil
         if include.contains("code"), !promptVM.codeMapsGloballyDisabled, let coll = collections {
             let builder = CodeStructureBuilder(owner: self, lookupContext: lookupContext)
-            let combined = coll.selected.map(\.file) + coll.codemap.map(\.file)
-            codeStructDTO = await builder.build(
-                for: combined,
-                presentation: coll.codemapPresentation
-            )
+            codeStructDTO = await builder.build(for: coll)
         }
 
         var fileTreeDTO: ToolResultDTOs.FileTreeDTO? = nil
@@ -158,16 +154,12 @@ extension MCPServerViewModel {
             let codemapsTokens = selectionReply?.summary?.codemapTokens ?? 0
 
             if let prepared = preparedTokenAccounting {
-                if let published = prepared.activePublishedSnapshot {
-                    tokenStatsDTO = Self.publishedTokenStats(published)
-                } else {
-                    tokenStatsDTO = Self.makeTokenStats(
-                        filesTokens: fileTokens,
-                        filesContentTokens: filesContentTokens > 0 ? filesContentTokens : nil,
-                        codemapsTokens: codemapsTokens > 0 ? codemapsTokens : nil,
-                        breakdown: prepared.breakdown
-                    )
-                }
+                tokenStatsDTO = Self.makeTokenStats(
+                    filesTokens: fileTokens,
+                    filesContentTokens: filesContentTokens > 0 ? filesContentTokens : nil,
+                    codemapsTokens: codemapsTokens > 0 ? codemapsTokens : nil,
+                    breakdown: prepared.breakdown
+                )
 
                 if let userFileTokens = selectionReply?.userCopyTokens, userFileTokens != fileTokens {
                     let userContentTokens = selectionReply?.userCopyContentTokens ?? 0

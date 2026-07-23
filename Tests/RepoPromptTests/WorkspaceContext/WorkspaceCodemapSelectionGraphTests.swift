@@ -1,12 +1,13 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testStrictQueryIsTargetlessUntilExactProjectionSeal() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
@@ -57,7 +58,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testEquivalentProjectionSuccessorResealsGenerationOneToThreeWithoutRebuild() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
@@ -154,7 +155,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testStagedIncompleteShardWithResidentNodesReturnsNoStructureResult() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
@@ -189,7 +190,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testReplacementProjectionStagingPreservesCompleteShardUntilExactSeal() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
@@ -244,7 +245,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testProjectionSegmentByteBudgetIsTypedAndTargetless() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
@@ -278,7 +279,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testProjectionCoverageAndBytesAreRevokedOnPathFence() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let value = try await snapshot(
@@ -313,7 +314,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testProjectionSegmentSupersedesSameGenerationLiveBuildWithoutLateDowngrade() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
@@ -350,9 +351,9 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let authority = try await makeAuthority(
             name: #function,
             files: [
-                "Source.swift": "struct Source {}",
-                "A.swift": "struct A {}",
-                "B.swift": "struct B {}"
+                "Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false),
+                "A.swift": SwiftFixtureSource.emptyStruct("A", trailingNewline: false),
+                "B.swift": SwiftFixtureSource.emptyStruct("B", trailingNewline: false)
             ]
         )
         defer { authority.repositoryFixture.cleanup() }
@@ -482,9 +483,9 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let authority = try await makeAuthority(
             name: #function,
             files: [
-                "A.swift": "struct A {}",
-                "B.swift": "struct B {}",
-                "C.swift": "struct C {}"
+                "A.swift": SwiftFixtureSource.emptyStruct("A", trailingNewline: false),
+                "B.swift": SwiftFixtureSource.emptyStruct("B", trailingNewline: false),
+                "C.swift": SwiftFixtureSource.emptyStruct("C", trailingNewline: false)
             ]
         )
         defer { authority.repositoryFixture.cleanup() }
@@ -564,13 +565,13 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let rootID = uuid("20000000-0000-0000-0000-000000000001")
         let firstAuthority = try await makeAuthority(
             name: #function + "-first",
-            files: ["Source.swift": "struct Source {}", "Local.swift": "struct Local {}"],
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Local.swift": SwiftFixtureSource.emptyStruct("Local", trailingNewline: false)],
             rootID: rootID,
             rootLifetimeID: uuid("20000000-0000-0000-0000-000000000002")
         )
         let secondAuthority = try await makeAuthority(
             name: #function + "-second",
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"],
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)],
             rootID: rootID,
             rootLifetimeID: uuid("20000000-0000-0000-0000-000000000003")
         )
@@ -693,9 +694,9 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let authority = try await makeAuthority(
             name: #function,
             files: [
-                "Source.swift": "struct Source {}",
-                "Target.swift": "struct Target {}",
-                "Extra.swift": "struct Extra {}"
+                "Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false),
+                "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false),
+                "Extra.swift": SwiftFixtureSource.emptyStruct("Extra", trailingNewline: false)
             ]
         )
         defer { authority.repositoryFixture.cleanup() }
@@ -819,9 +820,9 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let authority = try await makeAuthority(
             name: #function,
             files: [
-                "Source.swift": "struct Source {}",
-                "Second.swift": "struct Second {}",
-                "Target.swift": "struct Target {}"
+                "Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false),
+                "Second.swift": SwiftFixtureSource.emptyStruct("Second", trailingNewline: false),
+                "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)
             ]
         )
         defer { authority.repositoryFixture.cleanup() }
@@ -934,7 +935,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testGraphSizeBudgetsAcceptNAndRejectNPlusOneForEveryDimension() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
@@ -997,13 +998,13 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
         let rootLifetimeID = uuid("36000000-0000-0000-0000-000000000002")
         let firstAuthority = try await makeAuthority(
             name: #function + "-first",
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"],
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)],
             rootID: rootID,
             rootLifetimeID: rootLifetimeID
         )
         let conflictingAuthority = try await makeAuthority(
             name: #function + "-conflict",
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"],
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)],
             rootID: rootID,
             rootLifetimeID: rootLifetimeID
         )
@@ -1048,7 +1049,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testStaleSourceAndTargetGenerationsAreOmittedWithoutPartialPublication() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let sourceID = uuid("40000000-0000-0000-0000-000000000001")
@@ -1202,7 +1203,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
 
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let value = try await snapshot(
@@ -1310,7 +1311,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testCrossActorProcessActiveReservationLimitSaturatesAndRecovers() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let value = try await snapshot(
@@ -1367,7 +1368,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testRejectedCancelledAndSupersededBuildsPreserveTheLastCompleteShard() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
@@ -1483,7 +1484,7 @@ final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testValueOnlyBoundaryNeedsNoProducerOrIOAfterSnapshotCapture() async throws {
         let authority = try await makeAuthority(
             name: #function,
-            files: ["Source.swift": "struct Source {}", "Target.swift": "struct Target {}"]
+            files: ["Source.swift": SwiftFixtureSource.emptyStruct("Source", trailingNewline: false), "Target.swift": SwiftFixtureSource.emptyStruct("Target", trailingNewline: false)]
         )
         let sourceID = uuid("70000000-0000-0000-0000-000000000001")
         let targetID = uuid("70000000-0000-0000-0000-000000000002")

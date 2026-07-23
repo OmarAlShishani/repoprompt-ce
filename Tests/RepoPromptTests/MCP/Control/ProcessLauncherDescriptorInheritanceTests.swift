@@ -1,9 +1,26 @@
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
+    func testSpawnedChildStartsInOwnProcessGroup() throws {
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "printf 'ready\n'; exec /bin/cat >/dev/null"],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil
+        )
+        defer { Self.cleanup(spawned) }
+
+        XCTAssertEqual(spawned.processGroupID, spawned.pid)
+        XCTAssertEqual(Darwin.getpgid(spawned.pid), spawned.pid)
+
+        spawned.stdin?.closeFile()
+        _ = spawned.stdout.readDataToEndOfFile()
+        _ = try Self.waitForExit(spawned.pid)
+    }
+
     func testParentPipeEndsHaveCloseOnExecAndChildStdioStillWorks() throws {
         let spawned = try ProcessLauncher.spawn(
             command: "/bin/sh",
@@ -95,8 +112,8 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         XCTAssertFalse(Self.hasCloseOnExec(sessionFD))
 
         let spawned = try ProcessLauncher.spawn(
-            command: "/bin/sleep",
-            arguments: ["5"],
+            command: "/bin/cat",
+            arguments: [],
             environment: ProcessInfo.processInfo.environment,
             workingDirectory: nil
         )
@@ -135,7 +152,7 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
 
             var environment = ProcessInfo.processInfo.environment
             environment["SESSION_FD"] = String(sessionFD)
-            let script = "if [ -e \"/dev/fd/$SESSION_FD\" ]; then printf 'session:open\\n'; else printf 'session:closed\\n'; fi; sleep 5"
+            let script = "if [ -e \"/dev/fd/$SESSION_FD\" ]; then printf 'session:open\\n'; else printf 'session:closed\\n'; fi; exec /bin/cat >/dev/null"
             let spawned = try ProcessLauncher.spawn(
                 command: "/bin/sh",
                 arguments: ["-c", script],

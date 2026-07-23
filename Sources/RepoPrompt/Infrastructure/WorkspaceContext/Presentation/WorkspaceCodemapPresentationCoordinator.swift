@@ -120,6 +120,26 @@ private actor WorkspaceCodemapOperationPresentationOwnership {
     }
 }
 
+enum WorkspaceCodemapStructureExecutionPhase: Equatable {
+    case seedDemand
+    case projectionWait
+    case graphQuery
+    case targetDemand
+    case graphRequery
+    case freeze
+    case render
+    case assembly
+    case publicationRevalidation
+}
+
+struct WorkspaceCodemapPresentationAttempt<Context> {
+    let context: Context
+    let intent: WorkspaceCodemapOperationPresentationIntent
+    let rootScope: WorkspaceLookupRootScope
+    let logicalRootDisplayNamesByRootID: [UUID: String]
+    let requestedCodemapCount: Int?
+}
+
 struct WorkspaceCodemapPresentationCoordinator {
     private struct AutomaticPreparation {
         let candidates: [WorkspaceCodemapOperationPresentationCandidate]
@@ -159,6 +179,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         WorkspaceCodemapAutomaticSelectionPublicationReceipt
     ) async throws -> Void
     let structureAttemptDidBegin: @Sendable (Int) -> Void
+    let structurePhaseDidChange: @Sendable (WorkspaceCodemapStructureExecutionPhase) async -> Void
 
     init(
         store: WorkspaceFileContextStore,
@@ -170,7 +191,10 @@ struct WorkspaceCodemapPresentationCoordinator {
         afterAutomaticCandidateReconstruction: @escaping @Sendable (
             WorkspaceCodemapAutomaticSelectionPublicationReceipt
         ) async throws -> Void = { _ in },
-        structureAttemptDidBegin: @escaping @Sendable (Int) -> Void = { _ in }
+        structureAttemptDidBegin: @escaping @Sendable (Int) -> Void = { _ in },
+        structurePhaseDidChange: @escaping @Sendable (
+            WorkspaceCodemapStructureExecutionPhase
+        ) async -> Void = { _ in }
     ) {
         self.store = store
         self.policy = policy
@@ -178,6 +202,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         self.beforePublicationRevalidation = beforePublicationRevalidation
         self.afterAutomaticCandidateReconstruction = afterAutomaticCandidateReconstruction
         self.structureAttemptDidBegin = structureAttemptDidBegin
+        self.structurePhaseDidChange = structurePhaseDidChange
     }
 
     func presentation(
@@ -204,47 +229,95 @@ struct WorkspaceCodemapPresentationCoordinator {
             try Task.checkCancellation()
             return value
         }
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: policy.maximumTotalWait)
-        var lastStaleReason: WorkspaceCodemapOperationPublicationStaleReason?
-
-        for attempt in 0 ... 1 {
-            try Task.checkCancellation()
-            let ownership = WorkspaceCodemapOperationPresentationOwnership()
-            do {
-                let result = try await makePresentation(
+        return try await withPresentation(
+            prepareAttempt: {
+                WorkspaceCodemapPresentationAttempt(
+                    context: (),
                     intent: intent,
                     rootScope: rootScope,
                     logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+                    requestedCodemapCount: nil
+                )
+            }
+        ) { _, presentation in
+            try await operation(presentation)
+        }
+    }
+
+    func withPresentation<Context, Value>(
+        prepareAttempt: () async throws -> WorkspaceCodemapPresentationAttempt<Context>,
+        operation: (Context, WorkspaceCodemapOperationPresentation) async throws -> Value
+    ) async throws -> Value {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: policy.maximumTotalWait)
+        var lastStaleReason: WorkspaceCodemapOperationPublicationStaleReason?
+        var initialRequestedCodemapCount: Int?
+        var lastAttempt: WorkspaceCodemapPresentationAttempt<Context>?
+
+        for attempt in 0 ... 1 {
+            try Task.checkCancellation()
+            let prepared = try await prepareAttempt()
+            lastAttempt = prepared
+            if initialRequestedCodemapCount == nil {
+                initialRequestedCodemapCount = prepared.requestedCodemapCount
+            }
+            let ownership = WorkspaceCodemapOperationPresentationOwnership()
+            do {
+                var result = try await makePresentation(
+                    intent: prepared.intent,
+                    rootScope: prepared.rootScope,
+                    logicalRootDisplayNamesByRootID: prepared.logicalRootDisplayNamesByRootID,
                     ownership: ownership,
                     clock: clock,
                     deadline: deadline
                 )
+                if let reason = lastStaleReason,
+                   let requestedCount = initialRequestedCodemapCount
+                {
+                    result = preservingPriorStaleCoverage(
+                        result,
+                        reason: reason,
+                        requestedCodemapCount: requestedCount
+                    )
+                }
                 if let reason = retryableStaleReason(in: result.issues) {
                     lastStaleReason = reason
-                    await release(ownership)
-                    if attempt == 0, clock.now < deadline { continue }
-                    let value = try await operation(incompletePublication(reason: reason))
-                    try Task.checkCancellation()
-                    return value
+                    if attempt == 0, clock.now < deadline {
+                        await release(ownership)
+                        continue
+                    }
+                    guard initialRequestedCodemapCount != nil,
+                          !result.orderedEntries.isEmpty
+                    else {
+                        await release(ownership)
+                        let value = try await operation(
+                            prepared.context,
+                            incompletePublication(reason: reason)
+                        )
+                        try Task.checkCancellation()
+                        return value
+                    }
                 }
                 if let reason = lastStaleReason,
                    result.publicationReceipt == nil,
                    result.orderedEntries.isEmpty
                 {
                     await release(ownership)
-                    let value = try await operation(incompletePublication(reason: reason))
+                    let value = try await operation(
+                        prepared.context,
+                        incompletePublication(reason: reason)
+                    )
                     try Task.checkCancellation()
                     return value
                 }
-                let value = try await operation(result)
+                let value = try await operation(prepared.context, result)
                 try Task.checkCancellation()
                 if let receipt = result.publicationReceipt {
                     await beforePublicationRevalidation(receipt)
                     try Task.checkCancellation()
                     let disposition = await store.revalidateCodemapOperationPresentationForPublication(
                         receipt,
-                        rootScope: rootScope
+                        rootScope: prepared.rootScope
                     )
                     switch disposition {
                     case .current:
@@ -254,7 +327,10 @@ struct WorkspaceCodemapPresentationCoordinator {
                         lastStaleReason = reason
                         await release(ownership)
                         if attempt == 0, clock.now < deadline { continue }
-                        let fallbackValue = try await operation(incompletePublication(reason: reason))
+                        let fallbackValue = try await operation(
+                            prepared.context,
+                            incompletePublication(reason: reason)
+                        )
                         try Task.checkCancellation()
                         return fallbackValue
                     }
@@ -267,7 +343,15 @@ struct WorkspaceCodemapPresentationCoordinator {
                 throw error
             }
         }
-        let value = try await operation(incompletePublication(reason: lastStaleReason ?? .rootScope))
+        let prepared: WorkspaceCodemapPresentationAttempt<Context> = if let lastAttempt {
+            lastAttempt
+        } else {
+            try await prepareAttempt()
+        }
+        let value = try await operation(
+            prepared.context,
+            incompletePublication(reason: lastStaleReason ?? .rootScope)
+        )
         try Task.checkCancellation()
         return value
     }
@@ -1197,6 +1281,8 @@ struct WorkspaceCodemapPresentationCoordinator {
         for round in 0 ..< policy.maximumReadinessRounds {
             try Task.checkCancellation()
             var hasPending = false
+            var hasBusy = false
+            var pendingTickets: [(fileID: UUID, ticket: WorkspaceCodemapArtifactDemandTicket)] = []
             var retryAfter: [Int] = []
             for fileID in orderedFileIDs {
                 guard let current = results[fileID] else { continue }
@@ -1204,13 +1290,18 @@ struct WorkspaceCodemapPresentationCoordinator {
                 case let .pending(ticket):
                     let refreshed = await store.codemapArtifactDemandStatus(ticket)
                     results[fileID] = refreshed
-                    if case .pending = refreshed { hasPending = true }
+                    if case let .pending(refreshedTicket) = refreshed {
+                        hasPending = true
+                        pendingTickets.append((fileID, refreshedTicket))
+                    }
                     if case let .unavailable(.busy(milliseconds)) = refreshed {
                         hasPending = true
+                        hasBusy = true
                         if let milliseconds { retryAfter.append(milliseconds) }
                     }
                 case let .unavailable(.busy(milliseconds)):
                     hasPending = true
+                    hasBusy = true
                     if let milliseconds { retryAfter.append(milliseconds) }
                 case .ready, .unavailable:
                     break
@@ -1220,6 +1311,32 @@ struct WorkspaceCodemapPresentationCoordinator {
                   round + 1 < policy.maximumReadinessRounds,
                   clock.now < deadline
             else { break }
+
+            if !pendingTickets.isEmpty, !hasBusy {
+                let firstCompletion: (fileID: UUID, result: WorkspaceCodemapArtifactDemandResult)? = try await withThrowingTaskGroup(
+                    of: (fileID: UUID, result: WorkspaceCodemapArtifactDemandResult).self
+                ) { group in
+                    for pending in pendingTickets {
+                        group.addTask {
+                            try Task.checkCancellation()
+                            let result = await store.waitForCodemapArtifactDemandChange(
+                                pending.ticket,
+                                deadline: deadline
+                            )
+                            try Task.checkCancellation()
+                            return (pending.fileID, result)
+                        }
+                    }
+                    guard let first = try await group.next() else { return nil }
+                    group.cancelAll()
+                    return first
+                }
+                if let firstCompletion {
+                    results[firstCompletion.fileID] = firstCompletion.result
+                }
+                continue
+            }
+
             try await wait(
                 round: round,
                 suggestedMilliseconds: retryAfter,
@@ -1486,6 +1603,30 @@ struct WorkspaceCodemapPresentationCoordinator {
         )
     }
 
+    private func preservingPriorStaleCoverage(
+        _ presentation: WorkspaceCodemapOperationPresentation,
+        reason: WorkspaceCodemapOperationPublicationStaleReason,
+        requestedCodemapCount: Int
+    ) -> WorkspaceCodemapOperationPresentation {
+        guard presentation.orderedEntries.count < requestedCodemapCount else {
+            return presentation
+        }
+        let issue = WorkspaceCodemapOperationIssue.publicationStale(reason)
+        let issues = presentation.issues.contains(issue)
+            ? presentation.issues
+            : presentation.issues + [issue]
+        let coverage: WorkspaceCodemapOperationPresentationCoverage = presentation.orderedEntries.isEmpty
+            ? .unavailable(issues)
+            : .partial(issues)
+        return WorkspaceCodemapOperationPresentation(
+            id: presentation.id,
+            orderedEntries: presentation.orderedEntries,
+            coverage: coverage,
+            issues: issues,
+            publicationReceipt: presentation.publicationReceipt
+        )
+    }
+
     private func retryableStaleReason(
         in issues: [WorkspaceCodemapOperationIssue]
     ) -> WorkspaceCodemapOperationPublicationStaleReason? {
@@ -1551,6 +1692,9 @@ extension WorkspaceCodemapPresentationCoordinator {
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         logicalRootDisplayNamesByRootID: [UUID: String] = [:]
     ) async throws -> WorkspaceCodemapStructurePresentation {
+        // The warm seed-only lookup is part of seed-demand/presentation acquisition,
+        // so a cache hit intentionally remains attributed to this phase.
+        await structurePhaseDidChange(.seedDemand)
         if direction == nil,
            let published = await store.publishedCodemapStructurePresentation(
                seedFileIDs: seedFileIDs,
@@ -1568,6 +1712,9 @@ extension WorkspaceCodemapPresentationCoordinator {
 
         for attemptIndex in 0 ..< policy.maximumStructurePublicationAttempts {
             try Task.checkCancellation()
+            if attemptIndex > 0 {
+                await structurePhaseDidChange(.seedDemand)
+            }
             structureAttemptDidBegin(attemptIndex)
             let ownership = WorkspaceCodemapOperationPresentationOwnership()
             do {
@@ -1599,6 +1746,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                     }
                     return attempt.presentation
                 }
+                await structurePhaseDidChange(.publicationRevalidation)
                 await beforePublicationRevalidation(receipt.presentation)
                 switch await store.revalidateCodemapStructureForPublication(
                     receipt,
@@ -1851,6 +1999,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         }
 
         if direction != nil {
+            await structurePhaseDidChange(.projectionWait)
             let sourceTicketsByRoot = Dictionary(grouping: graphSeeds.map(\.ticket), by: \.rootEpoch)
             let deadlineUptimeNanoseconds = projectionDeadlineUptimeNanoseconds(
                 clock: clock,
@@ -1984,6 +2133,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         var traversalBudgetHit = false
 
         if let direction {
+            await structurePhaseDidChange(.graphQuery)
             var disposition = await store.queryCodemapStructureGraph(
                 WorkspaceCodemapStructureTraversalQuery(
                     seeds: graphSeeds,
@@ -2101,6 +2251,7 @@ extension WorkspaceCodemapPresentationCoordinator {
 
                 let targetIDs = traversalResult.nodes.filter { $0.depth > 0 }.map(\.fileID)
                 if !targetIDs.isEmpty {
+                    await structurePhaseDidChange(.targetDemand)
                     let targetDemand = try await demand(
                         fileIDs: targetIDs,
                         priority: .explicit,
@@ -2201,6 +2352,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                         )
                     }
 
+                    await structurePhaseDidChange(.graphRequery)
                     var revalidated = await store.queryCodemapStructureGraph(
                         WorkspaceCodemapStructureTraversalQuery(
                             seeds: graphSeeds,
@@ -2360,11 +2512,13 @@ extension WorkspaceCodemapPresentationCoordinator {
         var bundleReceipts: [WorkspaceCodemapOperationPresentationBundleReceipt] = []
         for rootEpoch in requestsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
             try Task.checkCancellation()
+            await structurePhaseDidChange(.freeze)
             switch await store.freezeCodemapPresentation(requestsByRoot[rootEpoch] ?? []) {
             case let .unavailable(reason):
                 issues.append(.freezeUnavailable(rootEpoch: rootEpoch, reason: reason))
             case let .ready(bundle):
                 await ownership.record(bundle)
+                await structurePhaseDidChange(.render)
                 switch await store.renderCodemapPresentation(bundle) {
                 case let .unavailable(reason):
                     issues.append(.renderUnavailable(rootEpoch: rootEpoch, reason: reason))
@@ -2389,6 +2543,7 @@ extension WorkspaceCodemapPresentationCoordinator {
             }
         }
 
+        await structurePhaseDidChange(.assembly)
         let separatorTokens = TokenCalculationService.estimateTokens(for: "\n\n")
         var structureEntries: [WorkspaceCodemapStructureRenderedEntry] = []
         var usedTokens = 0

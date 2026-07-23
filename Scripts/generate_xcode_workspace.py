@@ -82,6 +82,14 @@ def _target_map(manifest: dict) -> dict[str, dict]:
     return {target.get("name", ""): target for target in manifest.get("targets", [])}
 
 
+def _by_name_dependencies(target: dict) -> list[str]:
+    return [
+        dependency["byName"][0]
+        for dependency in target.get("dependencies", [])
+        if dependency.get("byName")
+    ]
+
+
 def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if manifest.get("name") != "RepoPromptCE":
         raise GeneratorError("Package.swift must define package 'RepoPromptCE'")
@@ -91,23 +99,78 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         product = products.get(name)
         if product is None or "executable" not in product.get("type", {}):
             raise GeneratorError(f"Package.swift must retain executable product '{name}'")
+    if products["RepoPrompt"].get("targets") != ["RepoPrompt"]:
+        raise GeneratorError(
+            "Executable product 'RepoPrompt' must remain mapped only to target 'RepoPrompt'"
+        )
 
     targets = _target_map(manifest)
     required_targets = (
         "RepoPrompt",
+        "RepoPromptApp",
         "RepoPromptMCP",
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
+        "RepoPromptWorkspaceCore",
+        "RepoPromptRegexCore",
+        "RepoPromptCodeMapCore",
         "TreeSitterScannerSupport",
+        "RepoPromptWorkspaceCoreTests",
+        "RepoPromptRegexCoreTests",
+        "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
     )
     for name in required_targets:
         if name not in targets:
             raise GeneratorError(f"Package.swift must retain target '{name}'")
 
+    repo_prompt = targets["RepoPrompt"]
+    if repo_prompt.get("type") != "executable":
+        raise GeneratorError("Target 'RepoPrompt' must remain executable")
+    if repo_prompt.get("path") != "Sources/RepoPromptExecutable":
+        raise GeneratorError(
+            "Target 'RepoPrompt' must remain the thin Sources/RepoPromptExecutable entry target"
+        )
+    if len(repo_prompt.get("dependencies", [])) != 1 or _by_name_dependencies(repo_prompt) != [
+        "RepoPromptApp"
+    ]:
+        raise GeneratorError("Target 'RepoPrompt' must depend only on 'RepoPromptApp'")
+    repo_prompt_unsafe_flags = [
+        setting.get("kind", {}).get("unsafeFlags", {}).get("_0", [])
+        for setting in repo_prompt.get("settings", [])
+    ]
+    if any("-import-objc-header" in flags for flags in repo_prompt_unsafe_flags):
+        raise GeneratorError(
+            "Target 'RepoPrompt' must not own the RepoPromptApp Objective-C bridging header"
+        )
+
+    repo_prompt_app = targets["RepoPromptApp"]
+    if repo_prompt_app.get("type") != "regular":
+        raise GeneratorError("Target 'RepoPromptApp' must remain an internal library target")
+    if repo_prompt_app.get("path") != "Sources/RepoPrompt":
+        raise GeneratorError(
+            "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
+        )
+
+    expected_test_dependencies = {
+        "RepoPromptApp",
+        "RepoPromptCodeMapCore",
+        "RepoPromptMCP",
+        "RepoPromptShared",
+    }
+    repo_prompt_tests = targets["RepoPromptTests"]
+    if (
+        len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
+        or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
+    ):
+        raise GeneratorError(
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
+            "RepoPromptMCP, and RepoPromptShared"
+        )
+
     unsafe_flags: list[list[str]] = []
-    for setting in targets["RepoPrompt"].get("settings", []):
+    for setting in repo_prompt_app.get("settings", []):
         value = setting.get("kind", {}).get("unsafeFlags", {}).get("_0")
         if isinstance(value, list):
             unsafe_flags.append(value)
@@ -120,17 +183,24 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         for flags in unsafe_flags
     ):
         raise GeneratorError(
-            "RepoPrompt must retain the Objective-C bridging-header unsafe flags"
+            "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
         )
 
-    resources = [
-        (resource.get("path"), "copy" in resource.get("rule", {}))
-        for resource in targets["RepoPromptTests"].get("resources", [])
-    ]
-    expected_resources = [("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)]
-    if resources != expected_resources:
+    expected_resources = {("Fixtures", True), ("Goldens", True)}
+    test_targets_with_codemap_resources = []
+    for target in targets.values():
+        if target.get("type") != "test":
+            continue
+        resources = {
+            (resource.get("path"), "copy" in resource.get("rule", {}))
+            for resource in target.get("resources", [])
+        }
+        if expected_resources.issubset(resources):
+            test_targets_with_codemap_resources.append(target.get("name"))
+    if test_targets_with_codemap_resources != ["RepoPromptCodeMapCoreTests"]:
         raise GeneratorError(
-            "RepoPromptTests must copy CodeMap/Fixtures and CodeMap/Goldens"
+            "RepoPromptCodeMapCoreTests must be the sole SwiftPM test target "
+            "that copies Fixtures and Goldens"
         )
 
     expected_scanners = ["src/javascript/scanner.c", "src/python/scanner.c"]
@@ -145,6 +215,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "Package.resolved",
         "Scripts/package_app.sh",
         "Scripts/xcode_developer_workflow.sh",
+        "Sources/RepoPromptExecutable/RepoPromptExecutable.swift",
         "conductor",
         "AppBundle/Info.plist.template",
         "Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework",
@@ -818,7 +889,12 @@ def validate_xcodebuild_list(destination: Path) -> None:
     workspace = destination / WORKSPACE_NAME
     command = ["xcodebuild", "-list", "-json", "-workspace", str(workspace)]
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except FileNotFoundError as error:
         raise GeneratorError("xcodebuild is required; install/select Xcode") from error
     if result.returncode != 0:

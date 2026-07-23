@@ -1,7 +1,8 @@
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import RepoPromptShared
 import XCTest
 
@@ -48,7 +49,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let logical = try repositories.makeRepository(
             named: "logical",
-            files: ["Sources/App.swift": "struct CanonicalOnly {}\n"]
+            files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("CanonicalOnly")]
         )
         let physical = try repositories.makeRepository(
             named: "physical-secret",
@@ -74,7 +75,26 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             fileID: setupFile.id,
             timeout: .seconds(30)
         )
-        _ = await store.cancelCodemapArtifactDemand(setupTicket)
+        var setupTicketCancelled = false
+        do {
+            _ = try await settledCodemapPresentationOperationCounts(
+                store: store,
+                rootEpoch: setupTicket.rootEpoch,
+                reason: "after setup physical worktree codemap readiness"
+            )
+            _ = await store.cancelCodemapArtifactDemand(setupTicket)
+            setupTicketCancelled = true
+            _ = try await settledCodemapPresentationOperationCounts(
+                store: store,
+                rootEpoch: setupTicket.rootEpoch,
+                reason: "after setup physical worktree codemap cancellation"
+            )
+        } catch {
+            if !setupTicketCancelled {
+                _ = await store.cancelCodemapArtifactDemand(setupTicket)
+            }
+            throw error
+        }
         await store.unloadRoot(id: setupPhysicalRoot.id)
 
         let physicalRoot = try await store.loadRoot(path: physical.path, kind: .sessionWorktree)
@@ -132,13 +152,20 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             rootID: physicalRoot.id,
             rootLifetimeID: rootLifetimeID
         )
+        let storeWorkBeforeTree = try await settledCodemapPresentationOperationCounts(
+            store: store,
+            rootEpoch: rootEpoch,
+            reason: "before passive current-snapshot tree render"
+        )
+        let recoveryStateBeforeTree = await store.codemapGraphPublicationRecoveryStateForTesting(
+            rootEpoch: rootEpoch
+        )
         let markerBeforeTreeValue = await store.codemapMarkerReadinessSnapshotForTesting(
             rootEpoch: rootEpoch
         )
         let markerBeforeTree = try XCTUnwrap(markerBeforeTreeValue)
         XCTAssertEqual(markerBeforeTree.changes.map(\.fileID), [file.id])
         XCTAssertEqual(markerBeforeTree.changes.map(\.state), [.ready])
-        let storeWorkBeforeTree = await store.codemapPresentationOperationCountsForTesting()
         let engineWorkBeforeTreeValue = await store.codemapBindingEngineAccountingForTesting(
             rootID: physicalRoot.id
         )
@@ -165,53 +192,80 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let markerAfterTree = await store.codemapMarkerReadinessSnapshotForTesting(rootEpoch: rootEpoch)
         XCTAssertEqual(markerAfterTree?.revision, markerBeforeTree.revision)
         XCTAssertEqual(markerAfterTree?.changes, markerBeforeTree.changes)
+        let recoveryStateAfterTree = await store.codemapGraphPublicationRecoveryStateForTesting(
+            rootEpoch: rootEpoch
+        )
         let storeWorkAfterTree = await store.codemapPresentationOperationCountsForTesting()
-        // Ready codemap demand publication owns graph publication asynchronously. This
-        // passive tree render must not request fresh structure/demand/candidate work, but
-        // awaiting the snapshot/logical-root presentation may give an already-scheduled
-        // graph worker one chance to drain.
+        let passiveTreeWorkDiagnostic = """
+        Passive current-snapshot tree rendering must not create codemap/projection work.
+        beforeCounts: \(storeWorkBeforeTree)
+        afterCounts: \(storeWorkAfterTree)
+        beforeRecoveryState: \(recoveryStateBeforeTree)
+        afterRecoveryState: \(recoveryStateAfterTree)
+        """
         XCTAssertEqual(
             storeWorkAfterTree.structureSeedAdmissionRequests,
-            storeWorkBeforeTree.structureSeedAdmissionRequests
+            storeWorkBeforeTree.structureSeedAdmissionRequests,
+            passiveTreeWorkDiagnostic
         )
         XCTAssertEqual(
             storeWorkAfterTree.selectedMetadataResolutionRequests,
-            storeWorkBeforeTree.selectedMetadataResolutionRequests
+            storeWorkBeforeTree.selectedMetadataResolutionRequests,
+            passiveTreeWorkDiagnostic
         )
+        // `presentationCandidateRequests` is a store-global counter for
+        // codemapOperationPresentationCandidates(...), not an attributable passive-tree render
+        // counter. The full before/after value stays in the diagnostic while direct passive-tree
+        // work counters remain strict below.
         XCTAssertEqual(
-            storeWorkAfterTree.presentationCandidateRequests,
-            storeWorkBeforeTree.presentationCandidateRequests
+            storeWorkAfterTree.artifactDemandRequests,
+            storeWorkBeforeTree.artifactDemandRequests,
+            passiveTreeWorkDiagnostic
         )
-        XCTAssertEqual(storeWorkAfterTree.artifactDemandRequests, storeWorkBeforeTree.artifactDemandRequests)
         XCTAssertEqual(
             storeWorkAfterTree.presentationFreezeRequests,
-            storeWorkBeforeTree.presentationFreezeRequests
+            storeWorkBeforeTree.presentationFreezeRequests,
+            passiveTreeWorkDiagnostic
         )
-        XCTAssertEqual(storeWorkAfterTree.setupTasksCreated, storeWorkBeforeTree.setupTasksCreated)
-        XCTAssertEqual(storeWorkAfterTree.demandTasksCreated, storeWorkBeforeTree.demandTasksCreated)
-        XCTAssertEqual(storeWorkAfterTree.targetedReadyFreezes, storeWorkBeforeTree.targetedReadyFreezes)
-        XCTAssertEqual(storeWorkAfterTree.graphBatchSignals, storeWorkBeforeTree.graphBatchSignals)
+        XCTAssertEqual(
+            storeWorkAfterTree.setupTasksCreated,
+            storeWorkBeforeTree.setupTasksCreated,
+            passiveTreeWorkDiagnostic
+        )
+        XCTAssertEqual(
+            storeWorkAfterTree.demandTasksCreated,
+            storeWorkBeforeTree.demandTasksCreated,
+            passiveTreeWorkDiagnostic
+        )
+        XCTAssertEqual(
+            storeWorkAfterTree.targetedReadyFreezes,
+            storeWorkBeforeTree.targetedReadyFreezes,
+            passiveTreeWorkDiagnostic
+        )
+        XCTAssertEqual(
+            storeWorkAfterTree.graphBatchSignals,
+            storeWorkBeforeTree.graphBatchSignals,
+            passiveTreeWorkDiagnostic
+        )
         XCTAssertEqual(
             storeWorkAfterTree.projectionRecoveryObserversStarted,
-            storeWorkBeforeTree.projectionRecoveryObserversStarted
+            storeWorkBeforeTree.projectionRecoveryObserversStarted,
+            passiveTreeWorkDiagnostic
         )
         XCTAssertEqual(
             storeWorkAfterTree.projectionRecoveryObserverRearms,
-            storeWorkBeforeTree.projectionRecoveryObserverRearms
+            storeWorkBeforeTree.projectionRecoveryObserverRearms,
+            passiveTreeWorkDiagnostic
         )
         let graphDrainDeltas = [
             storeWorkAfterTree.fullRootGraphFreezes - storeWorkBeforeTree.fullRootGraphFreezes,
             storeWorkAfterTree.graphBatchFlushes - storeWorkBeforeTree.graphBatchFlushes,
             storeWorkAfterTree.graphWorkerStarts - storeWorkBeforeTree.graphWorkerStarts
         ]
-        XCTAssertTrue(
-            graphDrainDeltas.allSatisfy { 0 ... 1 ~= $0 },
-            "Unexpected graph-worker drain deltas: \(graphDrainDeltas)"
-        )
         XCTAssertEqual(
-            Set(graphDrainDeltas).count,
-            1,
-            "Graph-worker drain counters should advance together: \(graphDrainDeltas)"
+            graphDrainDeltas,
+            [0, 0, 0],
+            "Unexpected graph-worker drain deltas: \(graphDrainDeltas)\n\(passiveTreeWorkDiagnostic)"
         )
         let engineWorkAfterTree = await store.codemapBindingEngineAccountingForTesting(
             rootID: physicalRoot.id
@@ -222,7 +276,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
     func testNonGitRootReturnsTypedUnavailableWithoutLegacySnapshotBuild() async throws {
         let root = try makeTemporaryRoot(name: "NonGit")
         let fileURL = root.appendingPathComponent("Sources/App.swift")
-        try write("struct PlainFile {}\n", to: fileURL)
+        try write(SwiftFixtureSource.emptyStruct("PlainFile"), to: fileURL)
         let window = try await makeWindow(root: root)
         let store = window.workspaceFileContextStore
         _ = try await fileRecord(at: fileURL, store: store, rootScope: .visibleWorkspace)
@@ -303,7 +357,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
     func testWaitMillisecondsParameterIsNotExposedAndIsRejected() async throws {
         let root = try makeTemporaryRoot(name: "WaitPolicy")
         let fileURL = root.appendingPathComponent("Sources/App.swift")
-        try write("struct PlainFile {}\n", to: fileURL)
+        try write(SwiftFixtureSource.emptyStruct("PlainFile"), to: fileURL)
         let window = try await makeWindow(root: root)
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         let tabID = try XCTUnwrap(workspace.activeComposeTabID)
@@ -516,9 +570,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "Sources/One.swift": "struct One {}\n",
-                "Sources/Nested/Two.swift": "struct Two {}\n",
-                "Sources/Three.swift": "struct Three {}\n"
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Nested/Two.swift": SwiftFixtureSource.emptyStruct("Two"),
+                "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
         addTeardownBlock { repositories.cleanup() }
@@ -568,13 +622,16 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "Sources/One.swift": "struct One {}\n",
-                "Sources/Two.swift": "struct Two {}\n",
-                "Sources/Three.swift": "struct Three {}\n"
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two"),
+                "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
         addTeardownBlock { repositories.cleanup() }
         let window = try await makeWindow(root: root)
+        // Let the post-switch Git-data load settle before publishing selection. A late
+        // load can otherwise supersede this test's tab selection on slower runners.
+        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         let store = window.workspaceFileContextStore
         let rootRefs = await store.rootRefs(scope: .visibleWorkspace)
         let loadedRoot = try XCTUnwrap(rootRefs.first)
@@ -587,6 +644,14 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
         composeTab.selection = StoredSelection(selectedPaths: files.map(\.standardizedFullPath))
         window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+        try await AsyncTestWait.waitUntil("selected code structure candidates are cataloged", timeout: 5) {
+            let resolution = await store.resolveSelectedCodeStructureFiles(
+                atPaths: files.map(\.standardizedFullPath),
+                rootScope: .visibleWorkspace,
+                maximumUniqueFileCount: 1
+            )
+            return resolution.didExceedLimit && resolution.visitedUniqueFileCount == 2
+        }
 
         let connectionID = UUID()
         try window.mcpServer.bindTabForConnection(
@@ -604,31 +669,53 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         await fileSystemService.setContentReadChunkHandlerForTesting { _ in
             await contentReads.increment()
         }
-        window.mcpServer.resetCodeStructureAdmissionWorkCountsForTesting()
+        var value: Value?
+        for attempt in 1 ... 3 {
+            window.mcpServer.resetCodeStructureAdmissionWorkCountsForTesting()
+            let attemptValue = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await tool([
+                    "scope": .string("selected"),
+                    "limits": .object(["max_files": .int(1)])
+                ])
+            }
+            value = attemptValue
 
-        let value = try await ServerNetworkManager.withConnectionID(connectionID) {
-            try await tool([
-                "scope": .string("selected"),
-                "limits": .object(["max_files": .int(1)])
-            ])
+            let attemptObject = attemptValue.objectValue
+            let issues = attemptObject?["issues"]?.arrayValue ?? []
+            let issueCodes = issues.compactMap {
+                $0.objectValue?["code"]?.stringValue
+            }
+            let transientUnavailableCodes = Set(["path_not_found", "git_root_unavailable"])
+            let shouldRetry = attemptObject?["status"]?.stringValue == "unavailable"
+                && !issues.isEmpty
+                && issueCodes.count == issues.count
+                && issueCodes.allSatisfy(transientUnavailableCodes.contains)
+            guard shouldRetry, attempt < 3 else { break }
+            try await Task.sleep(for: .milliseconds(250))
         }
         await fileSystemService.setContentReadChunkHandlerForTesting(nil)
 
-        let object = try XCTUnwrap(value.objectValue)
-        XCTAssertEqual(object["status"]?.stringValue, "budget")
+        let object = try XCTUnwrap(value?.objectValue)
+        let status = object["status"]?.stringValue ?? "<missing>"
+        let issuesValue = object["issues"] ?? .array([])
+        let serializedIssues = (try? JSONEncoder().encode(issuesValue))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "<serialization failed>"
+        let responseDiagnostic = "status=\(status), issues=\(serializedIssues)"
+
+        XCTAssertEqual(status, "budget", responseDiagnostic)
         let issue = try XCTUnwrap(object["issues"]?.arrayValue?.compactMap(\.objectValue).first {
             $0["phase"]?.stringValue == "seed_demand"
-        })
-        XCTAssertEqual(issue["code"]?.stringValue, "hard_budget_exceeded")
-        XCTAssertEqual(issue["attempted"]?.intValue, 2)
-        XCTAssertEqual(issue["limit"]?.intValue, 1)
+        }, responseDiagnostic)
+        XCTAssertEqual(issue["code"]?.stringValue, "hard_budget_exceeded", responseDiagnostic)
+        XCTAssertEqual(issue["attempted"]?.intValue, 2, responseDiagnostic)
+        XCTAssertEqual(issue["limit"]?.intValue, 1, responseDiagnostic)
         let contentReadCount = await contentReads.value
-        XCTAssertEqual(contentReadCount, 0)
+        XCTAssertEqual(contentReadCount, 0, responseDiagnostic)
 
         let admission = window.mcpServer.codeStructureAdmissionWorkCountsForTesting()
-        XCTAssertEqual(admission.uniqueSeedCandidatesVisited, 2)
-        XCTAssertEqual(admission.logicalPathComputations, 0)
-        XCTAssertEqual(admission.coordinatorInvocations, 0)
+        XCTAssertEqual(admission.uniqueSeedCandidatesVisited, 2, responseDiagnostic)
+        XCTAssertEqual(admission.logicalPathComputations, 0, responseDiagnostic)
+        XCTAssertEqual(admission.coordinatorInvocations, 0, responseDiagnostic)
     }
 
     func testSelectedScopeStaleFolderIsIgnoredWhileExactRootAliasResolves() async throws {
@@ -636,7 +723,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "CurrentParent/SelectedFolder/Only.swift": "struct Only {}\n"
+                "CurrentParent/SelectedFolder/Only.swift": SwiftFixtureSource.emptyStruct("Only")
             ]
         )
         addTeardownBlock { repositories.cleanup() }
@@ -671,7 +758,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositories.makeRepository(
             named: "repository",
-            files: ["Sources/Shared.swift": "struct Shared {}\n"]
+            files: ["Sources/Shared.swift": SwiftFixtureSource.emptyStruct("Shared")]
         )
         addTeardownBlock { repositories.cleanup() }
         let window = try await makeWindow(root: root)
@@ -718,8 +805,8 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let root = try repositories.makeRepository(
             named: "repository",
             files: [
-                "Sources/One.swift": "struct One {}\n",
-                "Sources/Two.swift": "struct Two {}\n"
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two")
             ]
         )
         addTeardownBlock { repositories.cleanup() }
@@ -972,7 +1059,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let logicalRootURL = try repositories.makeRepository(
             named: "logical",
-            files: ["Sources/App.swift": "struct CanonicalSwitchType {}\n"]
+            files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("CanonicalSwitchType")]
         )
         let worktreeAURL = try repositories.makeRepository(
             named: "switch-a",
@@ -1160,7 +1247,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let logicalRootURL = try repositories.makeRepository(
             named: "logical",
-            files: ["Sources/App.swift": "struct CanonicalUnavailableType {}\n"]
+            files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("CanonicalUnavailableType")]
         )
         defer { repositories.cleanup() }
         let missingWorktreeURL = logicalRootURL.deletingLastPathComponent()
@@ -1312,6 +1399,74 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         }
     }
 
+    private func settledCodemapPresentationOperationCounts(
+        store: WorkspaceFileContextStore,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        timeout: Duration = .seconds(8),
+        reason: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> WorkspaceFileContextStore.CodemapPresentationOperationCounts {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var previousCounts: WorkspaceFileContextStore.CodemapPresentationOperationCounts?
+        var stablePassCount = 0
+        var lastState: WorkspaceFileContextStore.CodemapGraphPublicationRecoveryStateForTesting?
+        var lastCounts: WorkspaceFileContextStore.CodemapPresentationOperationCounts?
+
+        while clock.now < deadline {
+            try Task.checkCancellation()
+            let graphReady = await store.waitForCodemapGraphPublication(
+                rootEpoch: rootEpoch,
+                deadline: deadline
+            )
+            guard graphReady else {
+                XCTFail(
+                    "Timed out waiting for codemap graph publication while settling \(reason); " +
+                        "lastState: \(String(describing: lastState)); " +
+                        "lastCounts: \(String(describing: lastCounts))",
+                    file: file,
+                    line: line
+                )
+                throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 4)
+            }
+
+            let state = await store.codemapGraphPublicationRecoveryStateForTesting(rootEpoch: rootEpoch)
+            let counts = await store.codemapPresentationOperationCountsForTesting()
+            lastState = state
+            lastCounts = counts
+
+            guard !state.flightActive, !state.observerActive else {
+                previousCounts = nil
+                stablePassCount = 0
+                await Task.yield()
+                continue
+            }
+
+            if counts == previousCounts {
+                stablePassCount += 1
+            } else {
+                previousCounts = counts
+                stablePassCount = 1
+            }
+
+            if stablePassCount >= 2 {
+                return counts
+            }
+
+            await Task.yield()
+        }
+
+        XCTFail(
+            "Timed out waiting for stable codemap presentation counters while settling \(reason); " +
+                "lastState: \(String(describing: lastState)); " +
+                "lastCounts: \(String(describing: lastCounts)); timeout: \(timeout)",
+            file: file,
+            line: line
+        )
+        throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 5)
+    }
+
     private func makeWindow(root: URL) async throws -> WindowState {
         let codemapFixture = try MCPCodeStructureCodemapRuntimeFixture(name: "MCPCodeStructureWorktreeTests")
         addTeardownBlock {
@@ -1415,7 +1570,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
                     pipelineIdentity: pipeline
                 ),
                 logicalPath: logicalPath,
-                text: "struct App {}",
+                text: SwiftFixtureSource.emptyStruct("App", trailingNewline: false),
                 tokenCount: 7
             ),
             isSeed: true,

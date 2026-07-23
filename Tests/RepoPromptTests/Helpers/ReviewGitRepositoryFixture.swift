@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 
 final class ReviewGitRepositoryFixture {
     let sandbox: URL
@@ -26,23 +26,47 @@ final class ReviewGitRepositoryFixture {
         objectFormat: GitObjectFormat? = nil
     ) throws -> URL {
         let root = sandbox.appendingPathComponent(name, isDirectory: true).standardizedFileURL
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        var initArguments = ["init"]
         if let objectFormat {
-            initArguments.append("--object-format=\(objectFormat.rawValue)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try initializeRepository(at: root, objectFormat: objectFormat)
+        } else {
+            try ImmutableGitRepositoryTemplate.copy(.configuredMain, to: root)
+            try configureHermeticAttributesFile(at: root)
         }
-        _ = try runGit(initArguments, at: root)
-        _ = try runGit(["config", "user.name", "RepoPrompt Test"], at: root)
-        _ = try runGit(["config", "user.email", "repoprompt@example.test"], at: root)
-        _ = try runGit(["config", "commit.gpgSign", "false"], at: root)
-        _ = try runGit(["checkout", "-b", "main"], at: root)
 
         for (path, contents) in files {
             try write(contents, to: path, at: root)
         }
-        _ = try runGit(["add", "."], at: root)
+        _ = try runGit(["add", "-A"], at: root)
         _ = try runGit(["commit", "-m", "Initial commit"], at: root)
         return root
+    }
+
+    private func initializeRepository(at root: URL, objectFormat: GitObjectFormat) throws {
+        _ = try runGit(["init", "--object-format=\(objectFormat.rawValue)"], at: root)
+        _ = try runGit(["config", "user.name", "RepoPrompt Test"], at: root)
+        _ = try runGit(["config", "user.email", "repoprompt@example.test"], at: root)
+        _ = try runGit(["config", "commit.gpgSign", "false"], at: root)
+        _ = try runGit(["config", "core.autocrlf", "false"], at: root)
+        _ = try runGit(["config", "core.eol", "native"], at: root)
+        try configureHermeticAttributesFile(at: root)
+        _ = try runGit(["checkout", "-b", "main"], at: root)
+    }
+
+    private func configureHermeticAttributesFile(at root: URL) throws {
+        let attributesFile = root
+            .appendingPathComponent(".git", isDirectory: true)
+            .appendingPathComponent("info", isDirectory: true)
+            .appendingPathComponent("repoprompt-empty-global-attributes")
+            .standardizedFileURL
+        try FileManager.default.createDirectory(
+            at: attributesFile.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !FileManager.default.fileExists(atPath: attributesFile.path) {
+            try Data().write(to: attributesFile, options: .atomic)
+        }
+        _ = try runGit(["config", "core.attributesFile", attributesFile.path], at: root)
     }
 
     func makeLinkedWorktree(
@@ -127,31 +151,14 @@ final class ReviewGitRepositoryFixture {
 
     @discardableResult
     func runGit(_ arguments: [String], at root: URL) throws -> String {
-        let result = try runGitResult(arguments, at: root)
-        guard result.terminationStatus == 0 else {
-            throw NSError(
-                domain: "ReviewGitRepositoryFixture.git",
-                code: Int(result.terminationStatus),
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "git \(arguments.joined(separator: " ")) failed in \(root.path): \(result.outputText)"
-                ]
-            )
-        }
-        return result.outputText
+        try TestGitCommandRunner.run(
+            arguments,
+            cwd: root,
+            failureDomain: "ReviewGitRepositoryFixture.git"
+        )
     }
 
     func runGitResult(_ arguments: [String], at root: URL) throws -> TestProcessResult {
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-
-        return try TestProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
-            arguments: arguments,
-            currentDirectoryURL: root,
-            environment: environment
-        )
+        try TestGitCommandRunner.runResult(arguments, cwd: root)
     }
 }

@@ -1410,7 +1410,7 @@ enum AgentAssistantLineDerivation {
             return (count, false)
         }
 
-        for scalar in text.unicodeScalars where CharacterSet.newlines.contains(scalar) {
+        for char in text where char.isNewline {
             count += 1
             if count > limit {
                 return (count, false)

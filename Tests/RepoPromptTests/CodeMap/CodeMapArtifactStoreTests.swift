@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class CodeMapArtifactStoreTests: XCTestCase {

@@ -31,6 +31,54 @@ make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTes
 
 Use the narrowest relevant filter, then broaden only for the affected boundary.
 
+### Impacted local feedback lane
+
+For ordinary iteration, prefer the impacted lane over a full root run:
+
+```bash
+make dev-test-impacted RANGE=origin/main...HEAD
+```
+
+This calls `Scripts/test_suite_optimizer.py impacted` with the curated ledger, obtains changed files from `git diff --name-only`, prints exact selected XCTest IDs with reasons, includes a small smoke-floor suite set, reports heavy/opt-in tests skipped by `execution_tier`, and then invokes conductor with an exact XCTest filter. The selector is conservative: broad build/tooling/package/ledger boundaries report `full_root_required=true` instead of pretending a narrow subset is sufficient. Set `INCLUDE_HEAVY=1` only when intentionally running selected `codemap_e2e`, `scale`, `diagnostic`, `live_smoke`, or `release` rows and after setting any required environment gate.
+
+Full root `make dev-test` remains the explicit PR-ready/full local lane, nightly/merge/release lane, or fallback for broad changes. Do not use a green impacted run as evidence that broad package, build graph, conductor, ledger-schema, or generated-workspace changes are fully validated.
+
+For planning the remaining full root lane, generate runtime-balanced shards from ledger timing metadata:
+
+```bash
+make dev-test-shard-plan SHARDS=4
+```
+
+Shard plans use estimated `runtime_seconds`, not method count. Rows with heavy/opt-in tiers are excluded unless `INCLUDE_HEAVY=1` is supplied, and tests with shared-state tags still need isolation review before parallel execution.
+
+### Codemap-sensitive changes
+
+Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.
+
+For local strict codemap E2E coverage, opt in with either `RPCE_RUN_CODEMAP_E2E=1` or the marker file `/tmp/RepoPromptCE-codemap-e2e-opt-in`:
+
+```bash
+RPCE_RUN_CODEMAP_E2E=1 make dev-test FILTER=ContextBuilderWorktreeInheritanceTests
+touch /tmp/RepoPromptCE-codemap-e2e-opt-in && make dev-test FILTER=ContextBuilderWorktreeInheritanceTests ; rm /tmp/RepoPromptCE-codemap-e2e-opt-in
+```
+
+Run this strict gate when changes touch `Sources/RepoPrompt/Features/CodeMap/`, codemap paths in `Sources/RepoPrompt/Infrastructure/WorkspaceContext/`, `Sources/RepoPrompt/Infrastructure/SyntaxParsing/`, or `Sources/TreeSitterScannerSupport/`. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
+
+### Scale-sensitive contract gates
+
+Routine root tests should use lower-cost boundary variants when they still exercise the same spill, merge, streaming, or retained-reader path. The 100K scale contracts that are intentionally retained for Git authority evidence, target seed plan manifests, namespace manifests, and accepted-ingress seeded replay are opt-in:
+
+```bash
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.GitLoadedRootAuthorityEvidenceTests/testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBoundedWhenEnabled
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests/testManifestScaleStreamsOneHundredThousandOrMillionWhenEnabled
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.FileSystemAcceptedIngressBarrierTests/testSyntheticHundredThousandPathReplayWhenEnabled
+```
+
+Use direct `swift test` for these explicit opt-in scale checks so the environment gate reaches the XCTest process. Prefer `make dev-test` for the lower-cost routine variants and ordinary focused validation.
+
+Existing higher-scale overrides remain separate opt-ins, such as `RPCE_RUN_MILLION_RECORD_GIT_AUTHORITY_TESTS=1`, `RPCE_RUN_MILLION_ENTRY_TESTS=1`, and `REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=<count>`.
+
 ## Authoritative executable IDs
 
 Never derive the executable census from source text or a stale build. Use:
@@ -60,7 +108,18 @@ Treat these strings as exact, case-sensitive identifiers.
 
 Every executable add, rename, consolidation, or removal requires an atomic, surgical update to `Scripts/Fixtures/test-suite-contract-ledger.tsv`. Never regenerate or overwrite the curated ledger. In particular, do not point `inventory --force` at it.
 
-The TSV header order is fixed. Every live row carries identity/location fields (`method_id`, `target`, `file`, `suite`, `method`, `domain`, `layer`), contract fields (`primary_contract_id`, `secondary_contract_tags`, `validation_class`, `scenario_count`, `fixture_ids`, `observable_oracle`, `failure_risk`), cost/ownership fields (`runtime_seconds`, `resource_cost_tags`, `shared_state_tags`, `lifecycle_owner`), and disposition fields (`current_disposition`, `replacement_method_id`, `preserved_scenario_delta`, `notes`).
+The TSV header order is fixed. Every live row carries identity/location fields (`method_id`, `target`, `file`, `suite`, `method`, `domain`, `layer`, `execution_tier`), contract fields (`primary_contract_id`, `secondary_contract_tags`, `validation_class`, `scenario_count`, `fixture_ids`, `observable_oracle`, `failure_risk`), cost/ownership fields (`runtime_seconds`, `resource_cost_tags`, `shared_state_tags`, `lifecycle_owner`), and disposition fields (`current_disposition`, `replacement_method_id`, `preserved_scenario_delta`, `notes`).
+
+`execution_tier` is one of:
+
+- `fast` — cheap deterministic checks suitable for every impacted run;
+- `routine` — ordinary root SwiftPM checks selected by changed files/domains plus the smoke floor;
+- `integration` — higher-cost in-process integration checks, selected when directly impacted or explicitly requested;
+- `codemap_e2e` — strict codemap generation/ready-state coverage that requires the local codemap E2E opt-in gate;
+- `scale` — 100K/million or otherwise high-cardinality contracts that require explicit scale env gates;
+- `diagnostic` — benchmark, report-only, wake-probe, or investigative checks, never routine timing evidence;
+- `live_smoke` — packaged/running-app smoke coverage;
+- `release` — release/signing/artifact-sensitive validation.
 
 For every new or touched row:
 
@@ -141,14 +200,19 @@ Ordinary additions, fixes, renames, and removals do not need timing artifacts me
 
 ### Optimization or performance campaigns
 
-In addition to ordinary evidence, create new append-only inventory, baseline, focused, and full-root artifacts and append the result to `prompt-exports/optimize-test-suite-runs.md`. Never rewrite earlier artifacts or scoreboard history.
+In addition to ordinary evidence, create new append-only inventory, baseline, focused, and full-root artifacts under `docs/test-suite-optimizer/`. The active append-only scoreboard is `docs/test-suite-optimizer/scoreboard.md`, and committed optimizer JSON artifacts live under `docs/test-suite-optimizer/artifacts/`. Raw logs and copied conductor logs stay local/uncommitted; use ignored local scratch such as `docs/test-suite-optimizer/raw-logs/` when needed.
 
-Collect 3–5 comparable normal timing samples per measured series. Root and provider timings remain separate. Use a fresh temporary generated ledger path when creating the append-only inventory artifact; never use the curated ledger as inventory output:
+Collect 3–5 comparable normal timing samples per measured series. Root and provider timings remain separate; report any root+provider value only as a derived secondary serial estimate. Use a fresh temporary generated ledger path when creating the append-only inventory artifact; never use the curated ledger as inventory output:
 
 ```bash
 label=example-campaign
-inventory="prompt-exports/test-suite-inventory-${label}.json"
-baseline="prompt-exports/test-suite-baseline-root-${label}.json"
+campaign_dir="docs/test-suite-optimizer"
+artifact_dir="$campaign_dir/artifacts"
+scoreboard="$campaign_dir/scoreboard.md"
+inventory="$artifact_dir/test-suite-inventory-${label}.json"
+root_baseline="$artifact_dir/test-suite-baseline-root-${label}.json"
+provider_baseline="$artifact_dir/test-suite-baseline-provider-${label}.json"
+mkdir -p "$artifact_dir"
 tmpdir="$(mktemp -d)"
 python3 Scripts/test_suite_optimizer.py inventory \
   --ledger "$tmpdir/generated-ledger.tsv" \
@@ -160,11 +224,42 @@ python3 Scripts/test_suite_optimizer.py baseline \
   --samples 5 \
   --label "$label" \
   --inventory "$inventory" \
-  --scoreboard prompt-exports/optimize-test-suite-runs.md \
-  --output "$baseline"
+  --scoreboard "$scoreboard" \
+  --output "$root_baseline" \
+  --source-change-guard metadata
+
+python3 Scripts/test_suite_optimizer.py baseline \
+  --target provider \
+  --samples 5 \
+  --label "$label" \
+  --inventory "$inventory" \
+  --scoreboard "$scoreboard" \
+  --output "$provider_baseline" \
+  --source-change-guard metadata
 ```
 
-Normal timing samples must not enable XCTest stall diagnostics or wake probes. Diagnostic/wake-probe runs are invalid timing samples and may be retained only as separate lifecycle evidence. The scoreboard must report method, contract, and scenario deltas; exact replacement/removal mappings; comparable sample counts; focused/full-root outcomes; and artifact paths.
+`--source-change-guard metadata` records path, size, and mtime metadata before and after each sample instead of hashing every source byte. It reduces measurement-tool overhead and cache perturbation but does not itself count as a suite-speed improvement; use the default content guard when strict byte-level immutability matters more than campaign overhead.
+
+During `baseline`, `Scripts/test_suite_optimizer.py` emits `test_suite_optimizer.progress {...}` lines to stderr at each sample start and end. These lines are live progress only; stdout remains the final JSON payload, and the written artifact plus scoreboard remain the authoritative timing evidence.
+
+Focused before/after evidence uses the same artifact path and append-only scoreboard, but is not the primary root metric unless followed by a complete root baseline:
+
+```bash
+focused="$artifact_dir/test-suite-focused-root-${label}-example.json"
+python3 Scripts/test_suite_optimizer.py baseline \
+  --target root \
+  --filter RepoPromptTests.ExampleTests \
+  --samples 5 \
+  --label "${label}-focused-example" \
+  --inventory "$inventory" \
+  --scoreboard "$scoreboard" \
+  --output "$focused" \
+  --source-change-guard metadata
+```
+
+Filtered baseline artifacts are marked `primary_metric_eligible=false` and include per-method `slowest_tests` rankings. `combine-baselines` accepts only comparable artifacts with the same target, scope, filter, and source-change guard, so complete and focused series cannot be pooled accidentally.
+
+Normal timing samples must not enable XCTest stall diagnostics or wake probes. Diagnostic/wake-probe runs are invalid timing samples and may be retained only as separate lifecycle evidence. The scoreboard must report median, observed p95, relative MAD/noise class, method/contract/scenario deltas, exact replacement/removal mappings, comparable sample counts, focused/full-root outcomes, provider outcomes when relevant, artifact paths, and sample validity.
 
 ## Live Agent Mode file-tool performance diagnostic
 
@@ -866,22 +961,21 @@ valid samples.
 
 ### 100k and 1M synthetic hooks
 
-The routine namespace-manifest scale contract generates 100,000 records and
-asserts exact record/read counts, more than 100 initial spill runs, and bounded
-buffer bytes:
+The routine namespace-manifest scale contract uses a lower record count with a
+small batch size so ordinary root-suite timing still exercises exact record/read
+counts, more than 100 initial spill runs, and bounded buffer bytes:
 
 ```bash
 make dev-test \
-  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes
+  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticEntriesRemainWithinConfiguredBatchBytes
 ```
 
-The opt-in one-million-record version uses the same executable oracle and
-resource policy; keep it separate from ordinary root-suite timing:
+The 100K/configured namespace-manifest version uses the same executable oracle
+and remains separate from ordinary root-suite timing:
 
 ```bash
-REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=1000000 \
-  make dev-test \
-  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes
+RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
+REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=1000000 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
 ```
 
 These hooks validate spill/streaming scale, not live Agent Mode latency. The

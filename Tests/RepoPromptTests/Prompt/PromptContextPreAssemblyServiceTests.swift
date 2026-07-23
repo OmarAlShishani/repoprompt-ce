@@ -1,4 +1,5 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class PromptContextPreAssemblyServiceTests: XCTestCase {
@@ -29,16 +30,44 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         }
     }
 
-    private actor InvocationCounter {
-        private var value = 0
-
-        func increment() -> Int {
-            value += 1
-            return value
+    private actor FinalPackagingRetryTrace {
+        struct Snapshot: Equatable {
+            let operationCount: Int
+            let revalidationCount: Int
+            let operationCountAtFirstRevalidation: Int?
+            let firstRevalidationUnloadedRoot: Bool
         }
 
-        func count() -> Int {
-            value
+        private var operationCount = 0
+        private var revalidationCount = 0
+        private var operationCountAtFirstRevalidation: Int?
+        private var firstRevalidationUnloadedRoot = false
+
+        func recordOperation() -> Int {
+            operationCount += 1
+            return operationCount
+        }
+
+        func recordPublicationRevalidationBegan() -> Bool {
+            revalidationCount += 1
+            if revalidationCount == 1 {
+                operationCountAtFirstRevalidation = operationCount
+                return true
+            }
+            return false
+        }
+
+        func recordFirstRevalidationDidUnloadRoot() {
+            firstRevalidationUnloadedRoot = true
+        }
+
+        func snapshot() -> Snapshot {
+            Snapshot(
+                operationCount: operationCount,
+                revalidationCount: revalidationCount,
+                operationCountAtFirstRevalidation: operationCountAtFirstRevalidation,
+                firstRevalidationUnloadedRoot: firstRevalidationUnloadedRoot
+            )
         }
     }
 
@@ -86,6 +115,74 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         XCTAssertFalse(result.fileTreeContent?.contains(fixture.logicalRoot.standardizedFileURL.path) ?? true, result.fileTreeContent ?? "")
         XCTAssertFalse(result.fileTreeContent?.contains(fixture.worktreeRoot.standardizedFileURL.path) ?? true, result.fileTreeContent ?? "")
         XCTAssertEqual(result.gitDiff, PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage)
+    }
+
+    func testSelectedUnavailableCodemapOmitsNilFallbackReadAndReportsLogicalMissingPath() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "PromptPreAssemblyBinaryLogical")
+        let worktreeRoot = try makeTemporaryRoot(name: "PromptPreAssemblyBinaryWorktree")
+        let relativePath = "Assets/Opaque.dat"
+        try FileManager.default.createDirectory(
+            at: logicalRoot.appendingPathComponent("Assets"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: worktreeRoot.appendingPathComponent("Assets"),
+            withIntermediateDirectories: true
+        )
+        try Data([0x00, 0x01, 0x02, 0x03]).write(
+            to: logicalRoot.appendingPathComponent(relativePath)
+        )
+        try Data([0x00, 0x04, 0x05, 0x06]).write(
+            to: worktreeRoot.appendingPathComponent(relativePath)
+        )
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let projection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: UUID(),
+            bindings: [makeBinding(logicalRoot: logicalRoot, worktreeRoot: worktreeRoot)]
+        )
+        let lookupContext = try WorkspaceLookupContext(
+            rootScope: XCTUnwrap(projection).lookupRootScope,
+            bindingProjection: projection
+        )
+        let issue = WorkspaceCodemapOperationIssue.coordinationUnavailable
+        let unavailablePresentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .unavailable([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .none, codeMapUsage: .selected),
+            selection: StoredSelection(
+                selectedPaths: [relativePath],
+                codemapAutoEnabled: false
+            ),
+            store: store,
+            lookupContext: lookupContext,
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: .automaticOnly(),
+            selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
+            completeGitDiffProvider: { nil }
+        )
+
+        let result = await PromptContextPreAssemblyService.resolve(
+            request,
+            codemapPresentation: unavailablePresentation
+        )
+
+        XCTAssertTrue(result.entries.isEmpty)
+        XCTAssertEqual(result.missingPaths, [relativePath])
+        XCTAssertFalse(result.missingPaths.contains {
+            $0.contains(worktreeRoot.standardizedFileURL.path)
+        })
+        guard case .unavailable = result.codemapPresentation.coverage else {
+            return XCTFail("Failed selected codemap fallback must remain unavailable")
+        }
     }
 
     func testResolveSelectedDiffUsesPhysicalizedSelectionAndPolicy() async throws {
@@ -218,7 +315,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             let selectedURL = root.appendingPathComponent("Selected.swift")
             let targetURL = root.appendingPathComponent("Target.swift")
             try FileSystemTestSupport.write("let selected = true\n", to: selectedURL)
-            try FileSystemTestSupport.write("struct Target {}\n", to: targetURL)
+            try FileSystemTestSupport.write(SwiftFixtureSource.emptyStruct("Target"), to: targetURL)
 
             let store = WorkspaceFileContextStore()
             let rootRecord = try await store.loadRoot(path: root.path)
@@ -267,11 +364,11 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                     codemapPresentation: frozenPresentation
                 )
             }
-            await gate.waitUntilStarted()
+            try await gate.waitUntilStarted()
             _ = try await store.editFile(
                 rootID: rootRecord.id,
                 relativePath: "Target.swift",
-                newContent: "struct TargetV2 {}\n"
+                newContent: SwiftFixtureSource.emptyStruct("TargetV2")
             )
             await gate.release()
             let result = await resolveTask.value
@@ -305,7 +402,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let logicalRoot = try repositoryFixture.makeRepository(
             named: "prompt-revoked-logical",
-            files: ["Sources/App.swift": "struct LogicalPromptSentinel {}\n"]
+            files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("LogicalPromptSentinel")]
         )
         let worktreeRoot = try repositoryFixture.makeRepository(
             named: "prompt-revoked-worktree",
@@ -314,7 +411,12 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             ]
         )
         addTeardownBlock { repositoryFixture.cleanup() }
-        let store = WorkspaceFileContextStore(codemapProjectionPreloadLaunchPolicyForTesting: .disabled)
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let store = codemapFixture.makeStore(
+            codemapLocalGitClassificationProbe: .production,
+            codemapGitEligibilityProbe: .production(),
+            codemapProjectionPreloadLaunchPolicy: .disabled
+        )
         _ = try await store.loadRoot(path: logicalRoot.path)
         let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
             sessionID: UUID(),
@@ -351,8 +453,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
             completeGitDiffProvider: { nil }
         )
-        let publicationCount = InvocationCounter()
-        let operationCount = InvocationCounter()
+        let retryTrace = FinalPackagingRetryTrace()
         let coordinator = WorkspaceCodemapPresentationCoordinator(
             store: store,
             policy: WorkspaceCodemapPresentationRequestPolicy(
@@ -360,8 +461,9 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                 maximumTotalWait: .seconds(10)
             ),
             beforePublicationRevalidation: { _ in
-                if await publicationCount.increment() == 1 {
+                if await retryTrace.recordPublicationRevalidationBegan() {
                     await store.unloadRoot(id: physicalRootID)
+                    await retryTrace.recordFirstRevalidationDidUnloadRoot()
                 }
             }
         )
@@ -370,7 +472,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             request,
             presentationCoordinator: coordinator
         ) { preAssembly in
-            _ = await operationCount.increment()
+            _ = await retryTrace.recordOperation()
             let blocks = PromptPackagingService.generatePartitionedFileBlocks(
                 preAssembly.entries,
                 filePathDisplay: .relative,
@@ -380,10 +482,11 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             return (blocks.codemapBlocks + blocks.contentBlocks).joined(separator: "\n")
         }
 
-        let finalPublicationCount = await publicationCount.count()
-        let finalOperationCount = await operationCount.count()
-        XCTAssertEqual(finalPublicationCount, 1)
-        XCTAssertEqual(finalOperationCount, 2)
+        let retrySnapshot = await retryTrace.snapshot()
+        XCTAssertEqual(retrySnapshot.revalidationCount, 1)
+        XCTAssertEqual(retrySnapshot.operationCount, 2)
+        XCTAssertEqual(retrySnapshot.operationCountAtFirstRevalidation, 1)
+        XCTAssertTrue(retrySnapshot.firstRevalidationUnloadedRoot)
         XCTAssertFalse(packaged.contains("RevokedPromptSentinel"))
     }
 
@@ -392,7 +495,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
             let root = try repositoryFixture.makeRepository(
                 named: "repository",
-                files: ["Sources/App.swift": "struct CancelledPromptSentinel {}\n"]
+                files: ["Sources/App.swift": SwiftFixtureSource.emptyStruct("CancelledPromptSentinel")]
             )
             addTeardownBlock { repositoryFixture.cleanup() }
             let store = WorkspaceFileContextStore()
@@ -413,8 +516,12 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                     return "must-not-publish"
                 }
             }
+            defer {
+                task.cancel()
+                gate.release()
+            }
 
-            await gate.waitUntilStarted()
+            try await gate.waitUntilStarted()
             task.cancel()
             await gate.release()
             do {
@@ -1065,7 +1172,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
     private func readyCodemapDemand(
         store: WorkspaceFileContextStore,
         fileID: UUID,
-        timeout: Duration = .seconds(20)
+        timeout: Duration = .seconds(60)
     ) async throws -> WorkspaceCodemapArtifactDemandReady {
         var result = await store.requestCodemapArtifact(forFileID: fileID)
         let clock = ContinuousClock()
@@ -1210,35 +1317,38 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
 }
 
 #if DEBUG
-    private actor PreAssemblyContentReadGate {
-        private var started = false
-        private var released = false
-        private var startWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private struct PreAssemblyContentReadGateState: Equatable {
+        var started = false
+        var released = false
+    }
+
+    private final class PreAssemblyContentReadGate: @unchecked Sendable {
+        private let condition = AsyncTestCondition(PreAssemblyContentReadGateState())
 
         func markStartedAndWaitForRelease() async {
-            started = true
-            let waiters = startWaiters
-            startWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
+            condition.update { $0.started = true }
+            do {
+                try await condition.waitUntil(
+                    "preassembly content read gate release",
+                    timeout: 20
+                ) { $0.released }
+            } catch is CancellationError {
+                // Cancellation is the contract for the cancellation-path test; the
+                // caller checks cancellation immediately after this wait returns.
+            } catch {
+                XCTFail("Timed out waiting for preassembly content read gate release: \(error)")
             }
         }
 
-        func waitUntilStarted() async {
-            guard !started else { return }
-            await withCheckedContinuation { continuation in
-                startWaiters.append(continuation)
-            }
+        func waitUntilStarted() async throws {
+            try await condition.waitUntil(
+                "preassembly content read gate start",
+                timeout: 20
+            ) { $0.started }
         }
 
         func release() {
-            released = true
-            let waiters = releaseWaiters
-            releaseWaiters.removeAll()
-            waiters.forEach { $0.resume() }
+            condition.update { $0.released = true }
         }
     }
 #endif

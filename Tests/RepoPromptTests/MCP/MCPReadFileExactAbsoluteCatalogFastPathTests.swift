@@ -1,17 +1,7 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testReadFileSourceOrderingPreservesRootCaptureResolutionAndProviderTranslation() throws {
         do {
             let caseLabel = "testReadFileCapturesRootsOnceBeforeFreshnessAndConsolidatedResolution"
@@ -23,7 +13,8 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
 
             try assertOrdered([
                 "let roots = await store.rootRefs(scope: lookupRootScope)",
-                "await readableService.awaitFreshnessForExplicitRequest(path, rootRefs: roots)",
+                "await readableService.awaitFreshnessForExplicitRequest(",
+                "timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout",
                 "await readableService.resolveReadFileRequest("
             ], in: readFile, label: caseLabel)
             XCTAssertEqual(readFile.components(separatedBy: "store.rootRefs(scope: lookupRootScope)").count - 1, 1, caseLabel)
@@ -62,6 +53,28 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
             XCTAssertLessThan(translation.lowerBound, authorizedRead.lowerBound, caseLabel)
             XCTAssertLessThan(authorizedRead.lowerBound, scopedRead.lowerBound, caseLabel)
         }
+    }
+
+    func testFileTreeStartPathSourceOrderingUsesFolderResolverNotSelectionLookup() throws {
+        let caseLabel = "testFileTreeStartPathSourceOrderingUsesFolderResolverNotSelectionLookup"
+        let storeSource = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+        let startPathSnapshot = try XCTUnwrap(storeSource.slice(
+            from: "    private func makeFileTreeSelectionSnapshot(\n        _ request: WorkspaceFileTreeSnapshotRequest,\n        selectedStoreFileIDs: Set<UUID>,\n        renderableCodemapFileIDs: Set<UUID>,\n        profile: PathLocateProfile\n    ) async -> FileTreeSelectionSnapshot {\n",
+            to: "    private func resolveFileTreeStartFolder("
+        ), caseLabel)
+        XCTAssertTrue(startPathSnapshot.contains("resolveFileTreeStartFolder("), caseLabel)
+        XCTAssertFalse(startPathSnapshot.contains("lookupSelectionPath(trimmedStartPath"), caseLabel)
+
+        let startFolderResolver = try XCTUnwrap(storeSource.slice(
+            from: "    private func resolveFileTreeStartFolder(",
+            to: "    private func makeFileTreeSelectionSnapshot(\n        _ request: WorkspaceFileTreeSnapshotRequest,\n        selectedStoreFileIDs: Set<UUID>,\n        renderableCodemapFileIDs: Set<UUID>,\n        startFolder: WorkspaceFolderRecord?"
+        ), caseLabel)
+        try assertOrdered([
+            "let roots = rootRefs(scope: request.rootScope)",
+            "resolveFolderInput(",
+            "rootRefs: roots",
+            "allowGeneralLookupFallback: false"
+        ], in: startFolderResolver, label: caseLabel)
     }
 
     func testExactAbsoluteInputValidationCoversQualificationEmptyAndEmbeddedNUL() async throws {
@@ -370,12 +383,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {

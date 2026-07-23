@@ -1,6 +1,6 @@
 import CoreServices
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
@@ -826,7 +826,12 @@ final class GitLoadedRootAuthorityEvidenceTests: XCTestCase {
         XCTAssertTrue(store.activeArtifactURLs.isEmpty)
     }
 
-    func testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBounded() async throws {
+    func testLogicalCandidatesAndTreeRecordsStayBounded() async throws {
+        try await exerciseLargeLogicalStream(recordCount: 20000)
+    }
+
+    func testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBoundedWhenEnabled() async throws {
+        try TestScaleGate.requireEnabled("Run the 100K git authority scale contract")
         try await exerciseLargeLogicalStream(recordCount: 100_000)
     }
 

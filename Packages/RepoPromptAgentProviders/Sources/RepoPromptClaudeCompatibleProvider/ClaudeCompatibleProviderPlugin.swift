@@ -303,7 +303,7 @@ public enum ClaudeCompatibleModelCatalog {
         StaticModel(
             rawValue: sonnet5Raw,
             displayName: "Sonnet 5",
-            description: "Pinned Claude Sonnet 5. Near-Opus quality for coding and agentic work at Sonnet cost.",
+            description: "Pinned Claude Sonnet 5. Balanced speed and capability with 1M context for everyday engineering.",
             supportsXHigh: true
         ),
         StaticModel(

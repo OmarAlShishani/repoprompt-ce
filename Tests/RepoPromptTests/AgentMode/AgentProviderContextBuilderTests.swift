@@ -1,18 +1,9 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class AgentProviderContextBuilderTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testInitialFileTreeUsesBoundWorktreeAndLogicalPaths() async throws {
         let fixture = try await makeBoundFixture()
         let lookupContext = await makeLookupContext(fixture: fixture)
@@ -149,7 +140,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
             named: "repository",
             files: [
                 "Sources/Source.swift": "func makeTarget() -> Target { Target() }\n",
-                "Sources/Target.swift": "struct Target {}\n"
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
             ]
         )
         defer { repositories.cleanup() }
@@ -356,12 +347,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {

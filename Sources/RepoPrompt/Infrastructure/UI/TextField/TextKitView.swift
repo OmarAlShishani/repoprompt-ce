@@ -45,7 +45,7 @@ struct TextKitView: NSViewRepresentable {
     @MainActor
     class Coordinator: NSObject, NSTextViewDelegate {
         var parent: TextKitView
-        let textViewUndoManager = UndoManager()
+        private let textViewUndoManager = UndoManager()
         var internalText: String
         var lastAppliedTick: Int = 0
         // NEW: mark inactive after dismantle
@@ -98,6 +98,21 @@ struct TextKitView: NSViewRepresentable {
 
         func undoManager(for view: NSTextView) -> UndoManager? {
             textViewUndoManager
+        }
+
+        func performExternalReplacement(
+            in textView: NSTextView,
+            mutation: () -> Void
+        ) {
+            TextViewUndoSafeReplacement.perform(
+                in: textView,
+                undoManager: textViewUndoManager,
+                mutation: mutation
+            )
+        }
+
+        func clearUndoHistory() {
+            textViewUndoManager.removeAllActions()
         }
 
         fileprivate func scheduleLayoutStabilization(
@@ -305,7 +320,9 @@ struct TextKitView: NSViewRepresentable {
             } else {
                 // Preserve selection but clamp it to the new text length
                 let previousSelection = textView.clampedSelectedRange()
-                textView.string = text
+                context.coordinator.performExternalReplacement(in: textView) {
+                    textView.string = text
+                }
                 textView.setSelectedRange(previousSelection.clamped(to: textView.currentStringLength()))
                 applyAutoWritingDirection(to: textView)
 
@@ -354,7 +371,7 @@ struct TextKitView: NSViewRepresentable {
         textView.delegate = nil
         textView.isContinuousSpellCheckingEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
-        coordinator.textViewUndoManager.removeAllActions()
+        coordinator.clearUndoHistory()
         textView.string = ""
         coordinator.internalText = ""
         coordinator.wasEmpty = true

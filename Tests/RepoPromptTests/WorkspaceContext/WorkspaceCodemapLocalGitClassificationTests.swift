@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
@@ -212,7 +212,8 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         addTeardownBlock { gitFixture.cleanup() }
         let gitPreflightCount = AsyncCounter()
         let productionGitEligibility = WorkspaceCodemapGitEligibilityProbe.production().resolve
-        let store = WorkspaceFileContextStore(
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let store = codemapFixture.makeStore(
             codemapLocalGitClassificationProbe: .production,
             codemapGitEligibilityProbe: .init { rootURL in
                 await gitPreflightCount.increment()
@@ -238,7 +239,13 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         await store.replayObservedFileSystemDeltas(rootID: loaded.id, deltas: [.folderAdded(".git")])
 
         let nextDemand = await store.requestCodemapArtifact(forFileID: file.id)
-        let ready = try await settledReady(nextDemand, store: store)
+        let ready = try await settledReady(
+            nextDemand,
+            store: store,
+            gitPreflightCount: gitPreflightCount,
+            root: root,
+            file: file
+        )
         let finalGitPreflightCount = await gitPreflightCount.value
         XCTAssertEqual(finalGitPreflightCount, 1)
         _ = await store.cancelCodemapArtifactDemand(ready.ticket)
@@ -261,7 +268,7 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
             at: file.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try "struct Feature {}\n".write(to: file, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("Feature").write(to: file, atomically: true, encoding: .utf8)
     }
 
     private func firstFile(
@@ -285,20 +292,42 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
     private func settledReady(
         _ initial: WorkspaceCodemapArtifactDemandResult,
         store: WorkspaceFileContextStore,
-        timeout: Duration = .seconds(15)
+        gitPreflightCount: AsyncCounter,
+        root: URL,
+        file: WorkspaceFileRecord,
+        // The production Git/codemap path can legitimately consume a full 30-second activity
+        // window before retrying under process-admission pressure. This assertion checks eventual
+        // readiness, not latency, so allow that bounded retry without accepting a non-ready result.
+        timeout: Duration = .seconds(60)
     ) async throws -> WorkspaceCodemapArtifactDemandReady {
         var result = initial
         if case let .pending(ticket) = result {
             let clock = ContinuousClock()
             let deadline = clock.now.advanced(by: timeout)
-            while clock.now < deadline {
+            var delayNanoseconds: UInt64 = 1_000_000
+            while true {
                 result = await store.codemapArtifactDemandStatus(ticket)
                 guard case .pending = result else { break }
-                try await Task.sleep(for: .milliseconds(10))
+                guard clock.now < deadline else {
+                    let preflightCount = await gitPreflightCount.value
+                    XCTFail(
+                        "Timed out waiting for ready codemap demand after Git layout conversion; " +
+                            "lastDemand=\(result), gitPreflightCount=\(preflightCount), " +
+                            "root=\(root.path), fileID=\(file.id)"
+                    )
+                    throw LocalGitClassificationTestError.expectedReady
+                }
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+                delayNanoseconds = min(delayNanoseconds * 2, 50_000_000)
             }
         }
+
         guard case let .ready(ready) = result else {
-            XCTFail("Expected ready codemap demand, got \(result)")
+            let preflightCount = await gitPreflightCount.value
+            XCTFail(
+                "Expected ready codemap demand after Git layout conversion, got \(result); " +
+                    "gitPreflightCount=\(preflightCount), root=\(root.path), fileID=\(file.id)"
+            )
             throw LocalGitClassificationTestError.expectedReady
         }
         return ready
